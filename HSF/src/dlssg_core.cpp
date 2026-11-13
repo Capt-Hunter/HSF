@@ -802,15 +802,19 @@ const char* MakeCommandObjects(Presenter& p, HRESULT& hr) {
 
 namespace {
 
-// ---- The overlay window (Vulkan route, HSF.ini VkOverlayWindow) ----
+// ---- The overlay window (HSF.ini VkOverlayWindow on Vulkan, OverlayWindow on D3D11 and DX9) ----
 // A window of its own over the game's, never its child, as AeonSR's frame generation presents (MIT, github.com/BarbatosAWLS/AeonSR,
 // overlay_presenter.cpp): a child window on the game's window shares the game thread's input queue, and with the pointer inside the window
 // every mouse move went through this thread (Valheim: choppy only with the pointer inside and frame gen on). Layered and transparent, so the
 // mouse goes through to the game; never activated, so the game keeps the focus.
+// While ReShade's menu is open with MFG-Unlocker loaded, the overlay window docks into the game's window as a child for a moment: the mod's
+// menu only opens and takes clicks on a window inside the game's. The mouse may be choppy then; it is smooth again once the menu closes.
+std::atomic<bool> g_overlay_docked{false};
+
 LRESULT CALLBACK OverlayProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   if (message == WM_ERASEBKGND) return 1;
   if (message == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
-  if (message == WM_NCHITTEST) return HTTRANSPARENT;
+  if (message == WM_NCHITTEST && !g_overlay_docked.load()) return HTTRANSPARENT;
   if (message == WM_DESTROY) {
     PostQuitMessage(0);
     return 0;
@@ -841,7 +845,8 @@ void OverlayThread(Presenter& p, const std::atomic<bool>* close_when) {
   (void)atom;
   RECT r{};
   OverlayPlace(p.parent, r);
-  const HWND window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT, L"HSF_DLSSG_OVERLAY", L"HSF DLSS-G",
+  const LONG_PTR overlay_ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT;
+  const HWND window = CreateWindowExW(static_cast<DWORD>(overlay_ex), L"HSF_DLSSG_OVERLAY", L"HSF DLSS-G",
                                       WS_POPUP, r.left, r.top, r.right - r.left, r.bottom - r.top, nullptr, nullptr, ThisModule(), nullptr);
   if (window == nullptr) {
     Log("creating the overlay window over the game's window %p failed (%lu)", static_cast<void*>(p.parent), GetLastError());
@@ -869,13 +874,39 @@ void OverlayThread(Presenter& p, const std::atomic<bool>* close_when) {
     shown = true;
     shown_rect = where;
   };
+  bool docked = false;
+  const auto dock = [&](bool on) {
+    docked = on;
+    g_overlay_docked.store(on);
+    if (on) {
+      RECT client{};
+      GetClientRect(p.parent, &client);
+      SetWindowLongPtrW(window, GWL_EXSTYLE, WS_EX_NOPARENTNOTIFY);
+      SetWindowLongPtrW(window, GWL_STYLE, WS_CHILD | WS_CLIPSIBLINGS | WS_DISABLED);
+      SetParent(window, p.parent);
+      SetWindowPos(window, HWND_TOP, 0, 0, client.right, client.bottom, SWP_NOACTIVATE | SWP_FRAMECHANGED | (wanted ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+      shown = wanted;
+      Log("ReShade's menu is open with MFG-Unlocker loaded: the overlay window docks into the game's window, so the mod's menu opens and can be clicked");
+    } else {
+      SetParent(window, nullptr);
+      EnableWindow(window, TRUE);
+      SetWindowLongPtrW(window, GWL_STYLE, WS_POPUP);
+      SetWindowLongPtrW(window, GWL_EXSTYLE, overlay_ex);
+      SetLayeredWindowAttributes(window, 0, 255, LWA_ALPHA);
+      SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_HIDEWINDOW);
+      shown = false;
+      Log("the menus are closed: the overlay window is on its own over the game again");
+      follow();
+    }
+  };
   follow();
   MSG message;
   while (GetMessageW(&message, nullptr, 0, 0) > 0) {
     if (message.message == WM_HSF_SHOW && message.hwnd == window) {
       wanted = message.wParam != 0;
       Log(wanted ? "frames again: the overlay window is shown" : "frame gen off: the overlay window is hidden, the game shows its own frames");
-      follow();
+      if (docked) ShowWindow(window, wanted ? SW_SHOWNA : SW_HIDE);
+      else follow();
       continue;
     }
     if (message.message == WM_TIMER && message.hwnd == window) {
@@ -883,7 +914,23 @@ void OverlayThread(Presenter& p, const std::atomic<bool>* close_when) {
         DestroyWindow(window);
         continue;
       }
-      follow();
+      const bool want_dock = p.take_mouse.load() && g_mfg_unlocker_queries.load() != 0;
+      if (want_dock != docked) dock(want_dock);
+      if (docked) {
+        // Docked, the window lets the mouse through to the game (ReShade's menu) and takes it only while the mod's own menu is open.
+        const bool take = ModMenuOpen();
+        if (take == !IsWindowEnabled(window)) {
+          EnableWindow(window, take ? TRUE : FALSE);
+          Log(take ? "MFG-Unlocker's menu is open: the docked window takes the mouse" : "the docked window lets the mouse through to the game");
+        }
+        RECT client{}, own{};
+        GetClientRect(p.parent, &client);
+        GetClientRect(window, &own);
+        if (client.right > 0 && client.bottom > 0 && (client.right != own.right || client.bottom != own.bottom))
+          SetWindowPos(window, nullptr, 0, 0, client.right, client.bottom, SWP_NOZORDER | SWP_NOACTIVATE);
+      } else {
+        follow();
+      }
       continue;
     }
     DispatchMessageW(&message);

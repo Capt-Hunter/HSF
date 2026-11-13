@@ -25,6 +25,7 @@ Older files may still have `Presenter`, `Generated` and `Pacing`. They belonged 
 | `OverlaySimple`, `OverlayAdvanced` | `100,59,0,28,28` and `100,96,0,28,28` | size %, opacity %, corner (0 top left, 1 top right, 2 bottom left, 3 bottom right), x, y | Live | All | Each overlay's look. The offsets are pixels at 1440 lines, scaled to the frame. |
 | `GameFgWarningOk` | `0` | 0, 1 | HSF writes | D3D12-G | 1 after you pressed OK on "THIS GAME HAS ITS OWN FRAME GENERATION". |
 | `VkOverlayWindow` | `1` | 0, 1 | Start | Vulkan | DLSS-G shows its frames in a click-through window of its own over the game. 0 puts them in a child window of the game's window, as before, which made the mouse choppy with the pointer inside the window. |
+| `OverlayWindow` | `1` | 0, 1 | Start | D3D11, DX9 | The same click-through window on the D3D11 and DX9 routes. While ReShade's menu is open with MFG-Unlocker loaded, the window docks into the game's window, so the unlocker's menu opens and can be clicked. 0 puts the frames in a child window of the game's window, as before, which lost mouse moves with the pointer inside the window. |
 
 ## 2. Motion and depth
 

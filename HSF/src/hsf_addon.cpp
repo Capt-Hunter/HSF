@@ -166,6 +166,7 @@ hsf::reserve::LoadReader* const g_load_reader = new hsf::reserve::LoadReader;  /
 uint32_t CapInForce() { return g_reserve.InForce(g_fps_cap); }
 bool g_reflex_boost = false;  // HSF.ini ReflexBoost: Reflex low latency + boost (keeps GPU clocks up)
 bool g_vk_overlay_window = true;  // HSF.ini VkOverlayWindow (default 1; 0 = the child window as before): on the Vulkan route the helper presents from a click-through window of its own (dlssg_link.h, version 13)
+bool g_overlay_window = true;  // HSF.ini OverlayWindow (default 1; 0 = the child window as before): the same click-through window on the D3D11 and DX9 routes. A child window shares the game thread's input queue and lost mouse moves with the pointer inside the window (FF7R)
 bool g_queue_one = true;      // HSF.ini GameQueue1: with DLSS-G, the game's device queues at most 1 frame (SetMaximumFrameLatency)
 bool g_reflex_sleep = true;   // HSF.ini ReflexSleep: 0 = the game thread does not sleep on Reflex (markers only), for an A/B latency test
 // The motion quality score and its tools (score.h).
@@ -526,6 +527,7 @@ void PollIni() {
   g_gpu_reserve = GetPrivateProfileIntW(L"HSF", L"GpuReserve", 1, g_ini_path) != 0;
   g_reflex_boost = GetPrivateProfileIntW(L"HSF", L"ReflexBoost", 0, g_ini_path) != 0;
   g_vk_overlay_window = GetPrivateProfileIntW(L"HSF", L"VkOverlayWindow", 1, g_ini_path) != 0;
+  g_overlay_window = GetPrivateProfileIntW(L"HSF", L"OverlayWindow", 1, g_ini_path) != 0;
   g_queue_one = GetPrivateProfileIntW(L"HSF", L"GameQueue1", 1, g_ini_path) != 0;
   g_reflex_sleep = GetPrivateProfileIntW(L"HSF", L"ReflexSleep", 1, g_ini_path) != 0;
   g_score_enabled = GetPrivateProfileIntW(L"HSF", L"Score", 1, g_ini_path) != 0;
@@ -1116,6 +1118,7 @@ void UpdatePresenter(device* dev) {
   char text[480];
   ID3D11Device* const native_device = reinterpret_cast<ID3D11Device*>(dev->get_native());
   hsf::dlssg::SetColorSpace(space);
+  hsf::dlssg::SetOverlayWindow(g_overlay_window);
   const bool started = hsf::dlssg::Start(native_device, swap_desc.OutputWindow, desc.Width, desc.Height, desc.Format, g_sl_folder, error, sizeof(error));
   if (started) {
     running_window = swap_desc.OutputWindow;
@@ -3159,8 +3162,10 @@ void UpdatePresenter9() {
   bool started = false;
   if (format == DXGI_FORMAT_UNKNOWN)
     std::snprintf(error, sizeof(error), "DX9 back buffer format %u is not supported yet", static_cast<unsigned>(desc.Format));
-  else if (hsf::dx9::Start(g_native9, error, sizeof(error)))
+  else if (hsf::dx9::Start(g_native9, error, sizeof(error))) {
+    hsf::dlssg::SetOverlayWindow(g_overlay_window);
     started = hsf::dlssg::Start(hsf::dx9::Device(), window, desc.Width, desc.Height, format, g_sl_folder, error, sizeof(error));
+  }
   if (started) {
     running_window = window;
     running_size[0] = desc.Width;
