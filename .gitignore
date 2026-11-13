@@ -1,0 +1,23 @@
+# build output
+build/
+*.obj
+*.pdb
+*.ilk
+*.addon32
+*.addon64
+# separate repos / big third-party / old experiments
+/GITC-Uplift/
+/GITC-FG/
+/Nvidia Streamline/
+/Streamline SDK/
+/_removed_from_AC/
+/_removed_from_TR/
+/Luma-Framework/
+/_releases/
+# old probes, presenter-era measurements and their data: kept on this PC only
+/_archive/
+
+# working notes: kept on this PC only, not on GitHub
+/TEST_SWEEP.md
+/NOTES.md
+/EXPERIMENTAL.md

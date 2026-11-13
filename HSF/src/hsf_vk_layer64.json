@@ -1,0 +1,17 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_HSF_bridge",
+    "type": "GLOBAL",
+    "library_path": ".\\hsf_vk_layer64.dll",
+    "api_version": "1.3.296",
+    "implementation_version": "1",
+    "description": "HSF: lets a Vulkan game share its frames with HSF's frame generation",
+    "functions": {
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+    },
+    "disable_environment": {
+      "DISABLE_HSF_VK_LAYER": "1"
+    }
+  }
+}
