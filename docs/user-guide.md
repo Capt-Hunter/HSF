@@ -81,7 +81,7 @@ These were tested alongside HSF:
 - **DFC NR add-on**: works once DFC's own "Present with frame generation" is on (DEBUG tab > Placement > ADVANCED).
 - **GITC Uplift**: works alongside HSF, but not as a flow source: use LaunchPad or Lumenite for the flow.
 - **MFG-Unlocker**: works on DirectX 12 in the game, and through the helper on DirectX 11, Vulkan and 32-bit games. In 64-bit games put it next to the game's exe. In 32-bit games put it in `HSF_streamline\mods`, never next to the 32-bit exe.
-- **RenoDX**: works, HDR10 included.
+- **RenoDX**: works, HDR10 included. RenoDX HDR mods in DirectX 12 games work with frame generation (tested in Scorn and BLACKTAIL).
 - **Luma**: works in DirectX 11, and HSF uses Luma's DLSS data (see MOTION).
 - **RTSS and ReShade overlays**: work. On DirectX 11, keep KEEP OVERLAYS OUT on, so the overlays are not generated.
 

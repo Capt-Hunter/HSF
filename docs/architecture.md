@@ -60,6 +60,14 @@ This route is for D3D12 games without Streamline.
 5. The motion is the game's DLSS data from `ngx_input`, when there is any and `MotionFrom` allows it. Otherwise it is the flow source plus depth, run through the compose pass on the game's device.
 6. `debug_view.cpp` can replace the picture with exactly what DLSS-G was tagged with (the DEPTH and MOTION views).
 
+**The game's own DLSS.** Streamline starts NGX before the game does, with only its plugin folders to look in. A game that runs DLSS through NGX itself (Unreal's DLSS plugin) would then find no DLSS and hide it. HSF gives Streamline the folder of the game's `nvngx_dlss.dll` as a second plugin folder: the copy the game has loaded, else the newest one under the game folder. The answer is saved in `HSF.ini` as `SlNgxPath`, so the search runs once per game (again only when the exe changes).
+
+**Full-size vectors.** When the game's DLSS gives full-resolution vectors with render-size depth (Unreal), the depth fit pass (`depth_fit.cpp`) brings the depth up to the vectors' size on the game's device every frame, so DLSS-G gets both at one size.
+
+**RenoDX HDR mods.** ReShade wraps the D3D12 device, and DLSS-G makes calls of its own on the device it is given. With a RenoDX HDR mod loaded, those calls on ReShade's device showed stale, jumbled frames and removed ReShade's overlay. HSF puts thunks on the method table of ReShade's device: a call made from DLSS-G's code (found by return address, including the driver's NGX copies and NVAPI) goes to the native device, and every other caller still goes through ReShade. It is on only with a RenoDX HDR mod (`SlRouteDlssg=-1`); the RenoDX DLSS mods (`renodx-dlss*`) do not count.
+
+**DXGI guard (`dxgi_guard.cpp`).** ReShade 6.8.0's DXGI factory wraps any adapter `EnumAdapterByLuid` returns, even for interfaces it does not know. D3D11 asks for such internal interfaces when RTSS makes a D3D11 device, and the game crashed. HSF patches that one slot of ReShade's factory method table: interfaces ReShade knows still go through it, others go to the real adapter. The slot is put back when HSF unloads, so ReShade can reload its add-ons.
+
 Start-up switches for games that crash while Streamline starts: `SlFactoryProxy`, `SlManualHooking` and `SlLog` (see settings.md).
 
 ### 3.3 NGX input (`ngx_input.cpp`, `ngx_input.h`)
