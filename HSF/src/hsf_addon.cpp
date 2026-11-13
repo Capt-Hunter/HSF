@@ -2446,6 +2446,15 @@ void PickD3d12Route() {
       Log("route: sl.interposer.dll is loaded but the game never started it (a stray copy in the game folder?), so HSF brings its own Streamline");
     WritePrivateProfileStringW(L"HSF", L"SlBringIn", L"2", g_ini_path);
     Log("route: a D3D12 game with no Streamline: SlBringIn=2 written (HSF brings Streamline), it starts at the next launch");
+    // A game that runs DLSS itself, through NGX: Streamline must be told where its nvngx_dlss.dll is, or the game loses DLSS (see sl_bring's FindGameDlssFolder)
+    if (const HMODULE dlss = GetModuleHandleW(L"nvngx_dlss.dll")) {
+      wchar_t path[MAX_PATH] = L"";
+      if (GetModuleFileNameW(dlss, path, MAX_PATH) != 0) {
+        if (wchar_t* const slash = wcsrchr(path, L'\\')) *slash = L'\0';
+        WritePrivateProfileStringW(L"HSF", L"SlNgxPath", path, g_ini_path);
+        Log("route: this game runs DLSS through NGX itself; SlNgxPath written so it keeps its DLSS with HSF's Streamline");
+      }
+    }
   }
   Note("D3D12: HSF HAS SET UP ITS D3D12 ROUTE. RESTART THE GAME ONCE");
 #else
@@ -2568,6 +2577,37 @@ bool FindFlowAndDepth(effect_runtime* runtime, device* dev, ID3D12Resource** mot
   return true;
 }
 
+// HSF.fx's depth copy on its own (the game's depth at the back buffer's size), switching its techniques on as needed: for the game's DLSS vectors when they
+// are full-resolution and its DLSS depth is not. Unlike FindFlowAndDepth, needs no flow, so LaunchPad isn't switched on for it.
+ID3D12Resource* EffectDepthCopy(effect_runtime* runtime, device* dev) {
+  static effect_texture_variable variable = {};
+  static uint32_t reload_seen = 0;
+  static ULONGLONG next_search = 0;
+  if (reload_seen != g_effect_reloads) {
+    reload_seen = g_effect_reloads;
+    variable = {};
+    next_search = 0;
+  }
+  const ULONGLONG now = GetTickCount64();
+  if (now >= next_search) {
+    next_search = now + 1000;
+    if (variable.handle == 0) variable = runtime->find_texture_variable("HSF.fx", "HSFDepthCopy");
+    for (const char* name : {"HSF_DepthCopy", "HSF_Depth"}) {
+      const effect_technique technique = runtime->find_technique("HSF.fx", name);
+      if (technique.handle != 0 && !runtime->get_technique_state(technique)) {
+        runtime->set_technique_state(technique, true);
+        char text[160];
+        std::snprintf(text, sizeof(text), "switched on %s (HSF.fx), for the game's DLSS vectors", name);
+        Log(text);
+      }
+    }
+  }
+  if (variable.handle == 0) return nullptr;
+  resource_view srv{}, srv_srgb{};
+  runtime->get_texture_binding(variable, &srv, &srv_srgb);
+  return srv.handle != 0 ? reinterpret_cast<ID3D12Resource*>(dev->get_resource_from_view(srv).handle) : nullptr;
+}
+
 void BringFrame(effect_runtime* runtime, device* dev, resource target) {
   if (g_mfg_key != 0 && !g_menu_open && runtime->is_key_pressed(g_mfg_key)) {
     g_dlssg_frames = g_dlssg_frames >= std::max(hsf::slbring::GetStats().max_frames, 1u) ? 1 : g_dlssg_frames + 1;
@@ -2589,6 +2629,34 @@ void BringFrame(effect_runtime* runtime, device* dev, resource target) {
       ngx_serial = ngx_frame.serial;
       if (ngx_quiet < 3) g_dlss_seen = true;
       use_ngx = ngx_quiet < 3 && MotionFrom() != 1;
+    }
+  }
+  // Full-resolution vectors with render-size depth (DLSS without MVLowRes; Lies of P: 3440x1440 vectors, 2580x1080 depth). DLSS-G takes one size for both,
+  // and FeedFrame drops such frames, so generation stopped for good once the game's DLSS ran. HSF.fx's depth copy is the same depth at the back buffer's
+  // size, so it goes with the game's vectors instead; without it (HSF.fx missing), flow keeps going.
+  ID3D12Resource* ngx_depth = use_ngx ? ngx_frame.depth : nullptr;
+  bool ngx_depth_from_effect = false;
+  if (use_ngx && ngx_frame.motion != nullptr && ngx_frame.depth != nullptr) {
+    const D3D12_RESOURCE_DESC m = ngx_frame.motion->GetDesc();
+    const D3D12_RESOURCE_DESC d = ngx_frame.depth->GetDesc();
+    if (m.Width != d.Width || m.Height != d.Height) {
+      ID3D12Resource* const copy = EffectDepthCopy(runtime, dev);
+      const bool fits = copy != nullptr && copy->GetDesc().Width == m.Width && copy->GetDesc().Height == m.Height;
+      static int logged = -1;
+      if (logged != (fits ? 1 : 0)) {
+        logged = fits ? 1 : 0;
+        char text[260];
+        std::snprintf(text, sizeof(text), fits ? "the game's DLSS vectors are %llux%u and its depth %llux%u: the vectors go with HSF.fx's depth copy, which is the vectors' size"
+                                               : "the game's DLSS vectors are %llux%u and its depth %llux%u, and HSF.fx's depth copy isn't the vectors' size: motion stays on flow",
+                      m.Width, m.Height, d.Width, d.Height);
+        hsf::slbring::LogLine(text);
+      }
+      if (fits) {
+        ngx_depth = copy;
+        ngx_depth_from_effect = true;
+      } else {
+        use_ngx = false;
+      }
     }
   }
   g_using_dlss = use_ngx;
@@ -2615,10 +2683,11 @@ void BringFrame(effect_runtime* runtime, device* dev, resource target) {
   if (use_ngx) {
     hsf::slbring::FrameFeed feed;
     feed.motion = ngx_frame.motion;
-    feed.depth = ngx_frame.depth;
+    feed.depth = ngx_depth;
     feed.scale[0] = ngx_frame.scale[0];
     feed.scale[1] = ngx_frame.scale[1];
-    feed.depth_inverted = ngx_frame.depth_inverted;
+    // The effect's copy follows the flow route's convention (DepthInverted in HSF.ini)
+    feed.depth_inverted = ngx_depth_from_effect ? g_depth_inverted_setting != 0 : ngx_frame.depth_inverted;
     feed.reset = ngx_frame.reset || source_changed;
     // The game's vectors are sharp and exact, so flow's clean-up has nothing to do. The HUD mask works at the picture's size, which these are not.
     feed.compose = false;
@@ -6658,6 +6727,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         sl_options.factory_proxy = GetPrivateProfileIntW(L"HSF", L"SlFactoryProxy", 1, g_ini_path) != 0;
         sl_options.manual_hooking = GetPrivateProfileIntW(L"HSF", L"SlManualHooking", 0, g_ini_path) != 0;
         sl_options.early_load = GetPrivateProfileIntW(L"HSF", L"SlEarlyLoad", 1, g_ini_path) != 0;
+        wchar_t ngx_path[MAX_PATH] = L"";
+        GetPrivateProfileStringW(L"HSF", L"SlNgxPath", L"", ngx_path, MAX_PATH, g_ini_path);
+        sl_options.ngx_path = ngx_path;
         hsf::slbring::Start(bring_log.c_str(), have_own ? own.c_str() : folder, sl_options);
         g_ngx_input = GetPrivateProfileIntW(L"HSF", L"NgxInput", 1, g_ini_path) != 0;
         if (g_ngx_input) hsf::ngx::Start(&hsf::slbring::LogLine);

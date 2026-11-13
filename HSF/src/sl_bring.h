@@ -7,6 +7,7 @@
 #include <d3d12.h>
 
 #include <cstdint>
+#include <string>
 
 namespace hsf::slbring {
 
@@ -16,6 +17,9 @@ struct StartOptions {
   bool factory_proxy = true;   // SlFactoryProxy=0: Streamline changes the DXGI factory's method table instead of wrapping it. On by default: with RenoDX DLSS, a swap chain made the other way came back as plain DXGI and DLSS-G showed no frames (Jusant)
   bool manual_hooking = false; // SlManualHooking=1: Streamline hooks nothing itself, and HSF upgrades the factory, as OptiScaler does
   bool early_load = true;      // SlEarlyLoad=0: load sl.interposer.dll only with the first device, as before
+  // SlNgxPath=<folder>: where the game's own nvngx_dlss.dll lives. Streamline starts NGX with only its plugin folders to look in, and the game's own DLSS
+  // (Unreal's plugin and others that call NGX directly) then finds no DLSS and hides it. Empty: HSF looks for the game's copy under the game folder.
+  std::wstring ngx_path;
 };
 // folder holds sl.interposer.dll and its plugins. Only loads sl.interposer.dll (no slInit) when early_load is set, so other add-ons that look for Streamline
 // as they start (RenoDX DLSS picks its Present hook then) find it. DllMain calls it.

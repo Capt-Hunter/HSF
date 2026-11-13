@@ -20,6 +20,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -145,6 +146,44 @@ bool Lookup(T*& out, const char* name) {
   return out != nullptr;
 }
 
+// The folder of the game's own nvngx_dlss.dll, for games that call DLSS through NGX themselves. Streamline starts NGX (sl.common, for DLSS-G) with only
+// the plugin folders it was given as the place to look for NGX's feature DLLs, and it starts it before the game does. When the game then asks whether DLSS can
+// run, NGX looks only in those folders, finds no nvngx_dlss.dll, and the game hides DLSS from its menu (Lies of P, Unreal's DLSS plugin). So the game's folder
+// goes in the list too, after HSF's, and its DLSS stays. HSF.ini's SlNgxPath wins; otherwise a bounded search from the game's root (the exe folder, or for
+// Unreal the folder above <Project>\Binaries\Win64 that holds Engine). HSF_streamline itself is skipped.
+std::wstring FindGameDlssFolder() {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  if (!g_start_options.ngx_path.empty()) {
+    if (fs::exists(fs::path(g_start_options.ngx_path) / L"nvngx_dlss.dll", ec)) return g_start_options.ngx_path;
+    Line("SlNgxPath has no nvngx_dlss.dll: %ls", g_start_options.ngx_path.c_str());
+  }
+  wchar_t exe[MAX_PATH] = L"";
+  if (GetModuleFileNameW(nullptr, exe, MAX_PATH) == 0) return {};
+  // The exe folder. Only for Unreal's own layout (<root>\<Project>\Binaries\<platform>\game.exe, with the engine in <root>\Engine) the game's root instead.
+  // Nothing else climbs: a folder that just happens to hold one named Engine (a store library with a game installed as "Engine") would make the search
+  // cover other games and could find their copy.
+  fs::path root = fs::path(exe).parent_path();
+  const fs::path binaries = root.parent_path();
+  if (_wcsicmp(binaries.filename().c_str(), L"Binaries") == 0 && binaries.has_parent_path() && binaries.parent_path().has_parent_path()) {
+    const fs::path game_root = binaries.parent_path().parent_path();
+    if (game_root != game_root.root_path() &&
+        (fs::is_directory(game_root / L"Engine" / L"Binaries", ec) || fs::is_directory(game_root / L"Engine" / L"Plugins", ec)))
+      root = game_root;
+  }
+  int seen = 0;
+  for (auto it = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+    if (++seen > 60000) break;
+    const fs::path& path = it->path();
+    if (it->is_directory(ec)) {
+      if (it.depth() >= 9 || _wcsicmp(path.filename().c_str(), L"HSF_streamline") == 0) it.disable_recursion_pending();
+      continue;
+    }
+    if (_wcsicmp(path.filename().c_str(), L"nvngx_dlss.dll") == 0) return path.parent_path().wstring();
+  }
+  return {};
+}
+
 bool StartStreamline() {
   const std::wstring dll = g_folder + L"\\sl.interposer.dll";
   g_interposer = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
@@ -160,12 +199,16 @@ bool StartStreamline() {
     return false;
   }
   const sl::Feature features[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
-  const wchar_t* paths[] = {g_folder.c_str()};
+  // HSF's folder first (DLSS-G comes from there), then the game's own DLSS folder so its DLSS stays (see FindGameDlssFolder)
+  static std::wstring game_dlss;
+  game_dlss = FindGameDlssFolder();
+  const wchar_t* paths[] = {g_folder.c_str(), game_dlss.c_str()};
+  Line("NGX paths for Streamline: %ls%ls%ls", g_folder.c_str(), game_dlss.empty() ? L"" : L" + the game's DLSS in ", game_dlss.c_str());
   sl::Preferences pref{};
   pref.showConsole = false;
   pref.logLevel = sl::LogLevel::eDefault;
   pref.pathsToPlugins = paths;
-  pref.numPathsToPlugins = 1;
+  pref.numPathsToPlugins = game_dlss.empty() ? 1u : 2u;
   pref.pathToLogsAndData = g_folder.c_str();
   pref.logMessageCallback = SlLogLine;
   if (!g_start_options.log) {
