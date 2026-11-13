@@ -62,6 +62,7 @@ These need no game. Most need an NVIDIA GPU, and the D3D12 ones need D3D12.
 | `build\x64\sl_game_test.exe` | hooks on a copy of `sl.interposer.dll` |
 | `build\x64\sl_bring_test.exe` | HSF bringing Streamline into a small D3D12 program (needs Streamline's DLLs next to it) |
 | `build\x64\ngx_input_test.exe` | the NGX hook on this machine's `_nvngx.dll` |
+| `build\x64\depth_fit_test.exe` | depth fit: render-size depth brought up to the vectors' size |
 | `build\<arch>\camera_test.exe` | camera scanner, chooser and fit, no GPU |
 | `build\<arch>\camera_replay.exe <recording>` | replays an F6 recording |
 | `build\<arch>\score_test.exe`, `hud_test.exe`, `depth_test.exe`, `launchpad_tune_test.exe` | score, HUD, depth, tune rules |

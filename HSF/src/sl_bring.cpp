@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <psapi.h>
 
 #include <sl.h>
 #include <sl_consts.h>
@@ -21,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -28,6 +30,7 @@
 
 #include "compose.h"
 #include "debug_view.h"
+#include "depth_fit.h"
 #include "frame_checks.h"
 #include "nvof_flow.h"
 
@@ -98,6 +101,16 @@ PresentFn g_real_present = nullptr;
 Present1Fn g_real_present1 = nullptr;
 std::atomic<void*> g_game_swap_chain{nullptr};
 UINT g_back_buffers = 3;
+// The swap chain DXGI made for Streamline, under Streamline's own: DLSS-G presents on it, so its colour space is what the screen shows. Not held: it lives as long as
+// the game's, and is only used while the game presents.
+std::atomic<IUnknown*> g_native_swap_chain{nullptr};
+// The game's colour space (DXGI_COLOR_SPACE_TYPE) from FrameFeed, and what CheckColourSpace last logged for g_native_swap_chain. UINT32_MAX: none yet.
+std::atomic<uint32_t> g_game_space{UINT32_MAX};
+IUnknown* g_space_on = nullptr;
+uint32_t g_space_set = UINT32_MAX;
+uint32_t g_space_has = UINT32_MAX;
+// The swap chain is FP16 (scRGB), which DLSS-G does not take.
+std::atomic<bool> g_fp16{false};
 
 std::atomic<uint32_t> g_swap_chains{0}, g_failed{0};
 std::atomic<int> g_plugin_loaded{-1}, g_supported{-1}, g_status{-1};
@@ -149,17 +162,42 @@ bool Lookup(T*& out, const char* name) {
 // The folder of the game's own nvngx_dlss.dll, for games that call DLSS through NGX themselves. Streamline starts NGX (sl.common, for DLSS-G) with only
 // the plugin folders it was given as the place to look for NGX's feature DLLs, and it starts it before the game does. When the game then asks whether DLSS can
 // run, NGX looks only in those folders, finds no nvngx_dlss.dll, and the game hides DLSS from its menu (Lies of P, Unreal's DLSS plugin). So the game's folder
-// goes in the list too, after HSF's, and its DLSS stays. HSF.ini's SlNgxPath wins; otherwise a bounded search from the game's root (the exe folder, or for
-// Unreal the folder above <Project>\Binaries\Win64 that holds Engine). HSF_streamline itself is skipped.
+// goes in the list too, after HSF's, and its DLSS stays. HSF.ini's SlNgxPath wins; then a copy already loaded in the game; otherwise a bounded search from the
+// game's root (the exe folder, or for Unreal the folder above <Project>\Binaries\Win64 that holds Engine). HSF_streamline itself is skipped. The search's
+// answer goes into SlNgxPath, so it runs once per game: a folder, or "none:<the exe's write time>" when there is no copy, searched again after a game update.
+void SaveNgxPath(const std::wstring& value) {
+  if (!g_start_options.ini_path.empty()) WritePrivateProfileStringW(L"HSF", L"SlNgxPath", value.c_str(), g_start_options.ini_path.c_str());
+}
+
 std::wstring FindGameDlssFolder() {
   namespace fs = std::filesystem;
   std::error_code ec;
-  if (!g_start_options.ngx_path.empty()) {
-    if (fs::exists(fs::path(g_start_options.ngx_path) / L"nvngx_dlss.dll", ec)) return g_start_options.ngx_path;
-    Line("SlNgxPath has no nvngx_dlss.dll: %ls", g_start_options.ngx_path.c_str());
-  }
   wchar_t exe[MAX_PATH] = L"";
   if (GetModuleFileNameW(nullptr, exe, MAX_PATH) == 0) return {};
+  wchar_t stamp[32] = L"none:0";
+  WIN32_FILE_ATTRIBUTE_DATA exe_data{};
+  if (GetFileAttributesExW(exe, GetFileExInfoStandard, &exe_data))
+    swprintf_s(stamp, L"none:%08lx%08lx", exe_data.ftLastWriteTime.dwHighDateTime, exe_data.ftLastWriteTime.dwLowDateTime);
+  const std::wstring& saved = g_start_options.ngx_path;
+  if (saved == stamp) {
+    Line("no game DLSS to keep (searched at an earlier start; searched again once the game's exe changes)");
+    return {};
+  }
+  if (!saved.empty() && saved.rfind(L"none:", 0) != 0) {
+    if (fs::exists(fs::path(saved) / L"nvngx_dlss.dll", ec)) return saved;
+    Line("SlNgxPath has no nvngx_dlss.dll: %ls", saved.c_str());
+  }
+  // The game has its DLSS loaded already: that copy is the one it uses.
+  if (const HMODULE loaded = GetModuleHandleW(L"nvngx_dlss.dll")) {
+    wchar_t path[MAX_PATH] = L"";
+    if (GetModuleFileNameW(loaded, path, MAX_PATH) != 0) {
+      const std::wstring folder = fs::path(path).parent_path().wstring();
+      if (_wcsicmp(fs::path(folder).filename().c_str(), L"HSF_streamline") != 0) {
+        SaveNgxPath(folder);
+        return folder;
+      }
+    }
+  }
   // The exe folder. Only for Unreal's own layout (<root>\<Project>\Binaries\<platform>\game.exe, with the engine in <root>\Engine) the game's root instead.
   // Nothing else climbs: a folder that just happens to hold one named Engine (a store library with a game installed as "Engine") would make the search
   // cover other games and could find their copy.
@@ -171,17 +209,36 @@ std::wstring FindGameDlssFolder() {
         (fs::is_directory(game_root / L"Engine" / L"Binaries", ec) || fs::is_directory(game_root / L"Engine" / L"Plugins", ec)))
       root = game_root;
   }
-  int seen = 0;
+  // Every copy is listed in the log; with more than one, the newest file is taken (an older one is likelier a leftover).
+  int seen = 0, found = 0;
+  bool complete = true;
+  fs::path best;
+  fs::file_time_type best_time{};
   for (auto it = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
-    if (++seen > 60000) break;
+    if (++seen > 60000) {
+      complete = false;
+      break;
+    }
     const fs::path& path = it->path();
     if (it->is_directory(ec)) {
       if (it.depth() >= 9 || _wcsicmp(path.filename().c_str(), L"HSF_streamline") == 0) it.disable_recursion_pending();
       continue;
     }
-    if (_wcsicmp(path.filename().c_str(), L"nvngx_dlss.dll") == 0) return path.parent_path().wstring();
+    if (_wcsicmp(path.filename().c_str(), L"nvngx_dlss.dll") != 0) continue;
+    ++found;
+    const fs::file_time_type time = fs::last_write_time(path, ec);
+    Line("the game's DLSS: found %ls", path.c_str());
+    if (best.empty() || time > best_time) {
+      best = path.parent_path();
+      best_time = time;
+    }
   }
-  return {};
+  if (ec) complete = false;
+  if (found > 1) Line("the game's DLSS: %d copies, the newest is used: %ls", found, best.c_str());
+  // A search cut short by the entry limit or an error says nothing about "none", so that is not saved.
+  if (!best.empty()) SaveNgxPath(best.wstring());
+  else if (complete) SaveNgxPath(stamp);
+  return best.wstring();
 }
 
 bool StartStreamline() {
@@ -248,6 +305,263 @@ bool WriteSlot(void** table, int slot, void* value) {
   return true;
 }
 
+// DLSS-G's own calls on ReShade's device go to the native device under it.
+// Streamline is told about ReShade's device (see FactoryForDevice), so DLSS-G's command lists, textures and views would be ReShade's too. ReShade then reports them to its add-ons, and RenoDX's
+// swap chain mod redirects DLSS-G's copies to its own clones of the back buffers: the screen shows stale, out of order frames. Here, every method of ReShade's device that DLSS-G's code calls
+// runs on the native device instead, except making a command queue: DLSS-G's present queue stays ReShade's, which is what RTSS needs. The game and everyone else still get ReShade's device.
+// Only the calls from HSF's own Streamline folder, nvngx_dlssg.dll and the driver's newer copies of them count as DLSS-G's, and calls from NVAPI and NGX's core when DLSS-G called those: a
+// descriptor heap DLSS-G made on the native device must not reach ReShade's methods, which read its handles as ReShade's own. ReShade passes a command list that is not its own straight through to the queue.
+namespace route {
+
+constexpr uint32_t SLOT_CREATE_COMMAND_QUEUE = 8;
+constexpr uint32_t SLOT_CREATE_COMMAND_QUEUE1 = 75;  // ID3D12Device9
+constexpr uint32_t FIRST_SLOT = 3;                   // after IUnknown, whose reference counts stay ReShade's
+constexpr uint32_t MAX_SLOTS = 83;                   // methods in ID3D12Device14
+constexpr size_t THUNK_SIZE = 96;
+
+// Whose code calls the device. SHARED is NVIDIA's code that works for both DLSS-G and the game's own DLSS (NVAPI, NGX's core): whose call it is depends on who called it.
+enum Kind : uint8_t { OTHER, DLSSG, SHARED };
+
+struct Range {
+  uintptr_t begin = 0, end = 0;
+  Kind kind = OTHER;
+};
+Range g_ranges[64];
+std::atomic<uint32_t> g_range_count{0};
+SRWLOCK g_range_lock = SRWLOCK_INIT;
+void** g_native_table = nullptr;
+uintptr_t g_thunks_begin = 0, g_thunks_end = 0;
+std::atomic<uint32_t> g_routed{0};
+std::atomic<uint32_t> g_routed_shared{0};
+
+Kind ModuleKind(HMODULE module) {
+  wchar_t path[MAX_PATH] = L"";
+  if (GetModuleFileNameW(module, path, MAX_PATH) == 0) return OTHER;
+  const wchar_t* const name = wcsrchr(path, L'\\') != nullptr ? wcsrchr(path, L'\\') + 1 : path;
+  if (_wcsicmp(name, L"nvngx_dlssg.dll") == 0) return DLSSG;
+  if (_wcsicmp(name, L"nvapi64_impl.dll") == 0 || _wcsicmp(name, L"nvapi64.dll") == 0 || _wcsicmp(name, L"_nvngx.dll") == 0 || _wcsicmp(name, L"nvngx.dll") == 0) return SHARED;
+  // The driver runs newer copies of DLSS-G and of Streamline's parts from its own store, under names like 160_E658700.bin: NGX\models\dlssg\... and NGX\models\sl_common_override_0\...
+  // The game's own DLSS (models\dlss, models\dlssd) stays on ReShade's device.
+  std::wstring lower(path);
+  for (wchar_t& c : lower) c = towlower(c);
+  if (lower.find(L"\\ngx\\models\\dlssg\\") != std::wstring::npos || lower.find(L"\\ngx\\models\\sl_") != std::wstring::npos) return DLSSG;
+  const size_t length = g_folder.size();
+  return length != 0 && _wcsnicmp(path, g_folder.c_str(), length) == 0 && (path[length] == L'\\' || path[length] == L'/') ? DLSSG : OTHER;
+}
+
+// Whose code is at `address`. Each module is looked up once; the game's calls find their module in the first few entries.
+Kind KindAt(uintptr_t address) {
+  if (address >= g_thunks_begin && address < g_thunks_end) return OTHER;
+  const uint32_t count = g_range_count.load(std::memory_order_acquire);
+  for (uint32_t i = 0; i < count; ++i) {
+    if (address >= g_ranges[i].begin && address < g_ranges[i].end) return g_ranges[i].kind;
+  }
+  HMODULE module = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(address), &module) || module == nullptr) return OTHER;
+  const Kind kind = ModuleKind(module);
+  const auto* const dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+  const auto* const nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const uint8_t*>(module) + dos->e_lfanew);
+  AcquireSRWLockExclusive(&g_range_lock);
+  const uint32_t now = g_range_count.load(std::memory_order_relaxed);
+  bool known = false;
+  for (uint32_t i = 0; i < now; ++i) known = known || g_ranges[i].begin == reinterpret_cast<uintptr_t>(module);
+  if (!known && now < std::size(g_ranges)) {
+    g_ranges[now] = {reinterpret_cast<uintptr_t>(module), reinterpret_cast<uintptr_t>(module) + nt->OptionalHeader.SizeOfImage, kind};
+    g_range_count.store(now + 1, std::memory_order_release);
+    if (kind != OTHER) {
+      wchar_t path[MAX_PATH] = L"";
+      GetModuleFileNameW(module, path, MAX_PATH);
+      Line("DLSS-G route: %ls is %s", path, kind == DLSSG ? "DLSS-G's: its calls go to the native device" : "shared: its calls go to the native device when DLSS-G made them");
+    }
+  }
+  ReleaseSRWLockExclusive(&g_range_lock);
+  return kind;
+}
+
+// Whether `address` follows a call instruction: E8 rel32, or FF /2 through a register or memory.
+bool AfterCall(uintptr_t address) {
+  const auto* const p = reinterpret_cast<const uint8_t*>(address);
+  __try {
+    if (p[-5] == 0xE8) return true;
+    if (p[-6] == 0xFF && (p[-5] & 0x38) == 0x10) return true;  // call [rip+disp32] or [reg+disp32]
+    if (p[-3] == 0xFF && (p[-2] & 0x38) == 0x10) return true;  // call [reg+disp8]
+    if (p[-2] == 0xFF && (p[-1] & 0x38) == 0x10) return true;  // call reg or [reg]
+    if (p[-7] == 0xFF && (p[-6] & 0x38) == 0x10) return true;  // call [reg+index*scale+disp32]
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  return false;
+}
+
+// Whether DLSS-G is among the callers of this call. The unwinder stops at NVAPI's frames, so after the walk the stack itself is read: a value inside DLSS-G's code that follows a call
+// instruction is a return address into it. `stack` is where the thunk's caller left its return address.
+bool DlssgOnStack(const uintptr_t* stack, int& how) {
+  void* frames[48];
+  const USHORT count = RtlCaptureStackBackTrace(2, static_cast<DWORD>(std::size(frames)), frames, nullptr);
+  for (USHORT i = 0; i < count; ++i) {
+    if (KindAt(reinterpret_cast<uintptr_t>(frames[i])) == DLSSG) {
+      how = 1;
+      return true;
+    }
+  }
+  NT_TIB* const tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+  const auto* const top = reinterpret_cast<const uintptr_t*>(tib->StackBase);
+  for (const uintptr_t* slot = stack + 1; slot < stack + 1024 && slot < top; ++slot) {
+    const uintptr_t value = *slot;
+    if (value < 0x10000 || KindAt(value) != DLSSG) continue;
+    if (AfterCall(value)) {
+      how = 2;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Called by each method's thunk with where its caller's return address is: the native device's method when the call is DLSS-G's, otherwise nullptr (ReShade's method runs).
+void* __stdcall Decide(const uintptr_t* stack, uint32_t slot) {
+  if (slot == SLOT_CREATE_COMMAND_QUEUE || slot == SLOT_CREATE_COMMAND_QUEUE1) return nullptr;
+  const Kind kind = KindAt(*stack);
+  if (kind == OTHER) return nullptr;
+  if (kind == SHARED) {
+    int how = 0;
+    if (!DlssgOnStack(stack, how)) {
+      static std::atomic<uint32_t> left{0};
+      if (left.fetch_add(1, std::memory_order_relaxed) < 6) Line("DLSS-G route: method %u of the device, from NVIDIA's shared code with no DLSS-G caller found, left to ReShade", slot);
+      return nullptr;
+    }
+    if (g_routed_shared.fetch_add(1, std::memory_order_relaxed) < 12) Line("DLSS-G route: method %u of the device, called for DLSS-G through NVIDIA's shared code (found by %s), sent to the native one", slot, how == 1 ? "the unwinder" : "the stack");
+  } else if (g_routed.fetch_add(1, std::memory_order_relaxed) < 12) {
+    Line("DLSS-G route: method %u of the device sent to the native one", slot);
+  }
+  return g_native_table[slot];
+}
+
+// Unwind data for the thunks, the same for each: push rcx, push rdx, push r8, push r9, sub rsp 0x28 (prolog of 10 bytes).
+struct ThunkUnwind {
+  uint8_t version_flags = 1;
+  uint8_t prolog_size = 10;
+  uint8_t code_count = 5;
+  uint8_t frame = 0;
+  uint8_t codes[12] = {
+      10, 0x42,  // at 10: UWOP_ALLOC_SMALL, (0x28 - 8) / 8 = 4
+      6,  0x90,  // at 6: UWOP_PUSH_NONVOL r9
+      4,  0x80,  // at 4: UWOP_PUSH_NONVOL r8
+      2,  0x20,  // at 2: UWOP_PUSH_NONVOL rdx
+      1,  0x10,  // at 1: UWOP_PUSH_NONVOL rcx
+      0,  0,     // padding to an even count
+  };
+};
+
+// x64 thunk for one slot: keeps the four register arguments, asks Decide, then jumps to the native method with the native device as `this`, or to ReShade's method unchanged.
+// No ID3D12Device method takes a floating point argument by value, so the vector registers need no saving. Stack arguments are untouched: the stack is back as it came before either jump.
+void WriteThunk(uint8_t* code, uint32_t slot, void* native_device, void* reshade_method) {
+  uint8_t* p = code;
+  const auto put = [&](std::initializer_list<uint8_t> bytes) { for (uint8_t b : bytes) *p++ = b; };
+  const auto put64 = [&](const void* value) { std::memcpy(p, &value, 8); p += 8; };
+  put({0x51, 0x52, 0x41, 0x50, 0x41, 0x51});        // push rcx; push rdx; push r8; push r9
+  put({0x48, 0x83, 0xEC, 0x28});                    // sub rsp, 0x28 (shadow space, 16 byte alignment)
+  put({0x48, 0x8D, 0x4C, 0x24, 0x48});              // lea rcx, [rsp+0x48]: where the caller's return address is
+  put({0xBA});                                      // mov edx, slot
+  std::memcpy(p, &slot, 4);
+  p += 4;
+  put({0x48, 0xB8});                                // mov rax, Decide
+  put64(reinterpret_cast<const void*>(&Decide));
+  put({0xFF, 0xD0});                                // call rax
+  put({0x48, 0x83, 0xC4, 0x28});                    // add rsp, 0x28
+  put({0x41, 0x59, 0x41, 0x58, 0x5A, 0x59});        // pop r9; pop r8; pop rdx; pop rcx
+  put({0x48, 0x85, 0xC0});                          // test rax, rax
+  put({0x74, 0x0C});                                // jz to ReShade's method
+  put({0x48, 0xB9});                                // mov rcx, native device
+  put64(native_device);
+  put({0xFF, 0xE0});                                // jmp rax
+  put({0x48, 0xB8});                                // mov rax, ReShade's method
+  put64(reshade_method);
+  put({0xFF, 0xE0});                                // jmp rax
+}
+
+// A RenoDX add-on in the process: renodx-*.addon64. The DLSS NR mod (renodx-dlss) does not count: the route is for RenoDX's HDR mods, and with the NR mod
+// it took NGX calls the game and the mod make to find DLSS, so neither saw DLSS (Jusant).
+bool RenoDxLoaded() {
+  HMODULE modules[1024];
+  DWORD needed = 0;
+  if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) return false;
+  const DWORD count = std::min<DWORD>(needed / sizeof(HMODULE), static_cast<DWORD>(std::size(modules)));
+  for (DWORD i = 0; i < count; ++i) {
+    wchar_t path[MAX_PATH] = L"";
+    if (GetModuleFileNameW(modules[i], path, MAX_PATH) == 0) continue;
+    const wchar_t* const name = wcsrchr(path, L'\\') != nullptr ? wcsrchr(path, L'\\') + 1 : path;
+    if (_wcsnicmp(name, L"renodx", 6) == 0 && _wcsnicmp(name, L"renodx-dlss", 11) != 0) return true;
+  }
+  return false;
+}
+
+// Methods in the newest ID3D12Device both objects have.
+uint32_t SlotCount(ID3D12Device* device) {
+  const struct { IID iid; uint32_t slots; } versions[] = {
+      {__uuidof(ID3D12Device14), 83}, {__uuidof(ID3D12Device13), 82}, {__uuidof(ID3D12Device12), 81}, {__uuidof(ID3D12Device11), 80}, {__uuidof(ID3D12Device10), 79},
+      {__uuidof(ID3D12Device9), 76},  {__uuidof(ID3D12Device8), 73},  {__uuidof(ID3D12Device7), 68},  {__uuidof(ID3D12Device6), 66},  {__uuidof(ID3D12Device5), 65},
+      {__uuidof(ID3D12Device4), 57},  {__uuidof(ID3D12Device3), 51},  {__uuidof(ID3D12Device2), 48},  {__uuidof(ID3D12Device1), 47},
+  };
+  for (const auto& version : versions) {
+    IUnknown* found = nullptr;
+    if (SUCCEEDED(device->QueryInterface(version.iid, reinterpret_cast<void**>(&found))) && found != nullptr) {
+      found->Release();
+      return version.slots;
+    }
+  }
+  return 44;
+}
+
+// mode: -1 when RenoDX is loaded, 0 never, 1 always. Once, before Streamline is told about `reshade_device`.
+void Install(ID3D12Device* reshade_device, ID3D12Device* native_device, int mode) {
+  static bool done = false;
+  if (done || reshade_device == nullptr || native_device == nullptr || reshade_device == native_device) return;
+  done = true;
+  const bool renodx = RenoDxLoaded();
+  if (mode == 0 || (mode < 0 && !renodx)) {
+    Line("DLSS-G route: off (RenoDX loaded %d, SlRouteDlssg %d)", renodx ? 1 : 0, mode);
+    return;
+  }
+  const uint32_t slots = std::min({SlotCount(reshade_device), SlotCount(native_device), MAX_SLOTS});
+  // The thunks call into this module for as long as the process lives.
+  HMODULE self = nullptr;
+  GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&Decide), &self);
+  // The thunks, then their unwind data, then the function table that points each thunk at it.
+  const size_t code_size = slots * THUNK_SIZE;
+  const size_t unwind_at = code_size;
+  const size_t functions_at = unwind_at + ((sizeof(ThunkUnwind) + 7) & ~size_t{7});
+  const size_t total = functions_at + slots * sizeof(RUNTIME_FUNCTION);
+  auto* const code = static_cast<uint8_t*>(VirtualAlloc(nullptr, total, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+  if (code == nullptr) {
+    Line("DLSS-G route: no memory for the thunks");
+    return;
+  }
+  g_native_table = *reinterpret_cast<void***>(native_device);
+  void** const table = *reinterpret_cast<void***>(reshade_device);
+  for (uint32_t slot = FIRST_SLOT; slot < slots; ++slot) WriteThunk(code + slot * THUNK_SIZE, slot, native_device, table[slot]);
+  new (code + unwind_at) ThunkUnwind{};
+  auto* const functions = reinterpret_cast<RUNTIME_FUNCTION*>(code + functions_at);
+  for (uint32_t slot = FIRST_SLOT; slot < slots; ++slot) {
+    functions[slot - FIRST_SLOT] = {static_cast<DWORD>(slot * THUNK_SIZE), static_cast<DWORD>(slot * THUNK_SIZE + THUNK_SIZE), static_cast<DWORD>(unwind_at)};
+  }
+  DWORD old = 0;
+  // One protection for all of it: the unwind data shares the thunks' last page.
+  VirtualProtect(code, total, PAGE_EXECUTE_READ, &old);
+  FlushInstructionCache(GetCurrentProcess(), code, code_size);
+  const bool unwind = RtlAddFunctionTable(functions, slots - FIRST_SLOT, reinterpret_cast<DWORD64>(code)) != FALSE;
+  g_thunks_begin = reinterpret_cast<uintptr_t>(code);
+  g_thunks_end = g_thunks_begin + code_size;
+  if (!unwind) Line("DLSS-G route: the thunks' unwind data was not taken");
+  if (!VirtualProtect(&table[FIRST_SLOT], (slots - FIRST_SLOT) * sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) {
+    Line("DLSS-G route: ReShade's device table could not be changed");
+    return;
+  }
+  for (uint32_t slot = FIRST_SLOT; slot < slots; ++slot) table[slot] = code + slot * THUNK_SIZE;
+  VirtualProtect(&table[FIRST_SLOT], (slots - FIRST_SLOT) * sizeof(void*), old, &old);
+  Line("DLSS-G route: on (RenoDX loaded %d, SlRouteDlssg %d), %u methods of ReShade's device %p, native %p", renodx ? 1 : 0, mode, slots - FIRST_SLOT, static_cast<void*>(reshade_device), static_cast<void*>(native_device));
+}
+
+}  // namespace route
+
 // Tells Streamline about the device, then gives its factory. nullptr means the game gets a plain swap chain.
 // The device comes from the game's queue, so under ReShade it is ReShade's proxy and not the native one. DLSS-G makes its present queue on this device, and RTSS calls D3D11On12CreateDevice
 // on what it finds there, which makes dxgi.dll abort under ReShade for any device that is not a proxy (the crash of 0.3.0).
@@ -260,6 +574,8 @@ IDXGIFactory2* FactoryForDevice(ID3D12CommandQueue* queue) {
   if (device == g_device_set) {
     device->Release();
   } else {
+    // Before Streamline sees the device: its plugins make objects on it as they start.
+    route::Install(device, g_device.load(), g_start_options.route_dlssg);
     // That reference stays: Streamline keeps using the device.
     const sl::Result result = g_sl_set_device(device);
     Line("slSetD3DDevice %p, from the game's queue (native one %p): %d", device, g_device.load(), static_cast<int>(result));
@@ -515,9 +831,38 @@ void SetOptions(bool on, uint32_t frames, uint32_t width, uint32_t height, uint3
   Line("DLSS-G %s, %u generated per real frame, picture %ux%u format %u, inputs %ux%u: %d", on ? "ON" : "off", frames, width, height, static_cast<unsigned>(colour), input_width, input_height, static_cast<int>(result));
 }
 
+// ---- The screen's colour space ----
+
+// A mod such as RenoDX sets the game's colour space (HDR10: ST.2084 with BT.2020 primaries) on the swap chain under ReShade's, which here is Streamline's.
+// The swap chain DLSS-G presents on is the one under that, and it must carry the same colour space, or an HDR10 picture shows as SDR. Streamline
+// passes it on itself; this only says in the log whether the two agree, once each time that changes. The colour space on the swap chain under
+// Streamline is read from the private data RenoDX's ChangeColorSpace (src/utils/swapchain.hpp) writes next to SetColorSpace1, which Special K and
+// ReShade read too.
+constexpr GUID SKID_SWAP_CHAIN_COLOR_SPACE = {0x18b57e4, 0x1493, 0x4953, {0xad, 0xf2, 0xde, 0x6d, 0x99, 0xcc, 0x5, 0xe5}};
+
+void CheckColourSpace() {
+  IUnknown* const native = g_native_swap_chain.load();
+  const uint32_t want = g_game_space.load();
+  if (native == nullptr || want == UINT32_MAX) return;
+  ComPtr<IDXGISwapChain3> swap;
+  if (FAILED(native->QueryInterface(IID_PPV_ARGS(&swap)))) return;
+  DXGI_COLOR_SPACE_TYPE had = DXGI_COLOR_SPACE_CUSTOM;
+  UINT size = sizeof(had);
+  const uint32_t has = SUCCEEDED(swap->GetPrivateData(SKID_SWAP_CHAIN_COLOR_SPACE, &size, &had)) && size == sizeof(had) ? static_cast<uint32_t>(had) : UINT32_MAX;
+  if (native == g_space_on && want == g_space_set && has == g_space_has) return;
+  g_space_on = native;
+  g_space_set = want;
+  g_space_has = has;
+  char text[24] = "not set";
+  if (has != UINT32_MAX) std::snprintf(text, sizeof(text), "%u", has);
+  Line("colour space: the game's is %u; the swap chain under Streamline (%p) has %s%s", want, static_cast<void*>(native), text,
+       has == UINT32_MAX || has == want ? "" : ": they differ, the picture may look wrong");
+}
+
 // ---- Present: everything that must be just before or after the real one ----
 
 void BeforePresent() {
+  CheckColourSpace();
   if (g_sl_new_token == nullptr) return;
   if (g_token == nullptr) BeginFrame(false);
   Mark(sl::PCLMarker::eSimulationEnd);
@@ -667,14 +1012,21 @@ HRESULT NativeCreate(IDXGIFactory* factory, IUnknown* queue, DXGI_SWAP_CHAIN_DES
                            [&] { return real(factory, queue, desc, swap_chain); });
 }
 
+// Streamline's call down to DXGI: the swap chain it makes is the one DLSS-G presents on.
+template <typename T>
+HRESULT KeepNative(HRESULT hr, T** swap_chain) {
+  if (SUCCEEDED(hr) && swap_chain != nullptr && *swap_chain != nullptr) g_native_swap_chain = *swap_chain;
+  return hr;
+}
+
 // Under the wrapper, on DXGI's own table.
 HRESULT STDMETHODCALLTYPE HookNativeForHwnd(IDXGIFactory2* factory, IUnknown* queue, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen, IDXGIOutput* output, IDXGISwapChain1** swap_chain) {
-  if (t_inside) return g_native_for_hwnd(factory, RealQueue(queue), hwnd, desc, fullscreen, output, swap_chain);
+  if (t_inside) return KeepNative(g_native_for_hwnd(factory, RealQueue(queue), hwnd, desc, fullscreen, output, swap_chain), swap_chain);
   return NativeForHwnd(factory, queue, hwnd, desc, fullscreen, output, swap_chain, g_native_for_hwnd);
 }
 
 HRESULT STDMETHODCALLTYPE HookNativeCreate(IDXGIFactory* factory, IUnknown* queue, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** swap_chain) {
-  if (t_inside) return g_native_create(factory, RealQueue(queue), desc, swap_chain);
+  if (t_inside) return KeepNative(g_native_create(factory, RealQueue(queue), desc, swap_chain), swap_chain);
   return NativeCreate(factory, queue, desc, swap_chain, g_native_create);
 }
 
@@ -682,8 +1034,8 @@ HRESULT STDMETHODCALLTYPE HookNativeCreate(IDXGIFactory* factory, IUnknown* queu
 HRESULT STDMETHODCALLTYPE HookCreateForHwnd(IDXGIFactory2* factory, IUnknown* queue, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen, IDXGIOutput* output, IDXGISwapChain1** swap_chain) {
   if (t_inside) {
     // Streamline's call down. Its base factory may be the wrapper's: going through that would wrap this swap chain a second time.
-    if (g_native_for_hwnd != nullptr && t_native_factory != nullptr) return g_native_for_hwnd(static_cast<IDXGIFactory2*>(t_native_factory), RealQueue(queue), hwnd, desc, fullscreen, output, swap_chain);
-    return g_real_for_hwnd(factory, queue, hwnd, desc, fullscreen, output, swap_chain);
+    if (g_native_for_hwnd != nullptr && t_native_factory != nullptr) return KeepNative(g_native_for_hwnd(static_cast<IDXGIFactory2*>(t_native_factory), RealQueue(queue), hwnd, desc, fullscreen, output, swap_chain), swap_chain);
+    return KeepNative(g_real_for_hwnd(factory, queue, hwnd, desc, fullscreen, output, swap_chain), swap_chain);
   }
   HRESULT hr;
   if (g_native_for_hwnd != nullptr) {
@@ -699,8 +1051,8 @@ HRESULT STDMETHODCALLTYPE HookCreateForHwnd(IDXGIFactory2* factory, IUnknown* qu
 
 HRESULT STDMETHODCALLTYPE HookCreateSwapChain(IDXGIFactory* factory, IUnknown* queue, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** swap_chain) {
   if (t_inside) {
-    if (g_native_create != nullptr && t_native_factory != nullptr) return g_native_create(static_cast<IDXGIFactory*>(t_native_factory), RealQueue(queue), desc, swap_chain);
-    return g_real_create(factory, queue, desc, swap_chain);
+    if (g_native_create != nullptr && t_native_factory != nullptr) return KeepNative(g_native_create(static_cast<IDXGIFactory*>(t_native_factory), RealQueue(queue), desc, swap_chain), swap_chain);
+    return KeepNative(g_real_create(factory, queue, desc, swap_chain), swap_chain);
   }
   HRESULT hr;
   if (g_native_create != nullptr) {
@@ -822,6 +1174,8 @@ struct Feeder {
   bool compose_ready = false, mask_ready = false, had_compose = false;
   debugview::Pass view;
   bool view_tried = false, view_ready = false;
+  depthfit::Pass depth_fit;
+  bool depth_fit_tried = false, depth_fit_ready = false;
   nvof::Flow nvof;
   ComPtr<ID3D12Resource> mvec, composed, colour;
   // Zero motion in the motion format, for a frame NVIDIA Optical Flow has nothing for while no effect gives a flow (its first, or after a failure).
@@ -1011,10 +1365,27 @@ bool FeedFrame(const FrameFeed& in) {
   if ((in.motion == nullptr && !nvof_alone) || in.depth == nullptr || in.back_buffer == nullptr) return false;
   if (in.tag == nullptr && (g_sl_tag == nullptr || g_sl_constants == nullptr || g_sl_dlssg_options == nullptr || g_token == nullptr)) return false;
   const D3D12_RESOURCE_DESC back = in.back_buffer->GetDesc();
-  const D3D12_RESOURCE_DESC depth_desc = in.depth->GetDesc();
+  if (in.colour_space != UINT32_MAX) g_game_space = in.colour_space;
+  // DLSS-G takes SDR or HDR10 frames, not FP16 (NVIDIA's DLSS-G guide, section 11.0): it accepts the options and shows only the real frames. The helper converts
+  // FP16 to HDR10 for its own swap chain, but here DLSS-G presents on the game's, so the game (or RenoDX's swap chain setting) has to output HDR10.
+  const bool fp16 = back.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || back.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS;
+  if (fp16 && !g_fp16.exchange(true)) Line("the swap chain is FP16 (scRGB): DLSS-G generates nothing from it; set the game or RenoDX to HDR10");
+  if (!fp16) g_fp16 = false;
+  D3D12_RESOURCE_DESC depth_desc = in.depth->GetDesc();
   D3D12_RESOURCE_DESC motion_desc = depth_desc;
   if (nvof_alone) motion_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
   else motion_desc = in.motion->GetDesc();
+  // A game's DLSS can give full size vectors with depth at the render size (Unreal Engine 4). DLSS-G takes one size for both, so the depth is brought up to the vectors'
+  // (depth_fit.h) and everything below sees it at that size. A flow's smaller depth is still the game's dynamic resolution, below.
+  const bool fit_depth = in.dilated && !nvof_alone && (depth_desc.Width < motion_desc.Width || depth_desc.Height < motion_desc.Height);
+  if (fit_depth) {
+    static bool logged = false;
+    if (!logged) Line("depth is %llux%u and the game's full size vectors %llux%u: the depth is brought up to the vectors' size", depth_desc.Width, depth_desc.Height, motion_desc.Width, motion_desc.Height);
+    logged = true;
+    depth_desc.Width = motion_desc.Width;
+    depth_desc.Height = motion_desc.Height;
+    depth_desc.Format = DXGI_FORMAT_R32_FLOAT;
+  }
   // DLSS-G takes one size for depth and motion. A smaller flow (LumeniteFX Kernel's is 1/8 size, as in FF7R) is brought up to the depth's size by the
   // compose pass, which reads it at its own size; HSF's motion texture and everything sized to the input then follow the depth. LaunchPad's flow already matches.
   const bool resize = depth_desc.Width != motion_desc.Width || depth_desc.Height != motion_desc.Height;
@@ -1053,6 +1424,14 @@ bool FeedFrame(const FrameFeed& in) {
     if (f == nullptr) return false;
   }
   if (resize && !f->compose_ready) return false;  // MakeFeeder said why
+  if (fit_depth && !f->depth_fit_tried) {
+    f->depth_fit_tried = true;
+    const char* what = nullptr;
+    HRESULT hr = S_OK;
+    f->depth_fit_ready = f->depth_fit.Init(in.device, f->input_width, f->input_height, compose::FRAMES, what, hr);
+    Line("depth fit pass: %s%s (0x%08lx)", f->depth_fit_ready ? "ready" : "not available: ", f->depth_fit_ready ? "" : what, hr);
+  }
+  if (fit_depth && !f->depth_fit_ready) return false;
   const UINT frame = static_cast<UINT>(f->count % compose::FRAMES);
   if (f->fence->GetCompletedValue() < f->alloc_value[frame]) {
     f->fence->SetEventOnCompletion(f->alloc_value[frame], f->event);
@@ -1066,6 +1445,12 @@ bool FeedFrame(const FrameFeed& in) {
   ID3D12GraphicsCommandList* const list = f->list.Get();
   f->alloc[frame]->Reset();
   list->Reset(f->alloc[frame].Get(), nullptr);
+  // The depth everything below reads and DLSS-G gets.
+  ID3D12Resource* depth = in.depth;
+  if (fit_depth) {
+    f->depth_fit.Record(list, frame, in.depth);
+    depth = f->depth_fit.Result();
+  }
   const bool composing = f->compose_ready && in.compose;
   const bool masking = f->mask_ready && in.mask;
   if (!composing && f->had_compose) f->compose.ForgetHistory();
@@ -1080,7 +1465,7 @@ bool FeedFrame(const FrameFeed& in) {
     n.colour_view = ReadableFormat(back.Format);
     n.colour_state = static_cast<D3D12_RESOURCE_STATES>(in.back_buffer_state);
     n.copy_colour = true;
-    n.depth = in.depth;
+    n.depth = depth;
     n.depth_inverted = in.depth_inverted;
     n.width = f->input_width;
     n.height = f->input_height;
@@ -1109,7 +1494,7 @@ bool FeedFrame(const FrameFeed& in) {
   if (composing) {
     ID3D12Resource* const composed_to = masking ? f->composed.Get() : f->mvec.Get();
     if (!masking) mvec_to(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    f->compose.Record(list, frame, flow, in.depth, composed_to, f->input_width, f->input_height, in.depth_inverted, in.scale, reset);
+    f->compose.Record(list, frame, flow, depth, composed_to, f->input_width, f->input_height, in.depth_inverted, in.scale, reset);
   }
   if (masking) {
     if (f->colour_state != D3D12_RESOURCE_STATE_COPY_DEST) Barrier(list, f->colour.Get(), f->colour_state, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1132,11 +1517,11 @@ bool FeedFrame(const FrameFeed& in) {
   const uint32_t motion_state = static_cast<uint32_t>(own_motion || flow_made ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : READ_ANY);
   if (in.tag != nullptr) {
     const uint32_t ext[4] = {extent.left, extent.top, extent.width, extent.height};
-    in.tag(list, in.depth, static_cast<uint32_t>(READ_ANY), tag_motion, motion_state, ext, in.scale, composing || in.dilated);
+    in.tag(list, depth, static_cast<uint32_t>(READ_ANY), tag_motion, motion_state, ext, in.scale, composing || in.dilated);
   } else {
-    sl::Resource depth(sl::ResourceType::eTex2d, in.depth, static_cast<uint32_t>(READ_ANY));
+    sl::Resource depth_tag(sl::ResourceType::eTex2d, depth, static_cast<uint32_t>(READ_ANY));
     sl::Resource mvec(sl::ResourceType::eTex2d, tag_motion, motion_state);
-    sl::ResourceTag tags[] = {sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &extent), sl::ResourceTag(&mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &extent)};
+    sl::ResourceTag tags[] = {sl::ResourceTag(&depth_tag, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &extent), sl::ResourceTag(&mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &extent)};
     const sl::Result tagged = g_sl_tag(*g_token, VIEWPORT, tags, static_cast<uint32_t>(std::size(tags)), reinterpret_cast<sl::CommandBuffer*>(list));
     if (tagged != sl::Result::eOk) {
       static int logged = 0;
@@ -1153,7 +1538,7 @@ bool FeedFrame(const FrameFeed& in) {
       Line("depth and motion view: %s%s (0x%08lx)", f->view_ready ? "ready" : "not available: ", f->view_ready ? "" : what, hr);
     }
     if (f->view_ready)
-      f->view.Record(list, frame, static_cast<debugview::Kind>(in.view), tag_motion, in.depth, partial ? in.x : 0, partial ? in.y : 0, partial ? in.width : 0, partial ? in.height : 0,
+      f->view.Record(list, frame, static_cast<debugview::Kind>(in.view), tag_motion, depth, partial ? in.x : 0, partial ? in.y : 0, partial ? in.width : 0, partial ? in.height : 0,
                      in.depth_inverted, in.scale, in.back_buffer, static_cast<D3D12_RESOURCE_STATES>(in.back_buffer_state));
   }
   list->Close();
@@ -1223,6 +1608,7 @@ Stats GetStats() {
   s.generating = g_generating.load();
   s.shown_per_real = g_shown_per_real.load();
   s.nvof_state = g_nvof_state.load();
+  s.fp16 = g_fp16.load();
   return s;
 }
 

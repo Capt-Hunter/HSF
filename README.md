@@ -124,7 +124,7 @@ Pull requests and bug reports are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md
 
 ### Contributors
 
-*(your name could be here)*
+- [RankFTW](https://github.com/RankFTW): the bring-in route keeps a game's own DLSS, and uses its full-size vectors ([#1](https://github.com/Capt-Hunter/HSF/pull/1)).
 
 ### Thanks
 

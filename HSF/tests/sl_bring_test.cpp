@@ -5,6 +5,8 @@
 #include <dxgi1_6.h>
 
 #include <cstdio>
+#include <cstring>
+#include <string>
 
 #include "../src/sl_bring.h"
 
@@ -119,6 +121,12 @@ int wmain(int argc, wchar_t** argv) {
     IDXGISwapChain3* with_index = nullptr;
     Check(SUCCEEDED(swap_chain->QueryInterface(IID_PPV_ARGS(&with_index))), "swap chain index");
     // DLSS-G generates nothing for a window without focus, which says nothing about HSF: this needs saying when it fails.
+    // HDR10 on the game's swap chain, as RenoDX sets it (SetColorSpace1, then Special K's private data). HSF logs whether the swap chain under Streamline's agrees.
+    const DXGI_COLOR_SPACE_TYPE hdr10 = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+    static constexpr GUID SKID = {0x18b57e4, 0x1493, 0x4953, {0xad, 0xf2, 0xde, 0x6d, 0x99, 0xcc, 0x5, 0xe5}};
+    const HRESULT space_hr = with_index->SetColorSpace1(hdr10);
+    with_index->SetPrivateData(SKID, sizeof(hdr10), &hdr10);
+    printf("     game's swap chain set to HDR10: 0x%08lx\n", space_hr);
     SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     SetForegroundWindow(hwnd);
     int frames_with_focus = 0;
@@ -145,6 +153,7 @@ int wmain(int argc, wchar_t** argv) {
       feed.on = true;
       feed.frames = 1;
       feed.nvof = nvof && i < 200;
+      feed.colour_space = static_cast<uint32_t>(hdr10);
       // The second half as from a game's upscaler: part of the textures, a size that changes, jitter, no clean-up.
       const bool partial = i >= 200;
       if (GetForegroundWindow() == hwnd) ++frames_with_focus;
@@ -184,10 +193,23 @@ int wmain(int argc, wchar_t** argv) {
     printf("     DLSS-G status 0x%x, up to %u generated frames\n", static_cast<unsigned>(stats.status), stats.max_frames);
     Check(stats.status != -1, "DLSS-G answers");
     Check(stats.max_frames >= 1, "DLSS-G says how many frames it can make");
+    Check(!stats.fp16, "an R10G10B10A2 swap chain is not taken for FP16");
   }
 
   hsf::slbring::Stop(false);
   Check((*reinterpret_cast<void***>(first_factory))[15] == slot_before, "the factory is as it was after Stop");
+  // The log, closed by Stop: the colour space line says what the swap chain under Streamline has.
+  std::string space_line;
+  FILE* log = nullptr;
+  if (_wfopen_s(&log, argv[2], L"r") == 0 && log != nullptr) {
+    char line[512];
+    while (fgets(line, sizeof(line), log) != nullptr)
+      if (strstr(line, "colour space:") != nullptr) space_line = line;
+    fclose(log);
+  }
+  printf("     %s", space_line.empty() ? "no colour space line\n" : space_line.c_str());
+  Check(space_line.find("the game's is 12;") != std::string::npos && space_line.find("they differ") == std::string::npos,
+        "the colour space line names the game's HDR10, and the swap chain DLSS-G presents on does not disagree");
   printf(g_failures == 0 ? "all ok\n" : "%d failed\n", g_failures);
   fflush(stdout);
   // Streamline stays in the process by design, so this leaves without tearing it down, as a game would be free to.

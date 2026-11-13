@@ -6,7 +6,7 @@ Every file tracked in `HSF/`, and what it is for.
 
 | Target | Output | Sources |
 |---|---|---|
-| `hsf_addon` | `hsf.addon64` / `hsf.addon32` | `hsf_addon.cpp ui.cpp dlssg_remote.cpp dx9_bridge.cpp gpu_fence9.cpp vk_bridge.cpp vk_hook.cpp score.cpp depth.cpp hud.cpp`. The 64-bit build adds `dlssg_core.cpp hdr_out.cpp` and the D3D12 modules (`HSF_SL_GAME`): `sl_game.cpp sl_bring.cpp ngx_input.cpp frame_checks.cpp compose.cpp debug_view.cpp`, and delay-loads `sl.interposer.dll`. |
+| `hsf_addon` | `hsf.addon64` / `hsf.addon32` | `hsf_addon.cpp ui.cpp dlssg_remote.cpp dx9_bridge.cpp gpu_fence9.cpp vk_bridge.cpp vk_hook.cpp score.cpp depth.cpp hud.cpp dxgi_guard.cpp`. The 64-bit build adds `dlssg_core.cpp hdr_out.cpp` and the D3D12 modules (`HSF_SL_GAME`): `sl_game.cpp sl_bring.cpp depth_fit.cpp ngx_input.cpp frame_checks.cpp compose.cpp debug_view.cpp`, and delay-loads `sl.interposer.dll`. |
 | `hsf_dlssg_helper` | `hsf-dlssg-helper64.exe` (64-bit only) | `dlssg_helper.cpp dlssg_core.cpp hdr_out.cpp compose.cpp frame_checks.cpp` |
 | `hsf_vk_layer` | `hsf_vk_layer64.dll` and its manifest (64-bit only) | `vk_layer.cpp` |
 | `vk_scene` | `vk_scene.exe` (64-bit only) | `tests/vk_scene.cpp` |
@@ -59,6 +59,8 @@ D3D11 and DX9 games, 32-bit and 64-bit, run DLSS-G in the helper. Streamline 2.1
 |---|---|
 | `sl_game.h`, `sl_game.cpp` | The in-game route: HSF's own hooks on the game's `sl.interposer.dll`, logging, drive, camera rebuild, cut check, focus hold, frame tokens. |
 | `sl_bring.h`, `sl_bring.cpp` | The bring-in route: loads Streamline 2.14, catches swap-chain creation on the DXGI factory, and sends Reflex, tokens, tags and frames. |
+| `depth_fit.h`, `depth_fit.cpp` | Compute pass that brings the game's render-size depth up to the size of its full-size DLSS vectors, since DLSS-G takes one size for both. |
+| `dxgi_guard.h`, `dxgi_guard.cpp` | Keeps ReShade's DXGI factory from wrapping adapter interfaces it does not know (d3d11.dll asks for one when RTSS makes its device), which crashed the game. |
 | `ngx_input.h`, `ngx_input.cpp` | Hooks `_nvngx.dll`'s DLSS evaluate and copies the game's motion and depth. |
 | `debug_view.h`, `debug_view.cpp` | The D3D12 DEPTH and MOTION views: exactly what DLSS-G was tagged with, drawn over the picture. |
 
@@ -110,6 +112,7 @@ Offline tests and probes. CMake builds the ones it lists into `build/x64` (D3D12
 | `sl_game_test.cpp` | the hooks on a real `sl.interposer.dll` copy |
 | `sl_bring_test.cpp` | a small D3D12 program with no Streamline, which HSF brings in (needs a GPU and Streamline's DLLs) |
 | `ngx_input_test.cpp` | the NGX hook |
+| `depth_fit_test.cpp` | the depth fit pass |
 | `helper_exit_test.cpp` | the helper dies with its game (job or watchdog); with `hdr10` / `hdr10bug`, an eye test of HDR10 through the helper |
 | `gpu_reserve_test.cpp` | the GPU reserve's spike count and governor against a simple card model, and one live load reading |
 | `vk_scene.cpp` | a small Vulkan program for bringing up the Vulkan route without a game (run by hand, not in the suite) |

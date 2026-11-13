@@ -19,7 +19,11 @@ struct StartOptions {
   bool early_load = true;      // SlEarlyLoad=0: load sl.interposer.dll only with the first device, as before
   // SlNgxPath=<folder>: where the game's own nvngx_dlss.dll lives. Streamline starts NGX with only its plugin folders to look in, and the game's own DLSS
   // (Unreal's plugin and others that call NGX directly) then finds no DLSS and hides it. Empty: HSF looks for the game's copy under the game folder.
+  // "none:<exe write time>": an earlier search found none, so it is not searched again until the exe changes.
   std::wstring ngx_path;
+  std::wstring ini_path;       // HSF.ini, where the search's answer is saved as SlNgxPath; empty saves nothing
+
+  int route_dlssg = -1;        // SlRouteDlssg: DLSS-G's own calls on ReShade's device go to the native one. -1 when RenoDX is loaded, 0 never, 1 always
 };
 // folder holds sl.interposer.dll and its plugins. Only loads sl.interposer.dll (no slInit) when early_load is set, so other add-ons that look for Streamline
 // as they start (RenoDX DLSS picks its Present hook then) find it. DllMain calls it.
@@ -54,6 +58,7 @@ struct FrameFeed {
   bool dilated = false;             // the vectors are already dilated: full-resolution ones
   TagFn tag = nullptr;               // set: the inputs go to this instead of HSF's Streamline, and constants, options and markers are left to that Streamline's owner
   unsigned view = 0;                // debugview::Kind: 0 the game, 1 depth, 2 motion, as DLSS-G gets them, in place of the picture
+  uint32_t colour_space = UINT32_MAX;  // the game's DXGI_COLOR_SPACE_TYPE, for the swap chain DLSS-G presents on; UINT32_MAX: not known
 };
 // After the frame is finished and before Streamline gets its Present, on the thread that presents, with anything recorded for the same queue already submitted. False: this frame has no inputs.
 bool Frame(const FrameFeed& feed);
@@ -74,6 +79,7 @@ struct Stats {
   bool generating;           // HSF has DLSS-G on
   uint32_t shown_per_real;   // what DLSS-G last said it shows per real frame
   int nvof_state;            // NVIDIA Optical Flow on the last frame fed: 0 off, 1 waiting, 2 active, 3 failed (nvof::State)
+  bool fp16;                 // the swap chain is FP16 (scRGB), which DLSS-G does not take
 };
 Stats GetStats();
 

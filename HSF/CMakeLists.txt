@@ -22,7 +22,7 @@ add_library(hsf_minhook STATIC "${HSF_MINHOOK}/src/buffer.c" "${HSF_MINHOOK}/src
 target_include_directories(hsf_minhook SYSTEM PUBLIC "${HSF_MINHOOK}/include")
 target_compile_options(hsf_minhook PRIVATE /W0)
 
-add_library(hsf_addon SHARED src/hsf_addon.cpp src/ui.cpp src/dlssg_remote.cpp src/dx9_bridge.cpp src/gpu_fence9.cpp src/vk_bridge.cpp src/vk_hook.cpp src/score.cpp src/depth.cpp src/hud.cpp)
+add_library(hsf_addon SHARED src/hsf_addon.cpp src/ui.cpp src/dlssg_remote.cpp src/dx9_bridge.cpp src/gpu_fence9.cpp src/vk_bridge.cpp src/vk_hook.cpp src/score.cpp src/depth.cpp src/hud.cpp src/dxgi_guard.cpp)
 target_include_directories(hsf_addon SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/third_party/vulkan-headers/include")
 target_link_libraries(hsf_addon PRIVATE hsf_minhook)
 # DLSS-G for D3D11 and DX9 games runs in hsf-dlssg-helper64.exe; the add-on hands it frames on the game's (or the DX9 bridge's) Direct3D 11 device.
@@ -38,7 +38,7 @@ else()
   set(HSF_STREAMLINE "${CMAKE_SOURCE_DIR}/../Streamline SDK")
   # NVIDIA Optical Flow SDK 5.0 interface headers (NVIDIA's permissive licence, in each file). The engine itself is the driver's nvofapi64.dll.
   set(HSF_NVOF "${CMAKE_SOURCE_DIR}/third_party/nvof")
-  target_sources(hsf_addon PRIVATE src/dlssg_core.cpp src/hdr_out.cpp src/compose.cpp src/frame_checks.cpp src/sl_game.cpp src/sl_bring.cpp src/debug_view.cpp src/ngx_input.cpp src/nvof_flow.cpp)
+  target_sources(hsf_addon PRIVATE src/dlssg_core.cpp src/hdr_out.cpp src/compose.cpp src/frame_checks.cpp src/sl_game.cpp src/sl_bring.cpp src/debug_view.cpp src/depth_fit.cpp src/ngx_input.cpp src/nvof_flow.cpp)
   target_compile_definitions(hsf_addon PRIVATE HSF_SL_GAME)
   target_include_directories(hsf_addon SYSTEM PRIVATE "${HSF_STREAMLINE}/include" "${HSF_NVOF}")
   target_link_libraries(hsf_addon PRIVATE "${HSF_STREAMLINE}/lib/x64/sl.interposer.lib" delayimp version)
@@ -61,7 +61,7 @@ else()
   target_link_options(sl_game_test PRIVATE "/ENTRY:wmainCRTStartup")
   # Offline test of the frame checks, no game needed.
   # A small program with no Streamline of its own: HSF must bring Streamline to it. Needs a folder with Streamline's DLLs and a GPU.
-  add_executable(sl_bring_test tests/sl_bring_test.cpp src/sl_bring.cpp src/debug_view.cpp src/compose.cpp src/frame_checks.cpp src/nvof_flow.cpp)
+  add_executable(sl_bring_test tests/sl_bring_test.cpp src/sl_bring.cpp src/debug_view.cpp src/depth_fit.cpp src/compose.cpp src/frame_checks.cpp src/nvof_flow.cpp)
   target_include_directories(sl_bring_test SYSTEM PRIVATE "${HSF_STREAMLINE}/include" "${HSF_NVOF}")
   target_link_libraries(sl_bring_test PRIVATE d3d12 dxgi d3dcompiler)
   target_link_options(sl_bring_test PRIVATE "/ENTRY:wmainCRTStartup")
@@ -75,6 +75,11 @@ else()
   add_executable(debug_view_test tests/debug_view_test.cpp src/debug_view.cpp)
   target_link_libraries(debug_view_test PRIVATE d3d12 dxgi d3dcompiler)
   target_link_options(debug_view_test PRIVATE "/ENTRY:wmainCRTStartup")
+
+  # Offline test of the depth fit pass, no game needed.
+  add_executable(depth_fit_test tests/depth_fit_test.cpp src/depth_fit.cpp)
+  target_link_libraries(depth_fit_test PRIVATE d3d12 dxgi d3dcompiler)
+  target_link_options(depth_fit_test PRIVATE "/ENTRY:wmainCRTStartup")
 
   # Offline test of NVIDIA Optical Flow as a motion source: a picture moving by a known amount (build\x64\nvof_test.exe). Needs an RTX card.
   add_executable(nvof_test tests/nvof_test.cpp src/nvof_flow.cpp)

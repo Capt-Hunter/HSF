@@ -24,6 +24,7 @@
 #include "score.h"
 #include "motion_convention.h"
 #include "ui.h"
+#include "dxgi_guard.h"
 #ifdef HSF_SL_GAME
 #include <d3d12.h>
 #include "sl_bring.h"
@@ -2633,7 +2634,8 @@ void BringFrame(effect_runtime* runtime, device* dev, resource target) {
   }
   // Full-resolution vectors with render-size depth (DLSS without MVLowRes; Lies of P: 3440x1440 vectors, 2580x1080 depth). DLSS-G takes one size for both,
   // and FeedFrame drops such frames, so generation stopped for good once the game's DLSS ran. HSF.fx's depth copy is the same depth at the back buffer's
-  // size, so it goes with the game's vectors instead; without it (HSF.fx missing), flow keeps going.
+  // size, so it goes with the game's vectors instead. Without it (HSF.fx missing or off), full-resolution vectors keep the game's depth and Streamline's side
+  // brings that depth up to the vectors' size (depth_fit.h); only other size mismatches fall back to flow.
   ID3D12Resource* ngx_depth = use_ngx ? ngx_frame.depth : nullptr;
   bool ngx_depth_from_effect = false;
   if (use_ngx && ngx_frame.motion != nullptr && ngx_frame.depth != nullptr) {
@@ -2642,19 +2644,24 @@ void BringFrame(effect_runtime* runtime, device* dev, resource target) {
     if (m.Width != d.Width || m.Height != d.Height) {
       ID3D12Resource* const copy = EffectDepthCopy(runtime, dev);
       const bool fits = copy != nullptr && copy->GetDesc().Width == m.Width && copy->GetDesc().Height == m.Height;
+      // The game's depth smaller than its full-resolution vectors: the depth fit pass can bring it up.
+      const bool depth_fit = !fits && ngx_frame.full_res && d.Width <= m.Width && d.Height <= m.Height;
+      const int how = fits ? 1 : depth_fit ? 2 : 0;
       static int logged = -1;
-      if (logged != (fits ? 1 : 0)) {
-        logged = fits ? 1 : 0;
+      if (logged != how) {
+        logged = how;
         char text[260];
-        std::snprintf(text, sizeof(text), fits ? "the game's DLSS vectors are %llux%u and its depth %llux%u: the vectors go with HSF.fx's depth copy, which is the vectors' size"
-                                               : "the game's DLSS vectors are %llux%u and its depth %llux%u, and HSF.fx's depth copy isn't the vectors' size: motion stays on flow",
+        std::snprintf(text, sizeof(text),
+                      how == 1   ? "the game's DLSS vectors are %llux%u and its depth %llux%u: the vectors go with HSF.fx's depth copy, which is the vectors' size"
+                      : how == 2 ? "the game's DLSS vectors are %llux%u and its depth %llux%u, and HSF.fx's depth copy isn't the vectors' size: the game's depth is brought up to the vectors' size"
+                                 : "the game's DLSS vectors are %llux%u and its depth %llux%u, and HSF.fx's depth copy isn't the vectors' size: motion stays on flow",
                       m.Width, m.Height, d.Width, d.Height);
         hsf::slbring::LogLine(text);
       }
       if (fits) {
         ngx_depth = copy;
         ngx_depth_from_effect = true;
-      } else {
+      } else if (!depth_fit) {
         use_ngx = false;
       }
     }
@@ -2678,6 +2685,7 @@ void BringFrame(effect_runtime* runtime, device* dev, resource target) {
     feed.on = g_extra_enabled;
     feed.frames = g_dlssg_frames;
     feed.view = static_cast<unsigned>(g_bring_view);
+    feed.colour_space = GameColorSpace();
     hsf::slbring::Frame(feed);
   };
   if (use_ngx) {
@@ -4359,6 +4367,8 @@ void OnReshadePresent(effect_runtime* runtime) {
 void OnSlBringPresent(effect_runtime*) { hsf::slbring::Poll(); }
 #endif
 
+bool g_in_helper = false;  // True inside HSF's own DLSS-G helper process.
+
 void OnInitDevice([[maybe_unused]] device* dev) {
   // Vulkan probe: the planned bridge hands the game's frames to the helper through images and a fence shared with NT handles, made through
   // ReShade on the game's device. ReShade's layer can do that only when it turned on the external memory and semaphore extensions.
@@ -4373,6 +4383,10 @@ void OnInitDevice([[maybe_unused]] device* dev) {
     // and crashes the game. Early, Discord has not hooked yet. UpdatePresenterVk takes the bridge as it is.
     char error[320];
     if (!hsf::vk::Start(dev, error, sizeof(error))) Log(error);
+  }
+  // Before the first frame, so it is in place before RTSS or anything else makes a D3D11 device on an adapter from ReShade's factory.
+  if (!g_in_helper && (dev->get_api() == device_api::d3d11 || dev->get_api() == device_api::d3d12)) {
+    if (const char* line = hsf::dxgiguard::Install(reshade::internal::get_reshade_module_handle())) Log(line);
   }
 #ifdef HSF_SL_GAME
   if (g_sl_bring && dev->get_api() == device_api::d3d12) hsf::slbring::NoteDevice(reinterpret_cast<void*>(dev->get_native()));
@@ -5094,6 +5108,7 @@ MenuView ReadMenuView() {
     else if (s.swap_chains == 0) v.waiting = "No swap chain through Streamline yet.";
     else if (s.plugin_loaded == 0) v.problem = "DLSS-G's plugin did not load (see HSF_sl_bring.log).";
     else if (s.status > 0) v.problem = "DLSS-G reports a problem (see HSF_sl_bring.log).";
+    else if (s.fp16 && g_extra_enabled) v.problem = "The game's swap chain is FP16 (scRGB), which DLSS-G does not take. Set the game, or RenoDX's swap chain format, to HDR10.";
     return v;
   }
   if (g_sl_drive && d3d12_run) {
@@ -6606,7 +6621,6 @@ bool InHelperProcess() {
 // Inside the helper: ReShade's effects stay off, so the frames DLSS-G shows are not processed a second time.
 void OnHelperRuntime(reshade::api::effect_runtime* runtime) { runtime->set_effects_state(false); }
 
-bool g_in_helper = false;
 
 // Set by DllMain when Windows loads the add-on, cleared by the AddonInit call ReShade makes right after.
 bool g_fresh_attach = false;
@@ -6730,6 +6744,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         wchar_t ngx_path[MAX_PATH] = L"";
         GetPrivateProfileStringW(L"HSF", L"SlNgxPath", L"", ngx_path, MAX_PATH, g_ini_path);
         sl_options.ngx_path = ngx_path;
+        sl_options.ini_path = g_ini_path;
+        sl_options.route_dlssg = static_cast<int>(GetPrivateProfileIntW(L"HSF", L"SlRouteDlssg", -1, g_ini_path));
         hsf::slbring::Start(bring_log.c_str(), have_own ? own.c_str() : folder, sl_options);
         g_ngx_input = GetPrivateProfileIntW(L"HSF", L"NgxInput", 1, g_ini_path) != 0;
         if (g_ngx_input) hsf::ngx::Start(&hsf::slbring::LogLine);
@@ -6760,6 +6776,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
       (void)reserved;
 #endif
       if (reserved == nullptr) hsf::vk::UnhookCreateDevice();  // ReShade unloads the add-on but the game goes on: no hook into a freed HSF
+      if (reserved == nullptr) hsf::dxgiguard::Uninstall();    // the same for ReShade's DXGI factory
       UnhookNativePresent();
       UnhookNativePresent9();
       ClearDx9Run();  // a normal exit (a crash never gets here): the 9Ex crash rule must not count it
