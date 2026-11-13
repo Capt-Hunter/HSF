@@ -35,6 +35,9 @@ Start with the menu's status box. It names the route and gives the reason under 
 | Vulkan game: no HSF tab | A `dxgi.dll` copy of ReShade in the game folder keeps ReShade's Vulkan layer out | Remove that `dxgi.dll` (keep a copy), and use ReShade's Vulkan layer. |
 | Vulkan game: higher latency with RTSS | RTSS keeps HSF's `vkCreateDevice` hook out, so frames wait for their copies on the CPU | Expected. Closing RTSS gives the GPU route. |
 | Vulkan game crashes at random with RTSS and Discord | Discord's capture hook for Clips and RTSS clash | Turn off Discord's Clips (Settings > Clips). |
+| D3D12 game with a RenoDX HDR mod: jumbled or old frames, ReShade's overlay gone (Scorn, BLACKTAIL) | DLSS-G's own calls went through ReShade's device (HSF 0.9.8 and older) | Update HSF. |
+| D3D12 game crashes when RTSS is running (ReShade 6.8.0) | A ReShade 6.8.0 bug when RTSS makes a D3D11 device | Update HSF: it works around the bug. |
+| D3D12 game's own DLSS option is gone or greyed out with HSF | Streamline started DLSS before the game, without the game's `nvngx_dlss.dll` (HSF 0.9.8 and older) | Update HSF. HSF finds the game's copy once and saves it as `SlNgxPath`. If it picked the wrong one, remove that line from `HSF.ini`. |
 | HDR game looks washed out or SDR with frame generation on | An old HSF build (before HDR10 support on the helper) | Update HSF: install every file from the new zip together. |
 | Helper does not start after an update ("of another version" in `hsf_dlssg.log`) | The add-on and `hsf-dlssg-helper64.exe` come from different releases | Copy the whole zip again, `HSF_streamline` included. |
 
