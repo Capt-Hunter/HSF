@@ -160,12 +160,16 @@ std::wstring FindGameDlssFolder() {
   }
   wchar_t exe[MAX_PATH] = L"";
   if (GetModuleFileNameW(nullptr, exe, MAX_PATH) == 0) return {};
-  // The exe folder, or an Unreal game's root up to three folders above it (<root>\<Project>\Binaries\Win64): never further, or the search could reach a
-  // store library and another game's copy
+  // The exe folder. Only for Unreal's own layout (<root>\<Project>\Binaries\<platform>\game.exe, with the engine in <root>\Engine) the game's root instead.
+  // Nothing else climbs: a folder that just happens to hold one named Engine (a store library with a game installed as "Engine") would make the search
+  // cover other games and could find their copy.
   fs::path root = fs::path(exe).parent_path();
-  fs::path p = root;
-  for (int up = 0; up <= 3 && p.has_parent_path() && p != p.root_path(); ++up, p = p.parent_path()) {
-    if (fs::is_directory(p / L"Engine", ec)) { root = p; break; }
+  const fs::path binaries = root.parent_path();
+  if (_wcsicmp(binaries.filename().c_str(), L"Binaries") == 0 && binaries.has_parent_path() && binaries.parent_path().has_parent_path()) {
+    const fs::path game_root = binaries.parent_path().parent_path();
+    if (game_root != game_root.root_path() &&
+        (fs::is_directory(game_root / L"Engine" / L"Binaries", ec) || fs::is_directory(game_root / L"Engine" / L"Plugins", ec)))
+      root = game_root;
   }
   int seen = 0;
   for (auto it = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
