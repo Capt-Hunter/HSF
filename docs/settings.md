@@ -65,6 +65,7 @@ Older files may still have `Presenter`, `Generated` and `Pacing`. They belonged 
 | `SlFactoryProxy` | `1` | 0, 1 | Start | D3D12-B | Makes the swap chain through Streamline's factory proxy. Needed with ShortFuse's NR mod. |
 | `SlManualHooking` | `0` | 0, 1 | Start | D3D12-B | Streamline's manual hooking mode, for games that crash while Streamline starts. |
 | `SlEarlyLoad` | `1` | 0, 1 | Start | D3D12-B | Loads `sl.interposer.dll` when HSF loads, before `slInit`, so add-ons that look for Streamline at start-up find it (RenoDX DLSS picks its Present hook then). |
+| `SlNgxPath` | empty | a folder | Start | D3D12-B | Folder of the game's own `nvngx_dlss.dll`, given to Streamline after `HSF_streamline`. Streamline starts NGX before the game does, with only its plugin folders to find DLSS in, so a game that runs DLSS through NGX (Unreal's DLSS plugin) otherwise finds no DLSS and hides it. HSF writes it when it picks this route in a game with DLSS loaded; empty = HSF looks for the game's copy under the game folder. |
 | `DlssgRebuildCamera` | `1` | 0, 1 | Live | D3D12-G | DLSS-G gets `clipToPrevClip` and `prevClipToClip` rebuilt by HSF from the camera, not the game's. |
 | `DlssgCameraKey` | `122` (F11) | key code, 0 = none | Live | D3D12-G | Flips `DlssgRebuildCamera` in game. |
 | `DlssgCutCheck` | `1` | 0, 1 | Live | D3D12-G | When the camera jumps and the game sent no reset, HSF sends one. |
