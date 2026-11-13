@@ -133,5 +133,7 @@ Pull requests and bug reports are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md
 - BarbatosAWLS and [AeonSR](https://github.com/BarbatosAWLS/AeonSR) (MIT): the Vulkan route presents from a window of its own, as AeonSR does.
 - Pumbo (Filoppi) and [Luma](https://github.com/Filoppi/Luma-Framework): HSF reads the motion and depth Luma mods hand to DLSS. No Luma code is used.
 - RankFTW and [RHI](https://github.com/RankFTW/RHI), for bringing HSF to RHI's players.
+- [ghostinthecamera](https://github.com/ghostinthecamera/GITC-Uplift), for all of the help along the way.
+- A special thanks to [RankFTW](https://github.com/RankFTW), who helped a great deal: testing, finding bugs, the bring-in route fixes, and bringing HSF to RHI. HSF is much better for it.
 
 HSF is not made by, or affiliated with, NVIDIA or the ReShade project. DLSS, Reflex and RTX are trademarks of NVIDIA.
