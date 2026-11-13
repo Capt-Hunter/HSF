@@ -2,7 +2,7 @@
 
 HSF (Hunter's Sloppy Frames) by Capt-Hunter is a ReShade add-on that brings NVIDIA DLSS Frame Generation (DLSS-G), up to 6x, to almost any game. It works with games that have no frame generation of their own: DirectX 9, 11 and 12 and Vulkan, 32-bit and 64-bit, SDR and HDR. It feeds DLSS-G with the motion that the game gives through its own DLSS (or through a Luma mod's DLSS). When the game has no such motion, HSF uses optical flow from a ReShade effect (iMMERSE LaunchPad or LumeniteFX) together with the game's depth.
 
-Preview (0.9.8.6): HSF runs in a wide range of DX9, DX11, DX12 and Vulkan games, and in PS3 and PS5 emulators. HSF is in [RHI (ReShade HDR Installer)](https://github.com/RankFTW/RHI), which installs it for you.
+Preview (0.9.8.7): HSF runs in a wide range of DX9, DX11, DX12 and Vulkan games, and in PS3 and PS5 emulators. HSF is in [RHI (ReShade HDR Installer)](https://github.com/RankFTW/RHI), which installs it for you.
 
 ## Documents
 
