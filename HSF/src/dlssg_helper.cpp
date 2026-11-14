@@ -363,14 +363,6 @@ int wmain(int argc, wchar_t** argv) {
   // Appended, shared: a stopping helper and the next one can overlap (the add-on starts the file fresh once per game run).
   core::OpenLog((g_folder + L"\\hsf_dlssg.log").c_str(), L"a", _SH_DENYNO);
   Log("HSF DLSS-G helper (64-bit), pid %lu", GetCurrentProcessId());
-  // Per-monitor DPI aware, as games are. Unaware, the helper sees the game's window in scaled pixels under Windows display
-  // scaling (3440x1440 at 150% reads 2293x960): the overlay window got the scaled size, Windows stretched the DLSS-G swap
-  // chain onto it, and every Present took tens of milliseconds (hitching from the start until the window was resized).
-  using SetDpiContext = BOOL(WINAPI*)(HANDLE);
-  if (const auto set_dpi = reinterpret_cast<SetDpiContext>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"))) {
-    const BOOL dpi_ok = set_dpi(reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-4)));  // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-    Log("DPI awareness: per monitor %s", dpi_ok ? "on" : "not set");
-  }
   const bool system_dxgi = LoadSystemGraphicsDlls();
   if (argc < 2) {
     Log("no shared block named on the command line");
