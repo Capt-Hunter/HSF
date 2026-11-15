@@ -285,15 +285,22 @@ bool StartStreamline() {
   pref.projectId = "4f1c2a7e-9b3d-4e8a-a1c6-5d2e7f9b0c13";  // made-up, as for the helper
   pref.renderAPI = sl::RenderAPI::eD3D12;
   // ReShade may unload and load this add-on again during startup, and Streamline stays in the process through that, so its slInit is remembered outside the add-on.
-  wchar_t done[2] = {};
-  if (GetEnvironmentVariableW(L"HSF_SL_BRING_UP", done, 2) != 0) {
+  // The mark names this process and this copy of the interposer. Environment variables pass to child processes, and games that start themselves again
+  // (a launcher stub, or a restart into the real exe) would otherwise skip slInit in the child, where Streamline was never started: slSetD3DDevice then answers
+  // eErrorNotInitialized and DLSS-G never gets the swap chain. A copy of the interposer loaded again after an unload starts uninitialised too.
+  wchar_t mark[64] = {};
+  swprintf_s(mark, L"%lu:%p", GetCurrentProcessId(), static_cast<void*>(g_interposer));
+  wchar_t done[64] = {};
+  const DWORD done_length = GetEnvironmentVariableW(L"HSF_SL_BRING_UP", done, static_cast<DWORD>(std::size(done)));
+  if (done_length != 0 && done_length < std::size(done) && wcscmp(done, mark) == 0) {
     Line("Streamline was started earlier in this process");
     return true;
   }
+  if (done_length != 0) Line("Streamline mark from another process or an earlier copy of the interposer (%ls, now %ls): starting it here", done, mark);
   const sl::Result result = init(pref, sl::kSDKVersion);
   Line("slInit: %d, from %ls", static_cast<int>(result), dll.c_str());
   if (result != sl::Result::eOk) return false;
-  SetEnvironmentVariableW(L"HSF_SL_BRING_UP", L"1");
+  SetEnvironmentVariableW(L"HSF_SL_BRING_UP", mark);
   return true;
 }
 
@@ -1517,7 +1524,7 @@ bool FeedFrame(const FrameFeed& in) {
   const uint32_t motion_state = static_cast<uint32_t>(own_motion || flow_made ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : READ_ANY);
   if (in.tag != nullptr) {
     const uint32_t ext[4] = {extent.left, extent.top, extent.width, extent.height};
-    in.tag(list, depth, static_cast<uint32_t>(READ_ANY), tag_motion, motion_state, ext, in.scale, composing || in.dilated);
+    in.tag(list, depth, static_cast<uint32_t>(READ_ANY), tag_motion, motion_state, ext, in.scale, composing || in.dilated, in.depth_inverted);
   } else {
     sl::Resource depth_tag(sl::ResourceType::eTex2d, depth, static_cast<uint32_t>(READ_ANY));
     sl::Resource mvec(sl::ResourceType::eTex2d, tag_motion, motion_state);

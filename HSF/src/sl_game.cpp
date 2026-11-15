@@ -415,6 +415,24 @@ std::atomic<const sl::FrameToken*> g_last_frame{nullptr};
 // When the game last tagged its own vectors for DLSS-G (slSetTag or slSetTagForFrame), and how many came in a row. Unreal's Streamline plugin does this with no evaluates at all.
 std::atomic<ULONGLONG> g_last_game_vectors{0};
 std::atomic<uint32_t> g_game_vectors_streak{0};
+// When the game last sent its own slSetConstants. With its DLSS off a game may send none at all (PBZ, Unreal), and DLSS-G has no frame without them: optical motion then sends HSF's own.
+std::atomic<ULONGLONG> g_last_game_constants{0};
+// The game's own slDLSSGSetOptions asks for frame generation. While it does not, the game's Reflex frame limit is meant for its real frames.
+std::atomic<bool> g_game_fg_on{false};
+// The newest frame token each thread asked for. Unreal asks on its game thread for the frame it simulates and on its render thread for the frame it renders, one apart
+// (PBZ: 1143 render, 1144 game, 1143 render again). With no evaluates and no tags of the game's, the frame being presented is the render thread's, the lowest recent one.
+struct TokenAsked {
+  DWORD thread;
+  const sl::FrameToken* token;
+  uint32_t index;
+  ULONGLONG at;
+};
+constexpr size_t TOKEN_THREADS = 4;
+TokenAsked g_tokens_asked[TOKEN_THREADS] = {};  // under g_lock
+// The lowest is the first guess. If DLSS-G shows nothing with it, the state poll switches to the highest, and back (an RHI thread a frame behind would make the lowest wrong).
+std::atomic<bool> g_token_pick_highest{false};
+// When HSF last sent its own constants and Streamline took them.
+std::atomic<ULONGLONG> g_own_constants_last{0};
 
 // Generation needs vectors and depth, which come with evaluate calls, or with the game's own tags for DLSS-G. Menus have none, so generation waits for a run of them and stops when they stop.
 constexpr ULONGLONG EVALUATE_GONE_MS = 250;
@@ -663,6 +681,7 @@ sl::Result HookConstants(const sl::Constants& values, const sl::FrameToken& fram
   static_assert(sizeof(sl::Constants) <= CONSTANTS_BYTES);
   alignas(16) unsigned char fixed_bytes[CONSTANTS_BYTES] = {};
   bool use_fixed = false;
+  g_last_game_constants.store(GetTickCount64(), std::memory_order_relaxed);
   {
     Lock lock;
     const uint32_t token = SafeToken(&frame);
@@ -840,11 +859,45 @@ sl::Result HookEvaluate(sl::Feature feature, const sl::FrameToken& frame, const 
   return result;
 }
 
+// A game that tags by frame (eUseFrameBasedResourceTagging) answers slSetTag with eErrorInvalidIntegration, so HSF's own tags need a frame token. With the game's
+// DLSS off it neither evaluates nor tags (PBZ), and the tokens it asks for here are the only ones there are. Evaluates and the game's own tags still come first.
+// Call with g_lock held.
+void NoteTokenAsked(const sl::FrameToken* token, uint32_t index) {
+  if (index == UINT32_MAX) return;
+  const ULONGLONG now = GetTickCount64();
+  const DWORD thread = GetCurrentThreadId();
+  TokenAsked* slot = nullptr;
+  TokenAsked* oldest = &g_tokens_asked[0];
+  for (TokenAsked& t : g_tokens_asked) {
+    if (t.thread == thread) {
+      slot = &t;
+      break;
+    }
+    if (t.at < oldest->at) oldest = &t;
+  }
+  if (slot == nullptr) slot = oldest;
+  *slot = {thread, token, index, now};
+  if (now - g_last_evaluate.load(std::memory_order_relaxed) <= EVALUATE_GONE_MS || now - g_last_game_vectors.load(std::memory_order_relaxed) <= EVALUATE_GONE_MS) return;
+  const bool highest = g_token_pick_highest.load(std::memory_order_relaxed);
+  const TokenAsked* pick = nullptr;
+  for (const TokenAsked& t : g_tokens_asked)
+    if (t.token != nullptr && now - t.at <= EVALUATE_GONE_MS && (pick == nullptr || (highest ? t.index > pick->index : t.index < pick->index))) pick = &t;
+  if (pick == nullptr) return;
+  if (g_last_frame.exchange(pick->token, std::memory_order_relaxed) == nullptr) {
+    static uint32_t s_lines = 0;
+    if (s_lines++ < 10) Line("no evaluates and no tags from the game: HSF's tags go to the %s frame it asked for, %u (thread %lu)", highest ? "highest" : "lowest", pick->index, pick->thread);
+  }
+}
+
 sl::Result HookGetToken(sl::FrameToken*& token, const uint32_t* frame_index) {
   InFlight in_flight;
   const sl::Result result = g_real_get_token(token, frame_index);
   Lock lock;
-  if (result == sl::Result::eOk && token != nullptr) SeeToken(SafeToken(token));
+  if (result == sl::Result::eOk && token != nullptr) {
+    const uint32_t index = SafeToken(token);
+    SeeToken(index);
+    NoteTokenAsked(token, index);
+  }
   if (g_tracing) Line("slGetNewFrameToken -> %u%s", token != nullptr ? SafeToken(token) : UINT32_MAX, frame_index != nullptr ? " (game gave the index)" : "");
   NoteResult("slGetNewFrameToken", result);
   Summary();
@@ -887,6 +940,7 @@ sl::Result HookDlssgOptions(const sl::ViewportHandle& viewport, const sl::DLSSGO
     Lock lock;
     if (have) {
       const sl::DLSSGOptions& o = *reinterpret_cast<const sl::DLSSGOptions*>(bytes);
+      g_game_fg_on.store(o.mode != sl::DLSSGMode::eOff, std::memory_order_relaxed);
       if ((o.mode != g_last_dlssg_mode || g_dlssg_lines < 3) && g_dlssg_lines < 60) {
         ++g_dlssg_lines;
         g_last_dlssg_mode = o.mode;
@@ -934,7 +988,10 @@ sl::Result HookReflexOptions(const sl::ReflexOptions& options) {
   g_reflex_sent_cap.store(cap, std::memory_order_relaxed);
   g_reflex_sent_boost.store(boost ? 1 : 0, std::memory_order_relaxed);
   g_reflex_sent_shown.store(shown_now, std::memory_order_relaxed);
-  const bool force = drive && (o.mode == sl::ReflexMode::eOff || cap != 0 || (boost && o.mode != sl::ReflexMode::eLowLatencyWithBoost));
+  // The game's own limit with its FG off is for real frames, but with DLSS-G on Reflex counts it on screen: PBZ's 60 fps limit held the screen at 60, so 2x gave
+  // 30 real frames and 5x gave 12. Divided by the frames shown, the game keeps its own real rate. HSF's cap, when set, wins as before.
+  const bool scale_game_limit = drive && cap == 0 && o.frameLimitUs != 0 && shown_now > 1 && !g_game_fg_on.load(std::memory_order_relaxed);
+  const bool force = drive && (o.mode == sl::ReflexMode::eOff || cap != 0 || scale_game_limit || (boost && o.mode != sl::ReflexMode::eLowLatencyWithBoost));
   {
     // The game sends this every frame.
     static uint32_t s_last_mode = UINT32_MAX, s_last_limit = UINT32_MAX;
@@ -951,6 +1008,18 @@ sl::Result HookReflexOptions(const sl::ReflexOptions& options) {
   // The cap is on screen, and with DLSS-G on Reflex's limit already counts the frames shown, so it goes as it is. Multiplying it by the frames shown per real frame
   // (as HSF did) limited twice: Shadows at a 155 cap and 6x made 4.5 real frames a second, 26 on screen.
   if (cap != 0) o.frameLimitUs = static_cast<uint32_t>(1000000ull / cap);
+  else if (scale_game_limit) {
+    const uint32_t game_limit = o.frameLimitUs;
+    o.frameLimitUs = game_limit / shown_now;
+    static uint32_t s_last_game = 0, s_last_shown = 0, s_lines = 0;
+    if ((game_limit != s_last_game || shown_now != s_last_shown) && s_lines < 40) {
+      s_last_game = game_limit;
+      s_last_shown = shown_now;
+      ++s_lines;
+      Lock lock;
+      Line("the game's frame limit %u us is for its real frames: Reflex gets %u us, for %u shown per real frame", game_limit, o.frameLimitUs, shown_now);
+    }
+  }
   return g_real_reflex_options(o);
 }
 
@@ -1136,6 +1205,7 @@ bool Install(Hook& hook, uint8_t* target) {
   WriteAbsoluteJump(slot, hook.hook);
   std::memcpy(trampoline, first, length);
   // A moved load relative to rip must still reach the same address. The page is near the target and what it loads usually is too, but check.
+  bool ends_in_jump = false;
   for (size_t i = 0; i < rip_count; ++i) {
     const bool is_jump = first[rip_at[i]] == 0xE9;
     const size_t DISP_AT = is_jump ? 1 : 3, INSTRUCTION_BYTES = is_jump ? 5 : 7;
@@ -1143,6 +1213,13 @@ bool Install(Hook& hook, uint8_t* target) {
     std::memcpy(&displacement, first + rip_at[i] + DISP_AT, sizeof(displacement));
     const uint8_t* const address = target + rip_at[i] + INSTRUCTION_BYTES + displacement;
     const intptr_t moved = address - (trampoline + rip_at[i] + INSTRUCTION_BYTES);
+    // Someone else's jump as the last moved instruction (MFG-Unlocker on slDLSSGSetOptions, its module more than 2 GB from the trampoline in PBZ): an absolute jump to the
+    // same place does the same and reaches anywhere. Nothing runs after a jump, so no jump back follows it.
+    if (is_jump && rip_at[i] + INSTRUCTION_BYTES == length && rip_at[i] + 14 <= SLOT_BYTES - 16) {
+      WriteAbsoluteJump(trampoline + rip_at[i], address);
+      ends_in_jump = true;
+      continue;
+    }
     if (moved > INT32_MAX || moved < INT32_MIN) {
       Line("hook %s NOT installed at %p: its load cannot reach from the trampoline. Starts %s", hook.name, target, bytes_text);
       return false;
@@ -1150,7 +1227,7 @@ bool Install(Hook& hook, uint8_t* target) {
     const int32_t new_displacement = static_cast<int32_t>(moved);
     std::memcpy(trampoline + rip_at[i] + DISP_AT, &new_displacement, sizeof(new_displacement));
   }
-  WriteAbsoluteJump(trampoline + length, target + length);
+  if (!ends_in_jump) WriteAbsoluteJump(trampoline + length, target + length);
   FlushInstructionCache(GetCurrentProcess(), slot, SLOT_BYTES);
 
   std::memcpy(hook.saved, first, 8);
@@ -1455,6 +1532,11 @@ void Start(const wchar_t* log_path, bool drive, bool dynamic_resolution_known) {
   g_last_game_vectors.store(0);
   g_game_vectors_streak.store(0);
   g_last_frame.store(nullptr);
+  g_last_game_constants.store(0);
+  g_game_fg_on.store(false);
+  for (TokenAsked& t : g_tokens_asked) t = {};
+  g_token_pick_highest.store(false);
+  g_own_constants_last.store(0);
   g_tag_without_frame.store(false);
   g_dynamic.store(dynamic_resolution_known);
   g_have_camera_now = g_have_camera_before = false;
@@ -1582,7 +1664,11 @@ void ResendReflex() {
   const uint32_t cap = g_cap_fps.load(std::memory_order_relaxed);
   const int boost = g_reflex_boost.load(std::memory_order_relaxed) ? 1 : 0;
   const uint32_t shown = g_generating.load(std::memory_order_relaxed) ? g_frames_sent.load(std::memory_order_relaxed) + 1 : 1;
-  if (cap == g_reflex_sent_cap.load(std::memory_order_relaxed) && boost == g_reflex_sent_boost.load(std::memory_order_relaxed)) return;
+  // The frames shown matter only while the game's own limit is scaled (HookReflexOptions); HSF's own cap goes as it is.
+  const bool shown_matters = cap == 0 && !g_game_fg_on.load(std::memory_order_relaxed);
+  if (cap == g_reflex_sent_cap.load(std::memory_order_relaxed) && boost == g_reflex_sent_boost.load(std::memory_order_relaxed) &&
+      (!shown_matters || shown == g_reflex_sent_shown.load(std::memory_order_relaxed)))
+    return;
   alignas(sl::ReflexOptions) unsigned char copy[sizeof(sl::ReflexOptions)];
   {
     Lock lock;
@@ -1682,6 +1768,28 @@ void Poll() {
     }
   }
   g_presented_period.fetch_add(state.numFramesActuallyPresented);
+  // HSF picks the frame itself (no evaluates, no game tags, its own constants). If its tags land and DLSS-G still shows nothing for a few seconds, the frame
+  // it picked is not the one being presented: try the other end of the recent tokens. No setting for anyone to change; the log says which one works.
+  const ULONGLONG t = GetTickCount64();
+  const bool own_frame = OpticalActive() && t - g_own_constants_last.load(std::memory_order_relaxed) <= 1000;
+  static uint32_t s_idle_polls = 0;
+  static bool s_told_working = false;
+  if (own_frame && g_generating.load(std::memory_order_relaxed) && state.numFramesActuallyPresented <= 1) {
+    if (++s_idle_polls >= 3) {
+      s_idle_polls = 0;
+      s_told_working = false;
+      const bool highest = !g_token_pick_highest.load(std::memory_order_relaxed);
+      g_token_pick_highest.store(highest, std::memory_order_relaxed);
+      static uint32_t s_flips = 0;
+      if (s_flips++ < 20) Line("HSF's tags land but DLSS-G shows nothing: HSF's tags now go to the %s frame the game asked for", highest ? "highest" : "lowest");
+    }
+  } else {
+    s_idle_polls = 0;
+    if (own_frame && state.numFramesActuallyPresented > 1 && !s_told_working) {
+      s_told_working = true;
+      Line("DLSS-G generates on HSF's own frame pick (the %s frame the game asked for)", g_token_pick_highest.load(std::memory_order_relaxed) ? "highest" : "lowest");
+    }
+  }
 }
 
 void SetGeneration(bool allowed, uint32_t frames) {
@@ -1723,16 +1831,64 @@ void SetReflex(uint32_t fps_cap, bool boost) {
   g_reflex_boost.store(boost, std::memory_order_relaxed);
 }
 
-bool TagOptical(void* command_list, void* depth, uint32_t depth_state, void* motion, uint32_t motion_state, const uint32_t extent[4], const float scale[2], bool dilated) {
+namespace {
+// The game sends no constants of its own (its DLSS is off: PBZ), so DLSS-G would have none for this frame. HSF's flow is the picture's own motion, camera
+// included, so the camera itself is left as identity, as in slbring's own constants. Never while the game sends its own: two sets in one frame is a Streamline error.
+void SendOwnConstants(const uint32_t extent[4], const float scale[2], bool dilated, bool depth_inverted) {
+  const ULONGLONG now = GetTickCount64();
+  if (now - g_last_game_constants.load(std::memory_order_relaxed) <= EVALUATE_GONE_MS || g_real_constants == nullptr) return;
+  const sl::FrameToken* const frame = g_last_frame.load(std::memory_order_relaxed);
+  if (frame == nullptr) return;
+  // One set per frame: a second for the same frame is eErrorDuplicatedConstants (27, PBZ while loading, two presents on one token).
+  static std::atomic<uint32_t> s_last_index{UINT32_MAX};
+  const uint32_t index = SafeToken(frame);
+  if (index == UINT32_MAX || s_last_index.exchange(index, std::memory_order_relaxed) == index) return;
+  static std::atomic<ULONGLONG> s_last_sent{0};
+  // After a gap nothing moved from anywhere.
+  const bool reset = now - s_last_sent.exchange(now, std::memory_order_relaxed) > EVALUATE_GONE_MS;
+  sl::float4x4 identity{};
+  identity.setRow(0, {1, 0, 0, 0});
+  identity.setRow(1, {0, 1, 0, 0});
+  identity.setRow(2, {0, 0, 1, 0});
+  identity.setRow(3, {0, 0, 0, 1});
+  sl::Constants c{};
+  c.cameraViewToClip = c.clipToCameraView = c.clipToLensClip = c.clipToPrevClip = c.prevClipToClip = identity;
+  c.jitterOffset = {0.0f, 0.0f};
+  c.mvecScale = {scale[0], scale[1]};
+  c.cameraPinholeOffset = {0, 0};
+  c.cameraPos = {0, 0, 0};
+  c.cameraUp = {0, 1, 0};
+  c.cameraRight = {1, 0, 0};
+  c.cameraFwd = {0, 0, 1};
+  c.cameraNear = 0.1f;
+  c.cameraFar = 100.f;
+  c.cameraFOV = 1.f;
+  c.cameraAspectRatio = extent[3] != 0 ? static_cast<float>(extent[2]) / static_cast<float>(extent[3]) : 1.f;
+  c.depthInverted = depth_inverted ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+  c.cameraMotionIncluded = sl::Boolean::eTrue;
+  c.motionVectors3D = sl::Boolean::eFalse;
+  c.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+  c.motionVectorsDilated = dilated ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+  c.motionVectorsJittered = sl::Boolean::eFalse;
+  const sl::ViewportHandle viewport(g_viewport.load(std::memory_order_relaxed));
+  // Straight to Streamline, not through HookConstants, so these never count as the game's.
+  const sl::Result result = g_real_constants(c, *frame, viewport);
+  if (result == sl::Result::eOk) g_own_constants_last.store(now, std::memory_order_relaxed);
+  static std::atomic<uint32_t> s_lines{0};
+  if ((reset || result != sl::Result::eOk) && s_lines.fetch_add(1, std::memory_order_relaxed) < 20) {
+    Lock lock;
+    Line("the game sends no constants: HSF sends its own for frame %u, viewport %u%s: result %d", SafeToken(frame), static_cast<uint32_t>(viewport), reset ? " (reset)" : "", static_cast<int>(result));
+  }
+}
+}  // namespace
+
+bool TagOptical(void* command_list, void* depth, uint32_t depth_state, void* motion, uint32_t motion_state, const uint32_t extent[4], const float scale[2], bool dilated, bool depth_inverted) {
   InFlight in_flight;
   if (command_list == nullptr || depth == nullptr || motion == nullptr || !g_optical.load(std::memory_order_relaxed) || g_old_streamline.load(std::memory_order_relaxed)) return false;
   g_optical_scale_x.store(scale[0], std::memory_order_relaxed);
   g_optical_scale_y.store(scale[1], std::memory_order_relaxed);
   g_optical_dilated.store(dilated, std::memory_order_relaxed);
-  if (g_optical_last.exchange(GetTickCount64(), std::memory_order_relaxed) == 0) {
-    Lock lock;
-    Line("optical motion: first tags, %ux%u", extent[2], extent[3]);
-  }
+  SendOwnConstants(extent, scale, dilated, depth_inverted);
   sl::Extent ext{};
   ext.left = extent[0];
   ext.top = extent[1];
@@ -1761,6 +1917,11 @@ bool TagOptical(void* command_list, void* depth, uint32_t depth_state, void* mot
         Line("HSF's optical tag of %s returned %d", BufferName(tag.type), static_cast<int>(result));
       }
     }
+  }
+  // Optical motion counts as running only once its tags land: failed tags left generation on with nothing to generate from (PBZ, every tag 19).
+  if (ok && g_optical_last.exchange(GetTickCount64(), std::memory_order_relaxed) == 0) {
+    Lock lock;
+    Line("optical motion: first tags, %ux%u", extent[2], extent[3]);
   }
   return ok;
 }

@@ -33,7 +33,7 @@ void NoteDevice(void* device);
 // Once a frame on the thread that presents: logs now and then what DLSS-G says.
 void Poll();
 // Tags this frame's depth and motion for someone else's Streamline (the game's own, slgame::TagOptical) on `command_list`. extent is left, top, width, height.
-using TagFn = bool (*)(void* command_list, void* depth, uint32_t depth_state, void* motion, uint32_t motion_state, const uint32_t extent[4], const float scale[2], bool dilated);
+using TagFn = bool (*)(void* command_list, void* depth, uint32_t depth_state, void* motion, uint32_t motion_state, const uint32_t extent[4], const float scale[2], bool dilated, bool depth_inverted);
 // What DLSS-G gets for one real frame. All native objects. `motion` and `depth` are readable as shader resources, the same size, and stay as they are.
 struct FrameFeed {
   ID3D12Device* device = nullptr;

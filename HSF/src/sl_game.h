@@ -40,7 +40,8 @@ void SetScoreGuard(bool on);
 // left out, and the constants it sends get the flow's scale, no jitter and HSF's dilation. Only while TagOptical keeps coming: a few frames without it and the game's vectors are back.
 void SetOptical(bool on);
 // Tags HSF's depth and motion for the latest frame, on `command_list` (open, on the game's queue, Streamline copies them there). Same shape as slbring::FrameFeed's tag.
-bool TagOptical(void* command_list, void* depth, uint32_t depth_state, void* motion, uint32_t motion_state, const uint32_t extent[4], const float scale[2], bool dilated);
+// When the game sends no constants of its own (its DLSS off), HSF sends them for the same frame, with depth_inverted.
+bool TagOptical(void* command_list, void* depth, uint32_t depth_state, void* motion, uint32_t motion_state, const uint32_t extent[4], const float scale[2], bool dilated, bool depth_inverted);
 // HSF's FPS cap (on screen, 0 = leave the game's own) and Reflex boost, through the game's own Reflex. The cap becomes the game's frame limit for its real frames.
 void SetReflex(uint32_t fps_cap, bool boost);
 
