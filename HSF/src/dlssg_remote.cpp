@@ -343,21 +343,16 @@ bool Start(ID3D11Device* game_device, HWND window, UINT width, UINT height, DXGI
 
 // Never waits long: the helper only reads slots and fences it holds references to itself, and it exits by itself (stop flag, and a 3 s watchdog in
 // the helper), so the game side lets go at once. Waiting here froze the game (Tomb Raider's start-up ResizeBuffers).
-const char* Stop(DWORD wait_ms) {
+void Stop(DWORD wait_ms) {
   CheckHelper();
-  if (!g_r) return nullptr;
+  if (!g_r) return;
   InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_r->b->stop), 1);
   if (WaitForSingleObject(g_r->process, std::min<DWORD>(wait_ms, 50)) == WAIT_OBJECT_0)
     Log("stopped");
   else
     Log("stop asked; the helper finishes by itself (at most 3 s)");
   Finish();
-  return nullptr;
 }
-
-bool Reap() { return false; }
-
-bool Stopping() { return false; }
 
 bool Running() {
   CheckHelper();

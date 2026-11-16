@@ -59,10 +59,8 @@ struct Stats {
 // from `sl_folder`. False, and why in `error`, if not.
 bool Start(ID3D11Device* game_device, HWND window, UINT width, UINT height, DXGI_FORMAT format, const wchar_t* sl_folder, char* error,
            size_t error_size);
-// Game thread. Stops the presenter: waits at most `wait_ms`; returns why it is still stopping, or nullptr once fully stopped.
-const char* Stop(DWORD wait_ms = 250);
-bool Reap();
-bool Stopping();
+// Game thread. Stops the presenter: waits at most `wait_ms` for the helper; the helper finishes by itself after that.
+void Stop(DWORD wait_ms = 250);
 bool Running();
 // Running with frame gen on: the game sends its frames to the helper. With frame gen off the helper stays up but idle (child window hidden),
 // and the game shows its own frames with nothing copied, as if the helper were closed.

@@ -631,12 +631,8 @@ IDXGISwapChain* g_native_swap = nullptr;
 bool g_native_ok = false;  // the slot really is DXGI's and not ReShade's wrapper
 UINT g_game_sync = 1, g_game_flags = 0;
 uint32_t g_game_presents = 0;
-// The game's frame times for the overlay's graph: from one return of its Present to the next (the whole frame, Reflex's sleep or HSF's
-// limiter included). Game thread only.
+// The length of the overlay's latency graph.
 constexpr size_t FRAME_HISTORY = 300;
-float g_frame_ms[FRAME_HISTORY] = {};
-size_t g_frame_write = 0;
-LONGLONG g_last_frame = 0;
 
 // HSF's own FPS cap, for when Reflex is not there (no DLSS-G presenter): holds the game thread after its Present until the next frame's time.
 // A high-resolution waitable timer for most of the wait, then a short spin. A frame later than one whole period restarts the timeline.
@@ -731,12 +727,6 @@ HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* self, UINT sync_interval
     } else {
       CapWait(g_fps_cap);
     }
-    const LONGLONG now = Now();
-    if (g_last_frame != 0) {
-      const double ms = Seconds(now - g_last_frame) * 1000.0;
-      g_frame_ms[g_frame_write++ % FRAME_HISTORY] = static_cast<float>(std::min(ms, 1000.0));
-    }
-    g_last_frame = now;
     return hr;
   }
   return g_real_present(self, sync_interval, flags);
@@ -1007,8 +997,11 @@ void Inspect(effect_runtime* runtime, device* dev, const resource_desc& back) {
 }
 
 // Starts, restarts (new window, size or format) or stops the DLSS-G presenter (dlssg.h) to match the game's swap chain.
-bool AnyRunning() { return hsf::dlssg::Running(); }
-const char* StopAny(DWORD wait_ms = 250) { return hsf::dlssg::Stop(wait_ms); }
+// Stops the presenter (waits at most `wait_ms`) and logs `why`; logs nothing for nullptr.
+void StopPresenter(const char* why, DWORD wait_ms = 250) {
+  hsf::dlssg::Stop(wait_ms);
+  if (why != nullptr) Log(why);
+}
 
 // Frame gen OFF keeps the helper running, so ON comes back at once (no start-up) for a quick on/off comparison. The helper's window covers
 // the game's, though, so while it runs with generation off it shows only what it manages to pass through, and on a card that struggles with
@@ -1024,7 +1017,7 @@ constexpr ULONGLONG NO_MOTION_STOP_MS = 3000;
 ULONGLONG g_no_motion_since = 0;  // when the motion went away while frame gen was on, 0 while there is motion
 bool g_helper_closed = false;     // CLOSE HELPER pressed (or the GPU guard tripped) while frame gen is off; cleared by ON
 bool StopHelperWhileOff() {
-  if (g_extra_enabled && AnyRunning() && g_dlssg_stats.gpu_hang) {
+  if (g_extra_enabled && hsf::dlssg::Running() && g_dlssg_stats.gpu_hang) {
     g_extra_enabled = false;
     g_helper_closed = true;
     Log("frame gen turned OFF and the helper closed: the GPU could not keep up with DLSS-G; the game shows its own frames again. Turn FRAME GEN on to try again");
@@ -1035,20 +1028,18 @@ bool StopHelperWhileOff() {
   if (!no_motion) g_no_motion_since = 0;
   else if (g_no_motion_since == 0) g_no_motion_since = now;
   if (no_motion) {
-    if (AnyRunning()) {
+    if (hsf::dlssg::Running()) {
       if (now - g_no_motion_since < NO_MOTION_STOP_MS) return false;
-      const char* const late = StopAny();
-      Log(late != nullptr ? late : "presenter stopped: no motion vectors, the game shows its own frames until a flow effect gives them");
+      StopPresenter("presenter stopped: no motion vectors, the game shows its own frames until a flow effect gives them");
       g_dlssg_stats = {};
     }
     Note("no motion vectors (is the flow effect on?): the game shows its own frames");
     return true;
   }
   if (g_extra_enabled) return false;
-  if (AnyRunning() && !g_helper_closed) return false;  // OFF, helper kept for a quick ON
-  if (AnyRunning()) {
-    const char* const late = StopAny();
-    Log(late != nullptr ? late : "presenter stopped: helper closed with frame gen off, the game shows its own frames");
+  if (hsf::dlssg::Running() && !g_helper_closed) return false;  // OFF, helper kept for a quick ON
+  if (hsf::dlssg::Running()) {
+    StopPresenter("presenter stopped: helper closed with frame gen off, the game shows its own frames");
     g_dlssg_stats = {};
   }
   Note("frame gen off: the game shows its own frames");
@@ -1092,38 +1083,31 @@ void UpdatePresenter(device* dev) {
   static D3D11_TEXTURE2D_DESC running{}, refused{};
   static uint32_t running_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
   static int running_source = -1;
-  if (hsf::dlssg::Reap()) Log("presenter stopped (finished late)");
   if (StopHelperWhileOff()) {
     refused = {};
     return;
   }
-  if (AnyRunning() && running_source != g_seen.source) {
+  if (hsf::dlssg::Running() && running_source != g_seen.source) {
     // The motion vector slots are made for one source's size and format: a new source needs a new presenter.
-    const char* const late = StopAny();
-    Log(late != nullptr ? late : "presenter stopped: new motion source");
+    StopPresenter("presenter stopped: new motion source");
     refused = {};
     return;
   }
   // The same for a new motion size (a DLSS mod's data at the back buffer's size after the flow's, Dlss11Motion): the slots keep the first size they got.
   UINT slot_width = 0, slot_height = 0;
-  if (AnyRunning() && g_seen.have_motion && hsf::dlssg::MotionSize(&slot_width, &slot_height) &&
+  if (hsf::dlssg::Running() && g_seen.have_motion && hsf::dlssg::MotionSize(&slot_width, &slot_height) &&
       (slot_width != g_seen.mv_width || slot_height != g_seen.mv_height)) {
-    const char* const late = StopAny();
+    hsf::dlssg::Stop();
     char text[160];
     std::snprintf(text, sizeof(text), "presenter stopped: motion size now %ux%u (the helper's slots are %ux%u)", g_seen.mv_width, g_seen.mv_height, slot_width,
                   slot_height);
-    Log(late != nullptr ? late : text);
+    Log(text);
     refused = {};
     return;
   }
-  if (hsf::dlssg::Stopping()) {
-    Note("presenter stopping: waiting for its thread");
-    return;
-  }
   if (!g_native_ok || g_native_swap == nullptr) {
-    if (AnyRunning()) {
-      const char* const late = StopAny();
-      Log(late != nullptr ? late : "presenter stopped");
+    if (hsf::dlssg::Running()) {
+      StopPresenter("presenter stopped");
     }
     refused = {};
     return;
@@ -1138,20 +1122,18 @@ void UpdatePresenter(device* dev) {
   g_native_swap->GetFullscreenState(&fullscreen, nullptr);
   const auto same = [&](const D3D11_TEXTURE2D_DESC& other) { return other.Width == desc.Width && other.Height == desc.Height && other.Format == desc.Format; };
   const uint32_t space = GameColorSpace(g_native_swap);
-  if (AnyRunning() && running_window == swap_desc.OutputWindow && same(running) && space == running_space) return;
+  if (hsf::dlssg::Running() && running_window == swap_desc.OutputWindow && same(running) && space == running_space) return;
   if (fullscreen) {
-    if (AnyRunning()) {
-      const char* const late = StopAny();
-      if (late != nullptr) Log(late);
+    if (hsf::dlssg::Running()) {
+      hsf::dlssg::Stop();
     }
     Note("exclusive fullscreen: the presenter needs windowed or borderless");
     return;
   }
   if (same(refused)) return;  // failed for this size and format already; a new size or format tries again
-  if (AnyRunning()) {
+  if (hsf::dlssg::Running()) {
     // New window, size or format: stop first, start on a later frame.
-    const char* const late = StopAny();
-    Log(late != nullptr ? late : "presenter stopped: the game's swap chain changed");
+    StopPresenter("presenter stopped: the game's swap chain changed");
     return;
   }
   char error[320];
@@ -3077,8 +3059,6 @@ void AfterPresent9() {
   const LONGLONG now = Now();
   g_cap_wait_ms = static_cast<float>(Seconds(capped - before) * 1000.0);
   g_start_wait_ms = static_cast<float>(Seconds(now - capped) * 1000.0);
-  if (g_last_frame != 0) g_frame_ms[g_frame_write++ % FRAME_HISTORY] = static_cast<float>(std::min(Seconds(now - g_last_frame) * 1000.0, 1000.0));
-  g_last_frame = now;
 }
 
 // The first few calls of each hook, for the log: which object, and whether it is the one HSF follows.
@@ -3304,19 +3284,12 @@ void FindDepth9(effect_runtime* runtime, device* dev) {
 void UpdatePresenter9() {
   static HWND running_window = nullptr, refused_window = nullptr;
   static UINT running_size[2] = {}, refused_size[2] = {};
-  if (hsf::dlssg::Reap()) Log("presenter stopped (finished late)");
   if (StopHelperWhileOff()) {
     refused_window = nullptr;
     return;
   }
-  if (hsf::dlssg::Stopping()) {
-    Note("presenter stopping: waiting for its thread");
-    return;
-  }
   const auto stop = [](const char* why) {
-    if (!hsf::dlssg::Running()) return;
-    const char* const late = hsf::dlssg::Stop();
-    Log(late != nullptr ? late : why);
+    if (hsf::dlssg::Running()) StopPresenter(why);
   };
   if (g_vtable9 == nullptr || g_native_swap9 == nullptr) {
     stop("presenter stopped");
@@ -3599,9 +3572,7 @@ void UpdatePresenterVk(effect_runtime* runtime, device* dev) {
     return;
   }
   const auto stop = [](const char* why) {
-    if (!hsf::dlssg::Running()) return;
-    const char* const late = hsf::dlssg::Stop();
-    Log(late != nullptr ? late : why);
+    if (hsf::dlssg::Running()) StopPresenter(why);
   };
   const resource back = runtime->get_current_back_buffer();
   if (back.handle == 0) return;
@@ -4617,8 +4588,7 @@ void OnDestroySwapchain(swapchain* swap) {
 void OnDestroyDevice(device* dev) {
   if (dev->get_api() == device_api::vulkan) {
     if (!hsf::vk::Follows(dev)) return;  // another device (a game that tries a GPU and drops it): the bridge stays
-    const char* const late = hsf::dlssg::Stop(2000);
-    if (late != nullptr) Log(late);
+    hsf::dlssg::Stop(2000);
     StopVkDepth();
     ReleaseVkView(false);
     g_v9 = ScoreView9{};  // the device is already out of ReShade's table: its texture is left to it
@@ -4646,8 +4616,7 @@ void OnDestroyDevice(device* dev) {
   }
   std::snprintf(line, sizeof(line), "DX9 exit: ReShade destroys the game's D3D9 device %p; HSF releases its copies", static_cast<void*>(native));
   Log(line);
-  const char* const late = hsf::dlssg::Stop(2000);
-  if (late != nullptr) Log(late);
+  hsf::dlssg::Stop(2000);
   ReleaseDepth9View();
   ReleaseScoreView9();
   hsf::score::Shutdown();  // it runs on HSF's D3D11 device in a DX9 game, which Stop frees
@@ -4883,8 +4852,7 @@ void OnDestroyEffectRuntime(effect_runtime* runtime) {
   // Vulkan: the swap chain goes away (exit or a new swap chain): the bridge goes now, while the device is still whole; it starts again with the next one.
   if (runtime->get_device()->get_api() == device_api::vulkan) {
     if (hsf::vk::Device() == nullptr) return;
-    const char* const late = hsf::dlssg::Stop(2000);
-    if (late != nullptr) Log(late);
+    hsf::dlssg::Stop(2000);
     runtime->get_command_queue()->wait_idle();
     StopVkDepth();
     ReleaseVkView(true);
@@ -4903,8 +4871,7 @@ void OnDestroyEffectRuntime(effect_runtime* runtime) {
 #endif
   if (reinterpret_cast<IDXGISwapChain*>(runtime->get_native()) == g_native_swap) {
     // The swap chain is going away: give the thread longer, but never wait without limit (that froze the game).
-    const char* const late = StopAny(2000);
-    if (late != nullptr) Log(late);
+    hsf::dlssg::Stop(2000);
     hsf::score::Shutdown();
     g_clean_ready = false;
     if (g_clean_frame != nullptr) {
@@ -6232,7 +6199,7 @@ void DrawPanel(effect_runtime* runtime) {
   ui::RowLabel("FRAME GEN", c::GREEN);
   if (ui::Toggle("##fg", &g_extra_enabled)) changed = true;
   // OFF keeps the helper for a quick ON; the red CLOSE HELPER box beside OFF stops it, so the game shows its own fps again (StopHelperWhileOff).
-  if (!g_extra_enabled && !g_helper_closed && AnyRunning()) {
+  if (!g_extra_enabled && !g_helper_closed && hsf::dlssg::Running()) {
     ImGui::SameLine();
     if (ui::Button("##closehelper", "CLOSE HELPER", c::RED)) {
       g_helper_closed = true;
@@ -6961,13 +6928,6 @@ float Label(ImDrawList* draw, ImVec2 at, float size, const char* text, ImU32 col
   draw->AddText(font, size, ImVec2(at.x + shadow, at.y + shadow), IM_COL32(0, 0, 0, 200), text);
   draw->AddText(font, size, at, colour, text);
   return size / ImGui::GetFontSize() * ImGui::CalcTextSize(text).x;
-}
-
-// The game's frame times, oldest first (at most FRAME_HISTORY).
-size_t FrameHistory(float* out) {
-  const size_t count = std::min(g_frame_write, FRAME_HISTORY);
-  for (size_t i = 0; i < count; ++i) out[i] = g_frame_ms[(g_frame_write - count + i) % FRAME_HISTORY];
-  return count;
 }
 
 // ---- The overlay ----
