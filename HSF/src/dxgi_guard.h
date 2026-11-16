@@ -15,5 +15,9 @@ namespace hsf::dxgiguard {
 const char* Install(HMODULE reshade_module);
 // Puts ReShade's own method back, as HSF unloads while ReShade stays (ReShade reloading its add-ons). Install can run again after it.
 void Uninstall();
+// ReShade was loaded again while HSF stayed loaded (an emulator booting another game). If the patched table still holds HSF's method, it is the
+// same ReShade and nothing changes. Otherwise the old ReShade and its table are gone: the guard forgets them without writing, and the next
+// Install guards the new ReShade.
+void ForgetIfGone();
 
 }  // namespace hsf::dxgiguard

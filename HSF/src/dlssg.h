@@ -61,6 +61,8 @@ bool Start(ID3D11Device* game_device, HWND window, UINT width, UINT height, DXGI
            size_t error_size);
 // Game thread. Stops the presenter: waits at most `wait_ms` for the helper; the helper finishes by itself after that.
 void Stop(DWORD wait_ms = 250);
+// Game thread. Forgets a helper failure, so the next Start tries again (RESCAN). Until then every Start refuses with that failure.
+void ClearFailure();
 bool Running();
 // Running with frame gen on: the game sends its frames to the helper. With frame gen off the helper stays up but idle (child window hidden),
 // and the game shows its own frames with nothing copied, as if the helper were closed.

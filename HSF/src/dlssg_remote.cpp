@@ -354,6 +354,12 @@ void Stop(DWORD wait_ms) {
   Finish();
 }
 
+void ClearFailure() {
+  if (g_failed[0] == '\0') return;
+  Log("helper failure forgotten (RESCAN): the next start tries again");
+  g_failed[0] = '\0';
+}
+
 bool Running() {
   CheckHelper();
   return g_r != nullptr;

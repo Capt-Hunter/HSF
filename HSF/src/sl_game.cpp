@@ -166,6 +166,30 @@ uint32_t g_trace_left = 0;
 constexpr uint64_t TRACE_EVERY_FRAMES = 1800;
 constexpr uint32_t TRACE_FRAMES = 3;
 
+// What SeeToken, DriveFrame, Poll and SendOwnConstants keep between calls that steers what HSF does. Start puts it back to these first values
+// (Reset), so a Start after a Stop in the same process behaves as the first. Caps on log lines stay where they are: they are not reset.
+struct DriveState {
+  uint32_t highest_token = 0;    // SeeToken, under g_lock
+  ULONGLONG on_at = 0;           // DriveFrame: when HSF last turned generation on
+  bool dynamic_sent = false;     // DriveFrame: what DLSS-G was last sent
+  uint32_t output_sent = 0;
+  uint32_t idle_polls = 0;       // Poll: HSF's own frame pick
+  bool told_working = false;
+  std::atomic<uint32_t> own_last_index{UINT32_MAX};  // SendOwnConstants
+  std::atomic<ULONGLONG> own_last_sent{0};
+  void Reset() {
+    highest_token = 0;
+    on_at = 0;
+    dynamic_sent = false;
+    output_sent = 0;
+    idle_polls = 0;
+    told_working = false;
+    own_last_index.store(UINT32_MAX);
+    own_last_sent.store(0);
+  }
+};
+DriveState g_run;
+
 // A new frame token: counts frames, and every so often turns on a line per call for a few frames, which shows the order of calls and their threads.
 void SeeToken(uint32_t token) {
   if (token == UINT32_MAX || token == g_last_token) return;
@@ -174,7 +198,7 @@ void SeeToken(uint32_t token) {
   // The real frame count for the menu counts only the game's token moving forward. With optical motion HSF's own tags carry another token (0 in Witcher 3), and
   // counting every switch between the two gave about twice the real frames, more or fewer as the mouse moved. A token far behind the highest seen is
   // the game starting its count again (a load), and counts as a new start.
-  static uint32_t s_highest = 0;
+  uint32_t& s_highest = g_run.highest_token;
   if (token != 0 && (token > s_highest || s_highest - token > 100000)) {
     s_highest = token;
     g_frames_public.fetch_add(1, std::memory_order_relaxed);
@@ -1649,6 +1673,7 @@ void Start(const wchar_t* log_path, bool drive, bool dynamic_resolution_known) {
   g_output_width.store(0);
   g_output_height.store(0);
   g_drive.store(drive);
+  g_run.Reset();
   {
     OptionsLock options_lock;
     g_have_game_options = false;
@@ -1698,7 +1723,7 @@ static void DriveFrame() {
   if (g_quick_off.load(std::memory_order_relaxed)) gone_ms = std::min<ULONGLONG>(gone_ms, static_cast<ULONGLONG>(std::max(g_evaluate_gap_ms.load(std::memory_order_relaxed) * QUICK_OFF_GAPS, QUICK_OFF_LEAST_MS)));
   // DLSS-G starting up stalls the game's frames for a moment, which quick off took for missing vectors: on, off and on again within 90 ms, after which Crimson Desert lost its
   // device. The stall there reached 281 ms, so for the first second after HSF turns generation on no gap turns it off.
-  static ULONGLONG s_on_at = 0;
+  ULONGLONG& s_on_at = g_run.on_at;
   if (g_generating.load(std::memory_order_relaxed) && now - s_on_at < ON_SETTLE_MS) gone_ms = ON_SETTLE_MS;
   // With optical motion DLSS-G gets HSF's flow and depth, so the game need not run DLSS at all: with TAA (AC Shadows) there are no evaluates, and
   // waiting for them held generation off although the game sent its constants and HSF tagged every frame.
@@ -1716,8 +1741,8 @@ static void DriveFrame() {
   uint32_t frames = std::max(g_want_frames.load(std::memory_order_relaxed), 1u);
   const uint32_t max_frames = g_max_frames.load(std::memory_order_relaxed);
   if (max_frames != 0) frames = std::min(frames, max_frames);
-  static bool s_dynamic_sent = false;
-  static uint32_t s_output_sent = 0;
+  bool& s_dynamic_sent = g_run.dynamic_sent;
+  uint32_t& s_output_sent = g_run.output_sent;
   const bool dynamic = g_dynamic.load(std::memory_order_relaxed);
   const uint32_t output = g_output_width.load(std::memory_order_relaxed);
   if (on == g_generating.load(std::memory_order_relaxed) && (!on || frames == g_frames_sent.load(std::memory_order_relaxed)) && (!on || (dynamic == s_dynamic_sent && (!dynamic || output == s_output_sent)))) return;
@@ -1913,8 +1938,8 @@ void Poll() {
   // it picked is not the one being presented: try the other end of the recent tokens. No setting for anyone to change; the log says which one works.
   const ULONGLONG t = GetTickCount64();
   const bool own_frame = OpticalActive() && t - g_own_constants_last.load(std::memory_order_relaxed) <= 1000;
-  static uint32_t s_idle_polls = 0;
-  static bool s_told_working = false;
+  uint32_t& s_idle_polls = g_run.idle_polls;
+  bool& s_told_working = g_run.told_working;
   if (own_frame && g_generating.load(std::memory_order_relaxed) && state.numFramesActuallyPresented <= 1) {
     if (++s_idle_polls >= 3) {
       s_idle_polls = 0;
@@ -1994,10 +2019,10 @@ void SendOwnConstants(const uint32_t extent[4], const float scale[2], bool dilat
   const sl::FrameToken* const frame = g_last_frame.load(std::memory_order_relaxed);
   if (frame == nullptr) return;
   // One set per frame: a second for the same frame is eErrorDuplicatedConstants (27, PBZ while loading, two presents on one token).
-  static std::atomic<uint32_t> s_last_index{UINT32_MAX};
+  std::atomic<uint32_t>& s_last_index = g_run.own_last_index;
   const uint32_t index = SafeToken(frame);
   if (index == UINT32_MAX || s_last_index.exchange(index, std::memory_order_relaxed) == index) return;
-  static std::atomic<ULONGLONG> s_last_sent{0};
+  std::atomic<ULONGLONG>& s_last_sent = g_run.own_last_sent;
   // After a gap nothing moved from anywhere. The game's DLSS data through NGX also brings its own reset.
   const bool gap = now - s_last_sent.exchange(now, std::memory_order_relaxed) > EVALUATE_GONE_MS;
   const bool reset = g_optical_reset.exchange(false, std::memory_order_relaxed) || gap;

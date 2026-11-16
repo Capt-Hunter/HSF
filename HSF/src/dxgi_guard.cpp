@@ -47,6 +47,18 @@ bool Inside(HMODULE module, const void* address) {
          owner == module;
 }
 
+// Reads the patched slot without trusting that the memory is still there.
+bool SlotStillOurs() {
+  MEMORY_BASIC_INFORMATION info{};
+  void* const slot = &g_table[SLOT_ENUM_ADAPTER_BY_LUID];
+  if (VirtualQuery(slot, &info, sizeof(info)) != sizeof(info) || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return false;
+  __try {
+    return *static_cast<void* volatile*>(slot) == reinterpret_cast<void*>(&EnumAdapterByLuid);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
 }  // namespace
 
 const char* Install(HMODULE reshade_module) {
@@ -78,6 +90,12 @@ const char* Install(HMODULE reshade_module) {
 void Uninstall() {
   if (g_table == nullptr) return;
   if (g_table[SLOT_ENUM_ADAPTER_BY_LUID] == reinterpret_cast<void*>(&EnumAdapterByLuid)) WriteSlot(reinterpret_cast<void*>(g_reshade_enum));
+  g_table = nullptr;
+  g_done = false;
+}
+
+void ForgetIfGone() {
+  if (g_table != nullptr && SlotStillOurs()) return;
   g_table = nullptr;
   g_done = false;
 }

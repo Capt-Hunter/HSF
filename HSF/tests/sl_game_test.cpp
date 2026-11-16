@@ -483,6 +483,21 @@ void TestDrive(sl::Result (*set_loaded)(sl::Feature, bool), EvaluateFn evaluate,
   hsf::slgame::Poll();
   Check(g_fake_mode == sl::DLSSGMode::eOn && (g_fake_flags & static_cast<uint32_t>(sl::DLSSGFlags::eDynamicResolutionEnabled)) != 0, "drive: known dynamic resolution has the flag from the first time on");
   hsf::slgame::Stop(false);
+
+  // Start, Stop, Start in one process: the third run behaves as the first. Its tokens start low again (a new game boot), below the last run's
+  // highest; the frame count must still count them, which a value kept from the run before stopped.
+  hsf::slgame::Start(log, true);
+  hsf::slgame::SetGeneration(true, 2);
+  Check(hsf::slgame::HookFeatureFunctionForTest("slDLSSGSetOptions", stub), "restart: hook again for a third run");
+  const uint64_t frames_before = hsf::slgame::GameFrames();
+  for (uint32_t i = 0; i < 12; ++i) {
+    token.value = 5 + i;
+    evaluate(sl::kFeatureDLSS, token, inputs, 3, reinterpret_cast<sl::CommandBuffer*>(list.Get()));
+  }
+  Check(hsf::slgame::GameFrames() - frames_before == 12, "restart: frames counted from the new run's own first token");
+  hsf::slgame::Poll();
+  Check(g_fake_mode == sl::DLSSGMode::eOn && g_fake_frames == 2, "restart: generation goes on as in the first run");
+  hsf::slgame::Stop(false);
 }
 
 }  // namespace

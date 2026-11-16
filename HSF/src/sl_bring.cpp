@@ -1200,7 +1200,16 @@ struct Feeder {
   }
 };
 std::unique_ptr<Feeder> g_feeder;
+// A feeder that failed is not made again for the same sizes and formats (MakeFeeder logs why once); new ones try again.
+struct FeederKey {
+  ID3D12Device* device;
+  UINT64 width, input_width;
+  UINT height, input_height;
+  DXGI_FORMAT colour_format, motion_format;
+  bool operator==(const FeederKey&) const = default;
+};
 bool g_feeder_failed = false;
+FeederKey g_feeder_failed_for{};
 std::atomic<int> g_nvof_state{0};
 void NvofLine(const char* text) { Line("%s", text); }
 
@@ -1438,7 +1447,12 @@ bool FeedFrame(const FrameFeed& in) {
   if (f == nullptr || f->device != in.device || f->width != back.Width || f->height != back.Height || f->colour_format != back.Format || f->input_width != motion_desc.Width || f->input_height != motion_desc.Height || f->motion_format != motion_desc.Format ||
       (nvof_alone && !f->no_motion)) {
     g_feeder.reset();
-    if (!g_feeder_failed && !MakeFeeder(in, back, motion_desc)) g_feeder_failed = true;
+    const FeederKey key{in.device, back.Width, motion_desc.Width, back.Height, motion_desc.Height, back.Format, motion_desc.Format};
+    if (g_feeder_failed && !(key == g_feeder_failed_for)) g_feeder_failed = false;
+    if (!g_feeder_failed && !MakeFeeder(in, back, motion_desc)) {
+      g_feeder_failed = true;
+      g_feeder_failed_for = key;
+    }
     f = g_feeder.get();
     if (f == nullptr) return false;
   }

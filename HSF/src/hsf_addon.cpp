@@ -1078,19 +1078,41 @@ uint32_t GameColorSpace(IDXGISwapChain* swap) {
   return GameColorSpace();
 }
 
+// What one presenter keeper (UpdatePresenter, UpdatePresenter9, UpdatePresenterVk) keeps between frames. The running_ values describe the
+// presenter while hsf::dlssg::Running(). The refused_ values name a start that failed, which is not tried again for the same window and size
+// until RESCAN or a new device. `owner` is the device the values belong to: when it is destroyed, the refused start is forgotten (ForgetDevice).
+struct PresenterState {
+  const void* owner = nullptr;
+  HWND running_window = nullptr, refused_window = nullptr;
+  UINT running_size[2] = {}, refused_size[2] = {};
+  uint32_t running_format = 0, refused_format = 0;
+  uint32_t running_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+  int running_source = -1;
+  void ForgetRefused() {
+    refused_window = nullptr;
+    refused_size[0] = refused_size[1] = 0;
+    refused_format = 0;
+  }
+  void Follow(const void* device) { owner = device; }
+  void Forget(const void* device) {
+    if (device == nullptr || device != owner) return;
+    owner = nullptr;
+    ForgetRefused();
+  }
+};
+PresenterState g_presenter11, g_presenter9, g_presenter_vk;
+
 void UpdatePresenter(device* dev) {
-  static HWND running_window = nullptr;
-  static D3D11_TEXTURE2D_DESC running{}, refused{};
-  static uint32_t running_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-  static int running_source = -1;
+  PresenterState& p = g_presenter11;
+  p.Follow(dev);
   if (StopHelperWhileOff()) {
-    refused = {};
+    p.ForgetRefused();
     return;
   }
-  if (hsf::dlssg::Running() && running_source != g_seen.source) {
+  if (hsf::dlssg::Running() && p.running_source != g_seen.source) {
     // The motion vector slots are made for one source's size and format: a new source needs a new presenter.
     StopPresenter("presenter stopped: new motion source");
-    refused = {};
+    p.ForgetRefused();
     return;
   }
   // The same for a new motion size (a DLSS mod's data at the back buffer's size after the flow's, Dlss11Motion): the slots keep the first size they got.
@@ -1102,14 +1124,14 @@ void UpdatePresenter(device* dev) {
     std::snprintf(text, sizeof(text), "presenter stopped: motion size now %ux%u (the helper's slots are %ux%u)", g_seen.mv_width, g_seen.mv_height, slot_width,
                   slot_height);
     Log(text);
-    refused = {};
+    p.ForgetRefused();
     return;
   }
   if (!g_native_ok || g_native_swap == nullptr) {
     if (hsf::dlssg::Running()) {
       StopPresenter("presenter stopped");
     }
-    refused = {};
+    p.ForgetRefused();
     return;
   }
   DXGI_SWAP_CHAIN_DESC swap_desc{};
@@ -1120,9 +1142,9 @@ void UpdatePresenter(device* dev) {
   back->GetDesc(&desc);
   back->Release();
   g_native_swap->GetFullscreenState(&fullscreen, nullptr);
-  const auto same = [&](const D3D11_TEXTURE2D_DESC& other) { return other.Width == desc.Width && other.Height == desc.Height && other.Format == desc.Format; };
+  const auto same = [&](const UINT size[2], uint32_t format) { return size[0] == desc.Width && size[1] == desc.Height && format == static_cast<uint32_t>(desc.Format); };
   const uint32_t space = GameColorSpace(g_native_swap);
-  if (hsf::dlssg::Running() && running_window == swap_desc.OutputWindow && same(running) && space == running_space) return;
+  if (hsf::dlssg::Running() && p.running_window == swap_desc.OutputWindow && same(p.running_size, p.running_format) && space == p.running_space) return;
   if (fullscreen) {
     if (hsf::dlssg::Running()) {
       hsf::dlssg::Stop();
@@ -1130,7 +1152,7 @@ void UpdatePresenter(device* dev) {
     Note("exclusive fullscreen: the presenter needs windowed or borderless");
     return;
   }
-  if (same(refused)) return;  // failed for this size and format already; a new size or format tries again
+  if (same(p.refused_size, p.refused_format)) return;  // failed for this size and format already; a new size or format tries again
   if (hsf::dlssg::Running()) {
     // New window, size or format: stop first, start on a later frame.
     StopPresenter("presenter stopped: the game's swap chain changed");
@@ -1143,15 +1165,19 @@ void UpdatePresenter(device* dev) {
   hsf::dlssg::SetOverlayWindow(g_overlay_window);
   const bool started = hsf::dlssg::Start(native_device, swap_desc.OutputWindow, desc.Width, desc.Height, desc.Format, g_sl_folder, error, sizeof(error));
   if (started) {
-    running_window = swap_desc.OutputWindow;
-    running = desc;
-    running_space = space;
-    running_source = g_seen.source;
+    p.running_window = swap_desc.OutputWindow;
+    p.running_size[0] = desc.Width;
+    p.running_size[1] = desc.Height;
+    p.running_format = static_cast<uint32_t>(desc.Format);
+    p.running_space = space;
+    p.running_source = g_seen.source;
     std::snprintf(text, sizeof(text), "DLSS-G presenter started: %ux%u format %u%s%s", desc.Width, desc.Height, static_cast<unsigned>(desc.Format),
                   error[0] != '\0' ? "; " : "", error);
     Note("presenter on: DLSS Frame Generation (log: HSF_streamline\\hsf_dlssg.log)");
   } else {
-    refused = desc;
+    p.refused_size[0] = desc.Width;
+    p.refused_size[1] = desc.Height;
+    p.refused_format = static_cast<uint32_t>(desc.Format);
     std::snprintf(text, sizeof(text), "presenter could not start: %s", error);
     Note(text);
   }
@@ -1999,22 +2025,43 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t indices, uint32_t instances,
 // Before any of ReShade's effects: the frame with the HUD, and the end of the game's draws.
 // The size of the game's depth buffer ReShade binds to HSF.fx's DEPTH texture; false when it binds none or a placeholder (no view, or a
 // texture under half the picture).
-bool BoundDepthSize(effect_runtime* runtime, uint32_t& width, uint32_t& height) {
-  static effect_texture_variable semantic = {};
-  static uint32_t reload_seen = ~0u;
-  if (reload_seen != g_effect_reloads || semantic.handle == 0) {
-    reload_seen = g_effect_reloads;
-    semantic = runtime->find_texture_variable("HSF.fx", "HSFDepth");
+// What BoundDepthSize, FitDepthCopy and PinDepthSize keep between frames. The effect variables belong to one effect runtime (`owner`): when it
+// is destroyed, everything goes back to these first values (ForgetRuntime), so the next runtime starts as the first one did.
+struct DepthState {
+  const effect_runtime* owner = nullptr;
+  effect_texture_variable semantic = {};  // BoundDepthSize
+  uint32_t semantic_reload = ~0u;
+  effect_uniform_variable fit = {};  // FitDepthCopy
+  uint32_t fit_reload = ~0u;
+  float fit_sent[4] = {0.f, 0.f, 1.f, 1.f};
+  uint32_t pin_reload = ~0u;  // PinDepthSize
+  int pin_check = 1;
+  uint32_t pin_seen_width = 0, pin_seen_height = 0;
+  ULONGLONG pin_seen_since = 0, pin_missing_since = 0;
+  bool pin_written = false;
+  void Follow(const effect_runtime* runtime) { owner = runtime; }
+  void Forget(const effect_runtime* runtime) {
+    if (runtime != nullptr && runtime == owner) *this = DepthState{};
   }
-  if (semantic.handle == 0) return false;
+};
+DepthState g_depth_state;
+
+bool BoundDepthSize(effect_runtime* runtime, uint32_t& width, uint32_t& height) {
+  DepthState& d = g_depth_state;
+  d.Follow(runtime);
+  if (d.semantic_reload != g_effect_reloads || d.semantic.handle == 0) {
+    d.semantic_reload = g_effect_reloads;
+    d.semantic = runtime->find_texture_variable("HSF.fx", "HSFDepth");
+  }
+  if (d.semantic.handle == 0) return false;
   resource_view srv{}, srv_srgb{};
-  runtime->get_texture_binding(semantic, &srv, &srv_srgb);
+  runtime->get_texture_binding(d.semantic, &srv, &srv_srgb);
   if (srv.handle == 0) return false;
   device* const dev = runtime->get_device();
-  const resource_desc d = dev->get_resource_desc(dev->get_resource_from_view(srv));
-  if (d.type != resource_type::texture_2d || d.texture.width * 2 < g_seen.width || d.texture.height * 2 < g_seen.height) return false;
-  width = d.texture.width;
-  height = d.texture.height;
+  const resource_desc rd = dev->get_resource_desc(dev->get_resource_from_view(srv));
+  if (rd.type != resource_type::texture_2d || rd.texture.width * 2 < g_seen.width || rd.texture.height * 2 < g_seen.height) return false;
+  width = rd.texture.width;
+  height = rd.texture.height;
   return true;
 }
 
@@ -2023,16 +2070,16 @@ bool BoundDepthSize(effect_runtime* runtime, uint32_t& width, uint32_t& height) 
 void FitDepthCopy(effect_runtime* runtime) {
   const device_api api = runtime->get_device()->get_api();
   if ((api != device_api::vulkan && api != device_api::d3d9) || g_seen.width == 0 || g_seen.height == 0) return;
-  static effect_uniform_variable fit = {};
-  static uint32_t reload_seen = ~0u;
-  static float sent[4] = {0.f, 0.f, 1.f, 1.f};
-  if (reload_seen != g_effect_reloads) {
-    reload_seen = g_effect_reloads;
-    fit = runtime->find_uniform_variable("HSF.fx", "HSFDepthFit");
+  DepthState& d = g_depth_state;
+  d.Follow(runtime);
+  float* const sent = d.fit_sent;
+  if (d.fit_reload != g_effect_reloads) {
+    d.fit_reload = g_effect_reloads;
+    d.fit = runtime->find_uniform_variable("HSF.fx", "HSFDepthFit");
     sent[0] = sent[1] = 0.f;
     sent[2] = sent[3] = 1.f;
   }
-  if (fit.handle == 0) return;
+  if (d.fit.handle == 0) return;
   float want[4] = {0.f, 0.f, 1.f, 1.f};
   uint32_t width = 0, height = 0;
   if (BoundDepthSize(runtime, width, height)) {
@@ -2046,7 +2093,7 @@ void FitDepthCopy(effect_runtime* runtime) {
     want[1] = (1.f - want[3]) * 0.5f;
   }
   if (std::equal(want, want + 4, sent)) return;
-  runtime->set_uniform_value_float(fit, want, 4);
+  runtime->set_uniform_value_float(d.fit, want, 4);
   std::copy(want, want + 4, sent);
   char text[200];
   if (want[2] < 1.f || want[3] < 1.f)
@@ -2064,13 +2111,14 @@ void FitDepthCopy(effect_runtime* runtime) {
 void PinDepthSize(effect_runtime* runtime) {
   const device_api api = runtime->get_device()->get_api();
   if ((api != device_api::vulkan && api != device_api::d3d11 && api != device_api::d3d9) || g_seen.width == 0 || g_seen.height == 0) return;
-  static uint32_t reload_seen = ~0u;
-  static int check = 1;
-  static uint32_t seen_width = 0, seen_height = 0;
-  static ULONGLONG seen_since = 0, missing_since = 0;
-  static bool written = false;
-  if (reload_seen != g_effect_reloads) {
-    reload_seen = g_effect_reloads;
+  DepthState& d = g_depth_state;
+  d.Follow(runtime);
+  int& check = d.pin_check;
+  uint32_t &seen_width = d.pin_seen_width, &seen_height = d.pin_seen_height;
+  ULONGLONG &seen_since = d.pin_seen_since, &missing_since = d.pin_missing_since;
+  bool& written = d.pin_written;
+  if (d.pin_reload != g_effect_reloads) {
+    d.pin_reload = g_effect_reloads;
     check = 1;
     reshade::get_config_value(nullptr, "DEPTH", "UseAspectRatioHeuristics", check);
     seen_width = seen_height = 0;
@@ -2346,11 +2394,41 @@ struct SourceHold {
   }
 };
 
+// What PauseFlow and Dlss11Motion keep between frames. PauseFlow's state belongs to one effect runtime, Dlss11Motion's to one device: when that
+// one is destroyed, its part goes back to these first values (ForgetRuntime, ForgetDevice).
+struct MotionPickState {
+  const effect_runtime* pause_owner = nullptr;  // PauseFlow
+  bool paused = false;
+  uint32_t pause_reload = 0;
+  const device* dlss11_owner = nullptr;  // Dlss11Motion
+  uint64_t dlss11_last_serial = 0;
+  int dlss11_quiet = 0;
+  bool dlss11_used = false, dlss11_full = false;
+  SourceHold dlss11_hold;
+  void FollowRuntime(const effect_runtime* runtime) { pause_owner = runtime; }
+  void FollowDevice(const device* dev) { dlss11_owner = dev; }
+  void ForgetRuntime(const effect_runtime* runtime) {
+    if (runtime == nullptr || runtime != pause_owner) return;
+    pause_owner = nullptr;
+    paused = false;
+    pause_reload = 0;
+  }
+  void ForgetDevice(const device* dev) {
+    if (dev == nullptr || dev != dlss11_owner) return;
+    dlss11_owner = nullptr;
+    dlss11_last_serial = 0;
+    dlss11_quiet = 0;
+    dlss11_used = dlss11_full = false;
+    dlss11_hold = SourceHold{};
+  }
+};
+MotionPickState g_motion_pick;
+
 void PauseFlow(effect_runtime* runtime, bool pause) {
-  static bool paused = false;
-  static uint32_t reload_seen = 0;
-  if (reload_seen != g_effect_reloads) {  // a reload brings the techniques back as the preset has them
-    reload_seen = g_effect_reloads;
+  if (runtime != nullptr) g_motion_pick.FollowRuntime(runtime);
+  bool& paused = g_motion_pick.paused;
+  if (g_motion_pick.pause_reload != g_effect_reloads) {  // a reload brings the techniques back as the preset has them
+    g_motion_pick.pause_reload = g_effect_reloads;
     paused = false;
   }
   if (pause == paused || runtime == nullptr) return;
@@ -2389,9 +2467,11 @@ void Dlss11Motion(effect_runtime* runtime, device* dev) {
   g_dlss11_depth = nullptr;
   g_motion_fitted = false;
 #ifdef HSF_SL_GAME
-  static uint64_t last_serial = 0;
-  static int quiet = 0;
-  static bool used = false, full = false;
+  MotionPickState& m = g_motion_pick;
+  m.FollowDevice(dev);
+  uint64_t& last_serial = m.dlss11_last_serial;
+  int& quiet = m.dlss11_quiet;
+  bool &used = m.dlss11_used, &full = m.dlss11_full;
   hsf::ngx::Frame11 f;
   bool use = false;
   const bool have = hsf::ngx::Latest11(&f);
@@ -2400,8 +2480,7 @@ void Dlss11Motion(effect_runtime* runtime, device* dev) {
     last_serial = f.serial;
     if (quiet < 3) g_dlss_seen = true;
   }
-  static SourceHold hold;
-  use = have && hold.Pick(quiet < 3, "D3D11") && MotionFrom() != 1;
+  use = have && m.dlss11_hold.Pick(quiet < 3, "D3D11") && MotionFrom() != 1;
   const uint32_t out_width = g_seen.width, out_height = g_seen.height;
   ID3D11Device* const native = reinterpret_cast<ID3D11Device*>(dev->get_native());
   ID3D11Texture2D* fitted = nullptr;
@@ -3282,10 +3361,10 @@ void FindDepth9(effect_runtime* runtime, device* dev) {
 
 // Starts, restarts (new window or size) or stops DLSS-G for a D3D9 game.
 void UpdatePresenter9() {
-  static HWND running_window = nullptr, refused_window = nullptr;
-  static UINT running_size[2] = {}, refused_size[2] = {};
+  PresenterState& p = g_presenter9;
+  p.Follow(g_native9);
   if (StopHelperWhileOff()) {
-    refused_window = nullptr;
+    p.ForgetRefused();
     return;
   }
   const auto stop = [](const char* why) {
@@ -3293,7 +3372,7 @@ void UpdatePresenter9() {
   };
   if (g_vtable9 == nullptr || g_native_swap9 == nullptr) {
     stop("presenter stopped");
-    refused_window = nullptr;
+    p.ForgetRefused();
     Note("DX9: no native Present to use");
     return;
   }
@@ -3311,9 +3390,9 @@ void UpdatePresenter9() {
     Note("exclusive fullscreen: the presenter needs windowed or borderless");
     return;
   }
-  const bool same_running = window == running_window && desc.Width == running_size[0] && desc.Height == running_size[1];
+  const bool same_running = window == p.running_window && desc.Width == p.running_size[0] && desc.Height == p.running_size[1];
   if (hsf::dlssg::Running() && same_running) return;
-  if (window == refused_window && desc.Width == refused_size[0] && desc.Height == refused_size[1]) return;  // failed for this window and size already; a new size tries again
+  if (window == p.refused_window && desc.Width == p.refused_size[0] && desc.Height == p.refused_size[1]) return;  // failed for this window and size already; a new size tries again
   if (hsf::dlssg::Running()) {
     stop("presenter stopped: the game's window or size changed");
     return;
@@ -3329,16 +3408,16 @@ void UpdatePresenter9() {
     started = hsf::dlssg::Start(hsf::dx9::Device(), window, desc.Width, desc.Height, format, g_sl_folder, error, sizeof(error));
   }
   if (started) {
-    running_window = window;
-    running_size[0] = desc.Width;
-    running_size[1] = desc.Height;
+    p.running_window = window;
+    p.running_size[0] = desc.Width;
+    p.running_size[1] = desc.Height;
     std::snprintf(text, sizeof(text), "DLSS-G presenter started for Direct3D 9: %ux%u D3D9 format %u, bridge %s%s%s", desc.Width, desc.Height,
                   static_cast<unsigned>(desc.Format), hsf::dx9::ROUTE_NAMES[static_cast<int>(hsf::dx9::CurrentRoute())], error[0] != '\0' ? "; " : "", error);
     Note("presenter on: DLSS Frame Generation (log: HSF_streamline\\hsf_dlssg.log)");
   } else {
-    refused_window = window;
-    refused_size[0] = desc.Width;
-    refused_size[1] = desc.Height;
+    p.refused_window = window;
+    p.refused_size[0] = desc.Width;
+    p.refused_size[1] = desc.Height;
     std::snprintf(text, sizeof(text), "presenter could not start: %s", error);
     Note(text);
   }
@@ -3561,14 +3640,14 @@ uint64_t g_vk_handed_total = 0;       // frames handed to DLSS-G over the bridge
 
 // Starts, restarts (new window or size) or stops DLSS-G for a Vulkan game.
 void UpdatePresenterVk(effect_runtime* runtime, device* dev) {
-  static HWND running_window = nullptr, refused_window = nullptr;
-  static UINT running_size[2] = {}, refused_size[2] = {};
+  PresenterState& p = g_presenter_vk;
+  p.Follow(dev);
   if (g_vk_rescan) {
     g_vk_rescan = false;
-    refused_window = nullptr;
+    p.ForgetRefused();
   }
   if (StopHelperWhileOff()) {
-    refused_window = nullptr;
+    p.ForgetRefused();
     return;
   }
   const auto stop = [](const char* why) {
@@ -3586,8 +3665,8 @@ void UpdatePresenterVk(effect_runtime* runtime, device* dev) {
     stop("presenter restarted: the motion goes over at the back buffer's size from now on (the game's DLSS data was seen)");
     return;
   }
-  if (hsf::dlssg::Running() && window == running_window && width == running_size[0] && height == running_size[1]) return;
-  if (window == refused_window && width == refused_size[0] && height == refused_size[1]) return;  // failed for this window and size already
+  if (hsf::dlssg::Running() && window == p.running_window && width == p.running_size[0] && height == p.running_size[1]) return;
+  if (window == p.refused_window && width == p.refused_size[0] && height == p.refused_size[1]) return;  // failed for this window and size already
   if (hsf::dlssg::Running()) {
     stop("presenter stopped: the game's window or size changed");
     return;
@@ -3605,9 +3684,9 @@ void UpdatePresenterVk(effect_runtime* runtime, device* dev) {
   }
   if (started) {
     g_vk_presenter_error[0] = '\0';
-    running_window = window;
-    running_size[0] = width;
-    running_size[1] = height;
+    p.running_window = window;
+    p.running_size[0] = width;
+    p.running_size[1] = height;
     std::snprintf(text, sizeof(text), "DLSS-G presenter started for Vulkan: %ux%u format %u, %s", width, height, static_cast<unsigned>(desc.texture.format),
                   hsf::vk::SameFrame() ? "frames handed over in the same frame (shared semaphores on the game's device)"
                                        : "frames handed over in the same frame after a CPU wait for the copies (no shared semaphores on the game's device)");
@@ -3615,9 +3694,9 @@ void UpdatePresenterVk(effect_runtime* runtime, device* dev) {
     const char* const hook = hsf::vk::HookReport();
     Log(hook[0] != '\0' ? hook : "Vulkan device hook: did not see the game's device (HSF's Vulkan layer may still have added the extensions)");
   } else {
-    refused_window = window;
-    refused_size[0] = width;
-    refused_size[1] = height;
+    p.refused_window = window;
+    p.refused_size[0] = width;
+    p.refused_size[1] = height;
     std::snprintf(g_vk_presenter_error, sizeof(g_vk_presenter_error), "%s", error);
     std::snprintf(text, sizeof(text), "presenter could not start: %s", error);
     Note(text);
@@ -4585,7 +4664,21 @@ void OnDestroySwapchain(swapchain* swap) {
   if (swap->get_device()->get_api() == device_api::d3d9) ReleaseDx9ForReset();
 }
 
+// A device or an effect runtime goes away: the state kept for that one goes back to its first values, so the next one starts as the first did.
+// State that belongs to another device or runtime is left alone.
+void ResetDeviceState(device* dev) {
+  g_presenter11.Forget(dev);
+  g_presenter_vk.Forget(dev);
+  if (dev->get_api() == device_api::d3d9) g_presenter9.Forget(reinterpret_cast<const void*>(static_cast<uintptr_t>(dev->get_native())));
+  g_motion_pick.ForgetDevice(dev);
+}
+void ResetRuntimeState(effect_runtime* runtime) {
+  g_depth_state.Forget(runtime);
+  g_motion_pick.ForgetRuntime(runtime);
+}
+
 void OnDestroyDevice(device* dev) {
+  ResetDeviceState(dev);
   if (dev->get_api() == device_api::vulkan) {
     if (!hsf::vk::Follows(dev)) return;  // another device (a game that tries a GPU and drops it): the bridge stays
     hsf::dlssg::Stop(2000);
@@ -4849,6 +4942,7 @@ void OnReloaded(effect_runtime*) {
 }
 
 void OnDestroyEffectRuntime(effect_runtime* runtime) {
+  ResetRuntimeState(runtime);
   // Vulkan: the swap chain goes away (exit or a new swap chain): the bridge goes now, while the device is still whole; it starts again with the next one.
   if (runtime->get_device()->get_api() == device_api::vulkan) {
     if (hsf::vk::Device() == nullptr) return;
@@ -5817,6 +5911,13 @@ void LogFinder(const Finder& f, const char* why) {
 void Rescan(bool manual) {
   g_rescan_at = GetTickCount64();
   if (!manual) ++g_auto_rescans;
+  if (manual) {
+    // A press means try everything again: a helper that failed, and a presenter start refused for this window and size.
+    hsf::dlssg::ClearFailure();
+    g_presenter11.ForgetRefused();
+    g_presenter9.ForgetRefused();
+    g_presenter_vk.ForgetRefused();
+  }
 #ifdef HSF_SL_GAME
   if ((g_sl_bring && g_ngx_input) || g_sl_ngx) hsf::ngx::Rescan();
   if (g_sl_game) hsf::slgame::Rescan();
@@ -7384,6 +7485,17 @@ void OnHelperRuntime(reshade::api::effect_runtime* runtime) { runtime->set_effec
 // Set by DllMain when Windows loads the add-on, cleared by the AddonInit call ReShade makes right after.
 bool g_fresh_attach = false;
 
+// ReShade was loaded again into the same process while HSF stayed loaded: what HSF kept for the old ReShade's devices and effect runtimes goes
+// back to its first values. Their destroy events may never have reached HSF.
+void ResetRunState() {
+  g_presenter11 = PresenterState{};
+  g_presenter9 = PresenterState{};
+  g_presenter_vk = PresenterState{};
+  g_depth_state = DepthState{};
+  g_motion_pick = MotionPickState{};
+  hsf::dxgiguard::ForgetIfGone();
+}
+
 // Every ReShade event and overlay HSF uses. DllMain calls it on the first load; AddonInit calls it again when ReShade is loaded a second time
 // into the same process, where Windows keeps HSF loaded and skips DllMain.
 void RegisterEvents() {
@@ -7459,6 +7571,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
     if (reshade::internal::get_reshade_module_handle() == reshade_module) reshade::log_message(reshade::log_level::error, text);
     return false;
   }
+  ResetRunState();
   RegisterEvents();
   reshade::log_message(reshade::log_level::info, moved ? "HSF: ReShade was loaded again at another address (an emulator booting another game); HSF registered again"
                                                        : "HSF: ReShade was loaded again (an emulator booting another game); HSF registered again");
