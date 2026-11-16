@@ -645,6 +645,11 @@ void Stop() {
     CloseThreadpoolWork(g_work);  // no callback is running: CopyRows waits for them all
     g_work = nullptr;
   }
+  // The depth grid belongs to the device that just went: DepthGrid hands nothing until the next device's first read. The serial keeps counting, so a
+  // reader never takes the next grid for the one it has.
+  g_depth_grid.clear();
+  g_depth_min = g_depth_max = 0;
+  g_depth_checks = 0;
 }
 
 void ReleaseGameResources() {

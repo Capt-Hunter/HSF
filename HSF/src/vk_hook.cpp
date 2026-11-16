@@ -181,6 +181,11 @@ int HookFlags(const void* vk_device) {
   return it != g_flags.end() ? it->second : 0;
 }
 
+void ForgetDevice(const void* vk_device) {
+  std::lock_guard<std::mutex> lock(g_lock);
+  g_flags.erase(vk_device);
+}
+
 const char* HookReport() {
   std::lock_guard<std::mutex> lock(g_lock);
   static std::string copy;

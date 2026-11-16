@@ -16,6 +16,8 @@ const char* HookCreateDevice();
 void UnhookCreateDevice();
 // What the hook turned on for a device (a VkDevice): bit 1 shared semaphores with timeline, bit 2 shared memory; 0 if the hook did not see it.
 int HookFlags(const void* vk_device);
+// A device goes away (ReShade's destroy_device): its flags go too, so a new device that gets the same handle value does not read them.
+void ForgetDevice(const void* vk_device);
 // The hook's line about the newest device it saw, or "" if none.
 const char* HookReport();
 

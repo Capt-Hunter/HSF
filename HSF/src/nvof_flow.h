@@ -60,6 +60,8 @@ class Flow {
   bool MakeResources(const Frame& frame);
   bool Register(ID3D12Resource* resource, void** handle);
   void Fail(const char* format, ...);
+  // After Fail: frees the session and textures but stays failed for the same device and size.
+  void LetGoAfterFail();
   void Say(const char* format, ...);
 
   struct Slot {

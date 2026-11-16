@@ -4343,6 +4343,13 @@ bool OnCreateSwapchain65(device_api api, swapchain_desc& desc, void* hwnd) {
 // too. (AC Revelations did this 22 s in with a 2x16 DXT5 texture; OnCreateResource9 now makes such textures as whole blocks.) The menu shows the state and can switch either way.
 bool g_dx9_run_marked = false;  // this process wrote Dx9ExRun (a second device in the same launch is not a crash)
 bool g_dx9_ex_crash = false;     // Dx9ExCrash as read at device creation
+// Dx9ExCrash as HSF.ini holds it now, for the menu's DX9 GPU ROUTE row without a file read each frame. Every write below sets it too; the fault handler writes from
+// another thread, hence atomic.
+std::atomic<bool> g_dx9_ex_crash_saved{false};
+void SaveDx9ExCrash(bool on) {
+  WritePrivateProfileStringW(L"HSF", L"Dx9ExCrash", on ? L"1" : L"0", g_ini_path);
+  g_dx9_ex_crash_saved.store(on);
+}
 bool g_dx9_ex_asked = false;     // this launch's device is 9Ex because HSF asked ReShade for it (not the game's own choice)
 bool g_dx9_ex_at_launch = true;  // HSF.ini Dx9Ex as it was at device creation (g_dx9_ex follows the file while the game runs)
 
@@ -4360,17 +4367,18 @@ bool OnCreateDevice65(device_api api, uint32_t& api_version) {
   if (api != device_api::d3d9) return false;
   PollIni();
   g_dx9_ex_crash = GetPrivateProfileIntW(L"HSF", L"Dx9ExCrash", 0, g_ini_path) != 0;
+  g_dx9_ex_crash_saved.store(g_dx9_ex_crash);
   g_dx9_ex_at_launch = g_dx9_ex;
   if (g_dx9_ex && api_version < 0x9100) {
     wchar_t run[16] = L"";
     if (!g_dx9_run_marked) ReadDx9Run(run, 16);
     if (std::wcscmp(run, L"ex") == 0 && !g_dx9_ex_crash) {
       g_dx9_ex_crash = true;
-      WritePrivateProfileStringW(L"HSF", L"Dx9ExCrash", L"1", g_ini_path);
+      SaveDx9ExCrash(true);
       Log("9Ex crash rule: the last launch ended before its first frame on Direct3D 9Ex: this launch uses plain D3D9 (slower copies). The menu (ADVANCED, DX9 GPU ROUTE) can try 9Ex again.");
     } else if (std::wcscmp(run, L"plain") == 0 && g_dx9_ex_crash) {
       g_dx9_ex_crash = false;
-      WritePrivateProfileStringW(L"HSF", L"Dx9ExCrash", L"0", g_ini_path);
+      SaveDx9ExCrash(false);
       Log("9Ex crash rule: the last launch ended before its first frame on plain D3D9 too, so 9Ex was not the cause: back on 9Ex");
     }
     if (!g_dx9_run_marked) {
@@ -4518,7 +4526,7 @@ LONG CALLBACK OnFault9(EXCEPTION_POINTERS* info) {
   // The 9Ex crash rule, after the first frame: HSF asked for 9Ex, and the game faulted where something it asked the device for was not made.
   static std::atomic<bool> marked{false};
   if (g_dx9_ex_asked && t_create9_pending && !marked.exchange(true)) {
-    WritePrivateProfileStringW(L"HSF", L"Dx9ExCrash", L"1", g_ini_path);
+    SaveDx9ExCrash(true);
     Log("9Ex crash rule: the game faulted on Direct3D 9Ex where a texture or buffer it asked for was not made: the next launch uses plain D3D9 (slower copies). The menu (ADVANCED, DX9 GPU ROUTE) can try 9Ex again.");
   }
   return EXCEPTION_CONTINUE_SEARCH;
@@ -4698,6 +4706,7 @@ void ResetRuntimeState(effect_runtime* runtime) {
 void OnDestroyDevice(device* dev) {
   ResetDeviceState(dev);
   if (dev->get_api() == device_api::vulkan) {
+    hsf::vk::ForgetDevice(reinterpret_cast<const void*>(static_cast<uintptr_t>(dev->get_native())));
     if (!hsf::vk::Follows(dev)) return;  // another device (a game that tries a GPU and drops it): the bridge stays
     hsf::dlssg::Stop(2000);
     StopVkDepth();
@@ -5196,15 +5205,23 @@ int WantedLaunchPadQuality(effect_runtime* runtime) {
   return hsf::launchpad::ModeQuality(g_launchpad_mode, width, height);
 }
 
+// HSF.ini [LaunchPadUndo] Saved, read once and then kept by Tune and Undo: the menu asks every frame whether to show UNDO.
+int g_launchpad_undo_saved = -1;  // -1: not read yet
+bool LaunchPadUndoSaved() {
+  if (g_launchpad_undo_saved < 0) g_launchpad_undo_saved = GetPrivateProfileIntW(L"LaunchPadUndo", L"Saved", 0, g_ini_path) != 0 ? 1 : 0;
+  return g_launchpad_undo_saved != 0;
+}
+
 void TuneLaunchPad(effect_runtime* runtime, const LaunchPadState& state, int wanted) {
   // What was there, for Undo. Only the first tune's, so tuning twice still undoes to the user's own settings.
-  if (GetPrivateProfileIntW(L"LaunchPadUndo", L"Saved", 0, g_ini_path) == 0) {
+  if (!LaunchPadUndoSaved()) {
     wchar_t value[16];
     swprintf(value, std::size(value), L"%d", state.quality);
     WritePrivateProfileStringW(L"LaunchPadUndo", L"Quality", value, g_ini_path);
     WritePrivateProfileStringW(L"LaunchPadUndo", L"Reversed", LaunchPadDefinition(runtime, DEPTH_REVERSED, hsf::launchpad::DEFAULT_REVERSED) ? L"1" : L"0", g_ini_path);
     WritePrivateProfileStringW(L"LaunchPadUndo", L"UpsideDown", LaunchPadDefinition(runtime, DEPTH_UPSIDE_DOWN, hsf::launchpad::DEFAULT_UPSIDE_DOWN) ? L"1" : L"0", g_ini_path);
     WritePrivateProfileStringW(L"LaunchPadUndo", L"Saved", L"1", g_ini_path);
+    g_launchpad_undo_saved = 1;
   }
   const effect_uniform_variable quality = runtime->find_uniform_variable(LAUNCHPAD_FILE, "OPTICAL_FLOW_Q");
   if (quality.handle != 0) runtime->set_uniform_value_int(quality, wanted);
@@ -5231,7 +5248,7 @@ void TuneLaunchPad(effect_runtime* runtime, const LaunchPadState& state, int wan
 }
 
 void UndoLaunchPad(effect_runtime* runtime) {
-  if (GetPrivateProfileIntW(L"LaunchPadUndo", L"Saved", 0, g_ini_path) == 0) return;
+  if (!LaunchPadUndoSaved()) return;
   const int old_quality = static_cast<int>(GetPrivateProfileIntW(L"LaunchPadUndo", L"Quality", 0, g_ini_path));
   const effect_uniform_variable quality = runtime->find_uniform_variable(LAUNCHPAD_FILE, "OPTICAL_FLOW_Q");
   if (quality.handle != 0 && old_quality >= 0) runtime->set_uniform_value_int(quality, old_quality);
@@ -5243,6 +5260,7 @@ void UndoLaunchPad(effect_runtime* runtime) {
     runtime->set_preprocessor_definition_for_effect(LAUNCHPAD_FILE, DEPTH_UPSIDE_DOWN, upside_down ? "1" : "0");
   runtime->save_current_preset();
   WritePrivateProfileStringW(L"LaunchPadUndo", nullptr, nullptr, g_ini_path);
+  g_launchpad_undo_saved = 0;
   g_launchpad_mode = hsf::launchpad::MODE_NONE;
   WritePrivateProfileStringW(L"HSF", L"LaunchPadQuality", LaunchPadModeName(g_launchpad_mode), g_ini_path);
   char text[160];
@@ -5264,7 +5282,7 @@ void DrawLaunchPadTune(effect_runtime* runtime) {
               !state.depth_known ? "not checked yet (HSF has not measured depth)" : state.depth_matches ? "match HSF's" : "do NOT match HSF's");
   static const char* const MODE[] = {"Low", "Medium", "High", "AUTO"};
   ImGui::Text("HSF's pick: %s", g_launchpad_mode >= 0 && g_launchpad_mode <= 3 ? MODE[g_launchpad_mode] : "none (the player's own)");
-  if (GetPrivateProfileIntW(L"LaunchPadUndo", L"Saved", 0, g_ini_path) != 0 && ImGui::Button("Undo the LaunchPad tune")) UndoLaunchPad(runtime);
+  if (LaunchPadUndoSaved() && ImGui::Button("Undo the LaunchPad tune")) UndoLaunchPad(runtime);
   ImGui::TextDisabled("Pick the quality in the LAUNCHPAD row of HSF's menu. It sets LaunchPad's own settings and saves them to the ReShade preset.");
 }
 
@@ -5609,6 +5627,13 @@ struct MenuView {
 
 const char* FinderReason();
 
+// PROTECT GAME HUD is a different setting on each route: the game's own Streamline hands DLSS-G the picture from before the HUD (DlssgHud), HSF's own
+// Streamline masks the HUD (FrameChecks), D3D11 keeps the HUD's draws out (GameHud). DX9, Vulkan and the D3D12 helper route have none: setting is nullptr.
+struct HudSetting {
+  bool* setting = nullptr;
+  const char* note = "";  // what it does on this route, for the menu
+};
+
 MenuView ReadMenuView() {
   MenuView v;
   v.base_fps = g_menu_fps;
@@ -5697,6 +5722,15 @@ struct Finder {
 ULONGLONG g_rescan_at = 0;      // the last rescan, manual or automatic
 uint32_t g_auto_rescans = 0;    // automatic ones this run; they stop after a few, the button stays
 ULONGLONG g_stuck_since = 0;    // frame generation on and not generating since then, 0 when generating or off
+
+HudSetting HudSettingNow(const MenuView& v) {
+#ifdef HSF_SL_GAME
+  if (v.drive) return {&g_sl_hud, "PICTURE FROM BEFORE THE HUD"};
+  if (v.bring) return {&g_checks_enabled, "HUD MASK"};
+#endif
+  if (!v.d3d12 && g_seen.api == device_api::d3d11) return {&g_hud_enabled, "HUD DRAWS KEPT OUT"};
+  return {};
+}
 
 void DlssgStatusWords(int status, char* out, size_t size) {
   out[0] = '\0';
@@ -5896,7 +5930,7 @@ void ReadFinderD3d12(Finder& f) {
 }
 #endif
 
-Finder ReadFinder() {
+Finder BuildFinder() {
   Finder f;
 #ifdef HSF_SL_GAME
   if (D3d12Run()) {
@@ -5906,6 +5940,20 @@ Finder ReadFinder() {
 #endif
   if (g_seen.api == device_api::vulkan) ReadFinderVk(f);
   return f;
+}
+
+// The finder is read by the tick, the menu, the WAITING line and the overlay, several times a frame: it is built once per present (OnMenuFrame
+// moves g_finder_frame on) and again after a rescan. All of them run on ReShade's present thread.
+uint64_t g_finder_frame = 1;
+uint64_t g_finder_built = 0;
+Finder g_finder;
+
+const Finder& ReadFinder() {
+  if (g_finder_built != g_finder_frame) {
+    g_finder = BuildFinder();
+    g_finder_built = g_finder_frame;
+  }
+  return g_finder;
 }
 
 void LogFinder(const Finder& f, const char* why) {
@@ -5947,7 +5995,8 @@ void Rescan(bool manual) {
     hsf::ngx::RescanVk();         // and NGX's Vulkan calls are hooked again if some did not go in
 #endif
   }
-  const Finder f = ReadFinder();
+  g_finder_built = 0;  // the rescan changed what the steps read
+  const Finder& f = ReadFinder();
   if (f.count != 0) LogFinder(f, manual ? "RESCAN pressed" : "rescan, frame generation stuck");
 }
 
@@ -5957,7 +6006,7 @@ void FinderTick() {
   const ULONGLONG now = GetTickCount64();
   if (now < s_next) return;
   s_next = now + 1000;
-  const Finder f = ReadFinder();
+  const Finder& f = ReadFinder();
   if (f.count == 0) return;
   static int s_logged_open = -2;
   static const char* s_logged_name = nullptr;
@@ -5981,7 +6030,7 @@ void FinderTick() {
 void DrawFinder() {
   namespace ui = hsf::ui;
   namespace c = hsf::ui::colour;
-  const Finder f = ReadFinder();
+  const Finder f = ReadFinder();  // a copy: RESCAN below builds the finder again
   if (f.count == 0 || f.first_open < 0 || !g_extra_enabled) return;
   ui::RowLabel("DLSS FINDER", c::AMBER);
   for (int i = 0; i < f.count; ++i) {
@@ -6027,7 +6076,7 @@ void DrawFinder() {
 // The first step that stops frame generation, as the WAITING line: never WAITING with no reason.
 const char* FinderReason() {
   static char text[260];
-  const Finder f = ReadFinder();
+  const Finder& f = ReadFinder();
   if (f.first_open < 0) return nullptr;
   const FinderStep& step = f.steps[f.first_open];
   std::snprintf(text, sizeof(text), "%s: %s.", step.name, step.detail);
@@ -6035,6 +6084,7 @@ const char* FinderReason() {
 }
 
 void OnMenuFrame(effect_runtime*) {
+  ++g_finder_frame;
   FinderTick();
   static LONGLONG last = 0, window_start = 0;
   static uint32_t window_frames = 0;
@@ -6249,13 +6299,30 @@ void CopyLog(const MenuView& view) {
 }
 
 // A setting read only when the game starts, as a toggle that writes HSF.ini straight away.
+// Each key is read from the file once and kept here after that, so a menu frame reads no file.
 void StartupToggle(const char* label, const wchar_t* key, int fallback) {
   namespace ui = hsf::ui;
-  bool on = GetPrivateProfileIntW(L"HSF", key, fallback, g_ini_path) != 0;
+  struct Kept {
+    const wchar_t* key;
+    bool on;
+  };
+  static Kept s_kept[8];
+  static int s_count = 0;
+  Kept* kept = nullptr;
+  for (int i = 0; i < s_count && kept == nullptr; ++i)
+    if (std::wcscmp(s_kept[i].key, key) == 0) kept = &s_kept[i];
+  bool read = false;
+  if (kept == nullptr && s_count < static_cast<int>(std::size(s_kept))) {
+    kept = &s_kept[s_count++];
+    kept->key = key;
+    read = true;
+  }
+  bool on = kept != nullptr && !read ? kept->on : GetPrivateProfileIntW(L"HSF", key, fallback, g_ini_path) != 0;
   ui::SettingLabel(label);
   ImGui::PushID(label);
   if (ui::Toggle("##t", &on)) WritePrivateProfileStringW(L"HSF", key, on ? L"1" : L"0", g_ini_path);
   ImGui::PopID();
+  if (kept != nullptr) kept->on = on;
 }
 
 bool DrawOverlaySettings();
@@ -6512,7 +6579,7 @@ void DrawPanel(effect_runtime* runtime) {
         WritePrivateProfileStringW(L"HSF", L"LaunchPadQuality", LaunchPadModeName(g_launchpad_mode), g_ini_path);
         TuneLaunchPad(runtime, launchpad, WantedLaunchPadQuality(runtime));
       }
-      if (GetPrivateProfileIntW(L"LaunchPadUndo", L"Saved", 0, g_ini_path) != 0) {
+      if (LaunchPadUndoSaved()) {
         ImGui::SameLine(0.f, ImGui::GetFontSize() * 0.3f);
         if (ui::Button("##lpundo", "UNDO", c::DIM)) UndoLaunchPad(runtime);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Puts back LaunchPad's quality and depth settings from before HSF's first tune.");
@@ -6707,13 +6774,11 @@ void DrawPanel(effect_runtime* runtime) {
   // ---- Advanced.
   static bool advanced = false, debug = false, details = false, overlay = false;
   if (ui::Section("##advanced", "ADVANCED", "", &advanced)) {
-    ui::SettingLabel("PROTECT GAME HUD");
-    bool* hud = &g_hud_enabled;
-#ifdef HSF_SL_GAME
-    if (now.drive) hud = &g_sl_hud;
-    else if (now.bring) hud = &g_checks_enabled;
-#endif
-    if (ui::Toggle("##hud", hud)) changed = true;
+    if (const HudSetting hud = HudSettingNow(now); hud.setting != nullptr) {
+      ui::SettingLabel("PROTECT GAME HUD");
+      if (ui::Toggle("##hud", hud.setting)) changed = true;
+      ui::RightNote(hud.note, c::FAINT);
+    }
     if (!now.d3d12) {
       ui::SettingLabel("KEEP OVERLAYS OUT");
       if (ui::Toggle("##overlays", &g_keep_overlays_out)) changed = true;
@@ -6748,7 +6813,7 @@ void DrawPanel(effect_runtime* runtime) {
     if (g_native9 != nullptr) {
       // DX9 games: whether frames reach DLSS-G on the GPU (9Ex) or through CPU copies, and why; the 9Ex crash rule can be undone here.
       ui::SettingLabel("DX9 GPU ROUTE");
-      const bool crash_now = GetPrivateProfileIntW(L"HSF", L"Dx9ExCrash", 0, g_ini_path) != 0;
+      const bool crash_now = g_dx9_ex_crash_saved.load();
       const float y = ImGui::GetCursorScreenPos().y;
       // Either way takes effect at the next launch (the device is made once), and is saved per game in HSF.ini.
       const auto set_ex = [](bool on) {
@@ -6761,7 +6826,7 @@ void DrawPanel(effect_runtime* runtime) {
         ui::Caps("ON (THE GAME'S OWN D3D9EX)", c::GREEN, 0.8f);
       } else if (g_dx9_device_ex && crash_now) {
         if (ui::Button("##dx9ex", "ON // GAME FAULTED WITH IT: OFF AT NEXT LAUNCH // KEEP ON", c::AMBER)) {
-          WritePrivateProfileStringW(L"HSF", L"Dx9ExCrash", L"0", g_ini_path);
+          SaveDx9ExCrash(false);
           Log("9Ex crash rule: cleared from the menu, the next launch stays on 9Ex");
         }
       } else if (g_dx9_device_ex && g_dx9_ex) {
@@ -6770,7 +6835,7 @@ void DrawPanel(effect_runtime* runtime) {
         if (ui::Button("##dx9ex", "ON // OFF AT NEXT LAUNCH // KEEP ON", c::AMBER)) set_ex(true);
       } else if (g_dx9_ex_crash && crash_now) {
         if (ui::Button("##dx9ex", "OFF: GAME CRASHED WITH IT // TRY AGAIN", c::AMBER)) {
-          WritePrivateProfileStringW(L"HSF", L"Dx9ExCrash", L"0", g_ini_path);
+          SaveDx9ExCrash(false);
           Log("9Ex crash rule: cleared from the menu, the next launch tries 9Ex again");
         }
       } else if (g_dx9_ex_crash) {
@@ -7329,12 +7394,8 @@ void DrawOverlay(bool advanced) {
 #endif
     line(x, w, y1, "MOTION", c::DIM, motion_source, c::TEXT);
     if (!v.d3d12) line(x, w, y1, "DEPTH", c::DIM, DepthSent() ? "FOUND" : "NONE (FLAT)", DepthSent() ? c::TEXT : c::AMBER);
-    bool hud = g_hud_enabled;
-#ifdef HSF_SL_GAME
-    if (v.drive) hud = g_sl_hud;
-    else if (v.bring) hud = g_checks_enabled;
-#endif
-    line(x, w, y1, "HUD", c::DIM, hud ? "PROTECTED" : "NOT PROTECTED", hud ? c::TEXT : c::DIM);
+    if (const HudSetting hud = HudSettingNow(v); hud.setting != nullptr)
+      line(x, w, y1, "HUD", c::DIM, *hud.setting ? "PROTECTED" : "NOT PROTECTED", *hud.setting ? c::TEXT : c::DIM);
     const OlderCardMod& older = OlderCardModNow();
     if (older.live && older.family != 5) {
       if (older.safe_max != 0) std::snprintf(value, sizeof(value), "UP TO %uX", older.safe_max);

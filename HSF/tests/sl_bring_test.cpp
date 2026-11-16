@@ -4,6 +4,9 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 
+#include <share.h>
+
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -200,14 +203,27 @@ int wmain(int argc, wchar_t** argv) {
   Check((*reinterpret_cast<void***>(first_factory))[15] == slot_before, "the factory is as it was after Stop");
   // The log, closed by Stop: the colour space line says what the swap chain under Streamline has.
   std::string space_line;
+  // Opened sharing everything, with a few tries: _wfopen_s shares only reading and failed with EACCES (13) now and then right after Stop closed
+  // the log, while something else had it open (seen more often the longer the log). Nothing in the test writes to it any more.
   FILE* log = nullptr;
-  if (_wfopen_s(&log, argv[2], L"r") == 0 && log != nullptr) {
+  errno_t opened = 0;
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    log = _wfsopen(argv[2], L"r", _SH_DENYNO);
+    opened = log != nullptr ? 0 : errno;
+    if (log != nullptr) break;
+    Sleep(50);
+  }
+  int lines = 0;
+  if (opened == 0 && log != nullptr) {
     char line[512];
-    while (fgets(line, sizeof(line), log) != nullptr)
+    while (fgets(line, sizeof(line), log) != nullptr) {
+      ++lines;
       if (strstr(line, "colour space:") != nullptr) space_line = line;
+    }
     fclose(log);
   }
-  printf("     %s", space_line.empty() ? "no colour space line\n" : space_line.c_str());
+  if (space_line.empty()) printf("     no colour space line (open %d, %d lines read)\n", static_cast<int>(opened), lines);
+  else printf("     %s", space_line.c_str());
   Check(space_line.find("the game's is 12;") != std::string::npos && space_line.find("they differ") == std::string::npos,
         "the colour space line names the game's HDR10, and the swap chain DLSS-G presents on does not disagree");
   printf(g_failures == 0 ? "all ok\n" : "%d failed\n", g_failures);

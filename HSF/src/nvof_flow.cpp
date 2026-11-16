@@ -417,8 +417,9 @@ bool Flow::Start(ID3D12Device* device, ID3D12CommandQueue* queue, const Frame& f
     Fail("the motion format %u cannot be written by a compute shader", static_cast<unsigned>(out_format_));
     return false;
   }
-  // The driver's own library, never HSF's. It stays loaded for the life of the process.
-  static const HMODULE module = LoadLibraryW(L"nvofapi64.dll");
+  // The driver's own library from System32, never one found on the search path (a game folder or a packaged game's own folder could hold another,
+  // as with dxgi.dll in the helper). It stays loaded for the life of the process.
+  static const HMODULE module = LoadLibraryExW(L"nvofapi64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
   if (module == nullptr) {
     Fail("nvofapi64.dll is not there (an NVIDIA RTX card and its driver are needed)");
     return false;
@@ -540,6 +541,17 @@ void Flow::Shutdown() {
   state_ = State::off;
 }
 
+void Flow::LetGoAfterFail() {
+  // What the session was made for stays, so the next frame does not try again: only a new device, picture or size does.
+  ID3D12Device* const device = device_;
+  ID3D12CommandQueue* const queue = queue_;
+  Shutdown();
+  device_ = device;
+  queue_ = queue;
+  tried_ = true;
+  state_ = State::failed;
+}
+
 ID3D12Resource* Flow::Run(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, const Frame& frame, LogFn log) {
   log_ = log;
   if (device == nullptr || queue == nullptr || list == nullptr || frame.colour == nullptr || frame.width == 0 || frame.height == 0 || frame.format == DXGI_FORMAT_UNKNOWN) return nullptr;
@@ -552,7 +564,12 @@ ID3D12Resource* Flow::Run(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D1
     tried_ = true;
     if (!Start(device, queue, frame)) return nullptr;
   }
-  if (state_ == State::failed || session_ == nullptr) return nullptr;
+  if (state_ == State::failed) {
+    // A dead engine holds no memory: its session and textures go at the next frame, once the frame that failed has gone to the GPU (Shutdown waits for it).
+    if (api_ != nullptr || event_ != nullptr) LetGoAfterFail();
+    return nullptr;
+  }
+  if (session_ == nullptr) return nullptr;
 
   // The engine's signal for the last frame: the queue is waiting for it on the GPU. One that never comes would stop the queue for good, so it is let go from the CPU.
   if (flow_fence_->GetCompletedValue() < flow_value_ && GetTickCount64() - flow_sent_ms_ > STALL_MS) {

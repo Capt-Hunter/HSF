@@ -21,8 +21,6 @@ function Report($name, $ok, $detail) {
 
 # Runs one test exe with its output in $log. Returns its exit code ($null when it did not start or end) and a line for the report.
 function RunTest($exe, $testArgs, $log) {
-  # A Streamline test's own log starts empty: sl_bring_test reads its log back and does not find its line in one that holds an earlier run.
-  if ($testArgs -match '"([^"]+\.log)"$') { Remove-Item $Matches[1] -ErrorAction SilentlyContinue }
   $sw = [Diagnostics.Stopwatch]::StartNew()
   $start = @{ FilePath = $exe.FullName; WorkingDirectory = $exe.DirectoryName; NoNewWindow = $true; PassThru = $true
     RedirectStandardOutput = $log; RedirectStandardError = "$log.err" }

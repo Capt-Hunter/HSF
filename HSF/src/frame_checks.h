@@ -76,6 +76,10 @@ class Classifier {
 // frame goes in, so an answer that comes a frame later is no use.
 class Grid {
  public:
+  Grid() = default;
+  Grid(const Grid&) = delete;
+  Grid& operator=(const Grid&) = delete;
+  ~Grid() { if (event_ != nullptr) CloseHandle(event_); }  // the event is the only thing ComPtr does not free
   // `colour_format` must be readable from the frame's texture as a shader resource.
   bool Init(ID3D12Device* device, DXGI_FORMAT colour_format, const char*& what, HRESULT& hr);
   // Measures `colour` (in COMMON). False if the GPU did not answer in time: no verdict for this frame.
@@ -108,6 +112,10 @@ class Grid {
 // for this frame. Each point: motion x, motion y, depth, unused.
 class Samples {
  public:
+  Samples() = default;
+  Samples(const Samples&) = delete;
+  Samples& operator=(const Samples&) = delete;
+  ~Samples() { if (event_ != nullptr) CloseHandle(event_); }  // the event is the only thing ComPtr does not free
   bool Init(ID3D12Device* device, DXGI_FORMAT motion_format, const char*& what, HRESULT& hr);
   // `motion` and `depth` (R32_FLOAT) in COMMON, the same size. False if the GPU did not answer in time. `grid` stays valid until the next Run.
   bool Run(ID3D12Resource* motion, ID3D12Resource* depth, UINT width, UINT height, const float*& grid);
