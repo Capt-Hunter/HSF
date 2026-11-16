@@ -18,6 +18,8 @@ void StartVk(LogFunction log);
 void PollVk(reshade::api::device* device);
 // release: destroy HSF's images. False at ReShade's destroy_device, where the device is already out of ReShade's table (the images go with the device).
 void StopVk(bool release);
+// Removes the Vulkan NGX hooks (only those): before HSF unloads in a running game.
+void UnhookVk();
 
 // What the last DLSS call gave, as HSF's copies on the game's device: in shader_resource state between calls, the size of the part in use.
 struct FrameVk {

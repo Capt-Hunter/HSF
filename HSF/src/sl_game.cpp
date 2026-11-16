@@ -1478,33 +1478,12 @@ void ForEachHook(F&& f) {
 }  // namespace
 
 namespace {
-Hook g_other_hooks[8];
+hookpatch::HookSet g_other_hooks;  // HookFunction's callers: the tests
 }  // namespace
 
-bool HookFunction(const char* name, void* target, void* hook_function, void** real, void (*log)(const char* text)) {
-  Lock lock;
-  // Already hooked (a rescan asks again): nothing to do.
-  for (const Hook& hook : g_other_hooks)
-    if (hook.name != nullptr && hook.installed && hook.target == target && std::strcmp(hook.name, name) == 0) return true;
-  for (Hook& hook : g_other_hooks) {
-    if (hook.name != nullptr) continue;
-    hook.name = name;
-    hook.hook = hook_function;
-    hook.real = real;
-    const bool installed = hookpatch::Install(hook, static_cast<uint8_t*>(target), log != nullptr ? log : [](const char*) {});
-    if (!installed) hook = Hook{};
-    return installed;
-  }
-  return false;
-}
+bool HookFunction(const char* name, void* target, void* hook_function, void** real, void (*log)(const char* text)) { return g_other_hooks.Add(name, target, hook_function, real, log); }
 
-void UnhookFunctions() {
-  Lock lock;
-  for (Hook& hook : g_other_hooks) {
-    hookpatch::Remove(hook, [](const char*) {});
-    hook = Hook{};
-  }
-}
+void UnhookFunctions() { g_other_hooks.RemoveAll(nullptr); }
 
 int HooksInstalled() {
   Lock lock;

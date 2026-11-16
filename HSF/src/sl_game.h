@@ -10,7 +10,8 @@
 
 namespace hsf::slgame {
 
-// HSF's hook code for a call in another module (ngx_input.cpp), which works with or without the rest of this file running. real gets what calls the original. The hook's messages go to log.
+// One hook set for a call in another module, kept for the tests (the NGX readers have their own hookpatch::HookSet). Works with or without the rest of this file running.
+// real gets what calls the original. The hook's messages go to log, with no lock held. UnhookFunctions removes only this set's hooks.
 bool HookFunction(const char* name, void* target, void* hook, void** real, void (*log)(const char* text));
 void UnhookFunctions();
 
