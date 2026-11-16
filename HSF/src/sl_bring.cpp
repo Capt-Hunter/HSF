@@ -1397,7 +1397,17 @@ bool FeedFrame(const FrameFeed& in) {
   }
   // DLSS-G takes one size for depth and motion. A smaller flow (LumeniteFX Kernel's is 1/8 size, as in FF7R) is brought up to the depth's size by the
   // compose pass, which reads it at its own size; HSF's motion texture and everything sized to the input then follow the depth. LaunchPad's flow already matches.
-  const bool resize = depth_desc.Width != motion_desc.Width || depth_desc.Height != motion_desc.Height;
+  // The game's own DLSS data can come in textures of slightly different sizes, padded past the part in use (Gothic 1 Remake: vectors 2295x961, depth 2296x964,
+  // 2295x961 in use). Streamline takes them as they are when the extent fits inside both, which is how such a game tags them for its own frame generation. With
+  // nothing of HSF's reading the depth at the motion's size (no compose pass, no NVIDIA Optical Flow), both go to DLSS-G with that extent and no resize.
+  const bool extent_fits = in.width != 0 && in.height != 0 && !in.compose && !in.nvof && !fit_depth && in.motion != nullptr && in.x + in.width <= motion_desc.Width &&
+                           in.y + in.height <= motion_desc.Height && in.x + in.width <= depth_desc.Width && in.y + in.height <= depth_desc.Height;
+  const bool resize = !extent_fits && (depth_desc.Width != motion_desc.Width || depth_desc.Height != motion_desc.Height);
+  if (extent_fits && (depth_desc.Width != motion_desc.Width || depth_desc.Height != motion_desc.Height)) {
+    static bool logged = false;
+    if (!logged) Line("depth is %llux%u and the game's vectors %llux%u, with %ux%u in use, which fits both: both go as they are", depth_desc.Width, depth_desc.Height, motion_desc.Width, motion_desc.Height, in.width, in.height);
+    logged = true;
+  }
   // Only a flow smaller than the depth is brought up. A depth smaller than the flow is a game's dynamic resolution (AC Shadows changes it about three
   // times a second under load): following it rebuilt everything sized to the input, compose pass included, at each change, which shook the picture and
   // crashed the game. Those frames go without HSF's flow instead, and on the in-game route DLSS-G falls back to the game's vectors until the sizes match.

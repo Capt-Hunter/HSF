@@ -22,7 +22,7 @@ add_library(hsf_minhook STATIC "${HSF_MINHOOK}/src/buffer.c" "${HSF_MINHOOK}/src
 target_include_directories(hsf_minhook SYSTEM PUBLIC "${HSF_MINHOOK}/include")
 target_compile_options(hsf_minhook PRIVATE /W0)
 
-add_library(hsf_addon SHARED src/hsf_addon.cpp src/ui.cpp src/dlssg_remote.cpp src/dx9_bridge.cpp src/gpu_fence9.cpp src/vk_bridge.cpp src/vk_hook.cpp src/score.cpp src/depth.cpp src/hud.cpp src/dxgi_guard.cpp)
+add_library(hsf_addon SHARED src/hsf_addon.cpp src/ui.cpp src/dlssg_remote.cpp src/dx9_bridge.cpp src/gpu_fence9.cpp src/vk_bridge.cpp src/vk_hook.cpp src/score.cpp src/depth.cpp src/hud.cpp src/dxgi_guard.cpp src/safe_try.cpp)
 target_include_directories(hsf_addon SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/third_party/vulkan-headers/include")
 target_link_libraries(hsf_addon PRIVATE hsf_minhook)
 # DLSS-G for D3D11 and DX9 games runs in hsf-dlssg-helper64.exe; the add-on hands it frames on the game's (or the DX9 bridge's) Direct3D 11 device.
@@ -55,9 +55,9 @@ else()
   target_link_libraries(compose_test PRIVATE d3d12 dxgi d3dcompiler)
   target_link_options(compose_test PRIVATE "/ENTRY:wmainCRTStartup")
   # Offline test of the hooks on a game's Streamline: needs only a copy of sl.interposer.dll, which it hooks and calls.
-  add_executable(sl_game_test tests/sl_game_test.cpp src/sl_game.cpp)
+  add_executable(sl_game_test tests/sl_game_test.cpp src/sl_game.cpp src/safe_try.cpp)
   target_include_directories(sl_game_test SYSTEM PRIVATE "${HSF_STREAMLINE}/include")
-  target_link_libraries(sl_game_test PRIVATE d3d12 dxgi)
+  target_link_libraries(sl_game_test PRIVATE d3d12 dxgi hsf_minhook)
   target_link_options(sl_game_test PRIVATE "/ENTRY:wmainCRTStartup")
   # Offline test of the frame checks, no game needed.
   # A small program with no Streamline of its own: HSF must bring Streamline to it. Needs a folder with Streamline's DLLs and a GPU.
@@ -67,9 +67,14 @@ else()
   target_link_options(sl_bring_test PRIVATE "/ENTRY:wmainCRTStartup")
 
   # The hook on this machine's real _nvngx.dll, and a stand-in DLSS call on a real device.
-  add_executable(ngx_input_test tests/ngx_input_test.cpp src/ngx_input.cpp src/sl_game.cpp)
+  add_executable(ngx_input_test tests/ngx_input_test.cpp src/ngx_input.cpp src/sl_game.cpp src/safe_try.cpp)
   target_include_directories(ngx_input_test SYSTEM PRIVATE "${HSF_STREAMLINE}/include")
-  target_link_libraries(ngx_input_test PRIVATE d3d12 dxgi)
+  target_link_libraries(ngx_input_test PRIVATE d3d12 dxgi hsf_minhook)
+
+  # Offline test of HSF's patcher on made-up functions: the full length decoder (H3), unaligned functions, and the safe-try switch for it.
+  add_executable(hook_test tests/hook_test.cpp src/sl_game.cpp src/safe_try.cpp)
+  target_include_directories(hook_test SYSTEM PRIVATE "${HSF_STREAMLINE}/include")
+  target_link_libraries(hook_test PRIVATE d3d12 dxgi hsf_minhook)
 
   # Offline test of the depth and motion view, no game needed.
   add_executable(debug_view_test tests/debug_view_test.cpp src/debug_view.cpp)
@@ -125,6 +130,8 @@ target_link_libraries(hud_test PRIVATE d3d11 d3dcompiler)
 add_executable(gpu_reserve_test tests/gpu_reserve_test.cpp)
 # Offline test of the LaunchPad tune button's choices (build\<arch>\launchpad_tune_test.exe).
 add_executable(launchpad_tune_test tests/launchpad_tune_test.cpp)
+# Offline test of the safe-try marks (build\<arch>\safe_try_test.exe).
+add_executable(safe_try_test tests/safe_try_test.cpp src/safe_try.cpp)
 # The same for real depth (build\<arch>\depth_test.exe).
 add_executable(depth_test tests/depth_test.cpp src/depth.cpp)
 target_link_libraries(depth_test PRIVATE d3d11 d3dcompiler)

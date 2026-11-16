@@ -50,9 +50,14 @@ void SetScoreGuard(bool on);
 // Optical motion: DLSS-G gets HSF's flow and depth, tagged with TagOptical at present, instead of the game's vectors and depth. The game's own tags are
 // left out, and the constants it sends get the flow's scale, no jitter and HSF's dilation. Only while TagOptical keeps coming: a few frames without it and the game's vectors are back.
 void SetOptical(bool on);
+// On: a gap in the game's vectors does not turn generation off, as HSF's flow stands in (SetOptical). Off after FLOW_FILL_MS with neither.
+void SetFlowFill(bool on);
 // Tags HSF's depth and motion for the latest frame, on `command_list` (open, on the game's queue, Streamline copies them there). Same shape as slbring::FrameFeed's tag.
 // When the game sends no constants of its own (its DLSS off), HSF sends them for the same frame, with depth_inverted.
 bool TagOptical(void* command_list, void* depth, uint32_t depth_state, void* motion, uint32_t motion_state, const uint32_t extent[4], const float scale[2], bool dilated, bool depth_inverted);
+// What goes with the next TagOptical's vectors: the game's DLSS data read through NGX has the game's jitter (pixels of the render size) and its reset; flow has neither.
+// reset is sent once, with the next constants HSF sends or changes. Call before the frame's TagOptical.
+void SetOpticalJitter(const float jitter[2], bool jittered, bool reset);
 // HSF's FPS cap (on screen, 0 = leave the game's own) and Reflex boost, through the game's own Reflex. The cap becomes the game's frame limit for its real frames.
 void SetReflex(uint32_t fps_cap, bool boost);
 
@@ -114,6 +119,14 @@ bool RebuildClipToPrev(const float clip_to_view_cur[4][4], const CameraPose& cur
 // new displacement when moved; rip_count is how many, at most MAX_RIP_LOADS. Public for the test.
 constexpr size_t MAX_RIP_LOADS = 4;
 size_t PrologueLength(const uint8_t* code, size_t min_bytes, size_t* rip_at = nullptr, size_t* rip_count = nullptr);
+// A moved instruction that needs a new 4-byte displacement: where it starts, where its displacement is and where it ends, and whether it is a jump (rel32).
+struct MovedFix {
+  uint8_t at, disp_at, end;
+  bool is_jump;
+};
+// For a start PrologueLength does not know: a full x64 length decoder (MinHook's HDE64, BSD) measures whole instructions covering at least min_bytes. Loads relative to rip,
+// calls and far jumps (rel32) are listed in fixes (at most MAX_RIP_LOADS); short branches, a return before min_bytes, or a branch back into the moved bytes give 0. Public for the test.
+size_t PrologueLengthDecoded(const uint8_t* code, size_t min_bytes, MovedFix* fixes, size_t* fix_count);
 // How many hooks are in place now. For the test.
 int HooksInstalled();
 // Hooks a function as if the game had just asked Streamline for it by this name. For the test.

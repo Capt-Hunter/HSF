@@ -25,6 +25,7 @@
 #include "motion_convention.h"
 #include "ui.h"
 #include "dxgi_guard.h"
+#include "safe_try.h"
 #include "ngx_vk.h"  // FrameVk only in the 32-bit build, which has no NGX hooks
 #ifdef HSF_SL_GAME
 #include <d3d12.h>
@@ -2152,6 +2153,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list*, resource_view rtv, r
       hsf::ngx::Start11(&Log);
     }
     hsf::ngx::Poll11();
+    hsf::safetry::Tick();
   }
 #endif
   g_hud_at_effects = false;
@@ -2339,6 +2341,29 @@ void UpdateDlssgMotionScale() {
 // scaled up, so the two take turns (the mod pauses its DLSS in cutscenes and menus) in one size: the helper's shared slots keep one size per start, so it
 // restarts once when the size changes (UpdatePresenter). With FlowPause the flow effect is off while the data comes. After Inspect and the score, which
 // keep reading the flow.
+// Whether the game's DLSS data counts as coming, held: a change between it and the flow has to last SOURCE_HOLD_MS. So the data is kept over short gaps (a game that
+// presents more often than it runs DLSS, a hitch), and comes back only once it keeps coming, rather than the source flapping several times a second.
+constexpr ULONGLONG SOURCE_HOLD_MS = 1000;
+struct SourceHold {
+  bool dlss = false;
+  ULONGLONG since = 0;  // when what comes first differed from the source in use
+  bool Pick(bool fresh, const char* where) {
+    const ULONGLONG now = GetTickCount64();
+    if (fresh == dlss) {
+      since = 0;
+      return dlss;
+    }
+    if (since == 0) since = now;
+    if (now - since < SOURCE_HOLD_MS) return dlss;
+    dlss = fresh;
+    since = 0;
+    char text[160];
+    std::snprintf(text, sizeof(text), "%s: the game's DLSS data %s (held for %llu ms; whether HSF uses it is logged apart)", where, dlss ? "is coming" : "stopped coming", SOURCE_HOLD_MS);
+    Log(text);
+    return dlss;
+  }
+};
+
 void PauseFlow(effect_runtime* runtime, bool pause) {
   static bool paused = false;
   static uint32_t reload_seen = 0;
@@ -2387,12 +2412,14 @@ void Dlss11Motion(effect_runtime* runtime, device* dev) {
   static bool used = false, full = false;
   hsf::ngx::Frame11 f;
   bool use = false;
-  if (hsf::ngx::Latest11(&f)) {
+  const bool have = hsf::ngx::Latest11(&f);
+  if (have) {
     quiet = f.serial != last_serial ? 0 : std::min(quiet + 1, 1000);
     last_serial = f.serial;
     if (quiet < 3) g_dlss_seen = true;
-    use = quiet < 3 && MotionFrom() != 1;
   }
+  static SourceHold hold;
+  use = have && hold.Pick(quiet < 3, "D3D11") && MotionFrom() != 1;
   const uint32_t out_width = g_seen.width, out_height = g_seen.height;
   ID3D11Device* const native = reinterpret_cast<ID3D11Device*>(dev->get_native());
   ID3D11Texture2D* fitted = nullptr;
@@ -2657,6 +2684,76 @@ ID3D12Resource* EffectDepthCopy(effect_runtime* runtime, device* dev) {
   return srv.handle != 0 ? reinterpret_cast<ID3D12Resource*>(dev->get_resource_from_view(srv).handle) : nullptr;
 }
 
+// The game's DLSS data, read through NGX, as DLSS-G's inputs. Shared by the bring route and the game-Streamline route. False: its sizes do not fit, and motion stays on flow.
+// Full-resolution vectors with render-size depth (DLSS without MVLowRes; Lies of P: 3440x1440 vectors, 2580x1080 depth). DLSS-G takes one size for both,
+// and FeedFrame drops such frames, so generation stopped for good once the game's DLSS ran. HSF.fx's depth copy is the same depth at the back buffer's
+// size, so it goes with the game's vectors instead. Without it (HSF.fx missing or off), full-resolution vectors keep the game's depth and Streamline's side
+// brings that depth up to the vectors' size (depth_fit.h); only other size mismatches fall back to flow.
+bool NgxFeed(effect_runtime* runtime, device* dev, const hsf::ngx::Frame& ngx_frame, hsf::slbring::FrameFeed& feed, void (*log)(const char*)) {
+  ID3D12Resource* ngx_depth = ngx_frame.depth;
+  bool ngx_depth_from_effect = false;
+  if (ngx_frame.motion != nullptr && ngx_frame.depth != nullptr) {
+    const D3D12_RESOURCE_DESC m = ngx_frame.motion->GetDesc();
+    const D3D12_RESOURCE_DESC d = ngx_frame.depth->GetDesc();
+    // Textures padded past the part in use (Gothic 1 Remake: vectors 2295x961, depth 2296x964, 2295x961 in use) go as they are when that part fits inside both:
+    // Streamline takes them with that extent, as the game tags them for its own frame generation.
+    const bool extent_fits = ngx_frame.width != 0 && ngx_frame.height != 0 && ngx_frame.x + ngx_frame.width <= m.Width && ngx_frame.y + ngx_frame.height <= m.Height &&
+                             ngx_frame.x + ngx_frame.width <= d.Width && ngx_frame.y + ngx_frame.height <= d.Height;
+    if (extent_fits && (m.Width != d.Width || m.Height != d.Height)) {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        char text[260];
+        std::snprintf(text, sizeof(text), "the game's DLSS vectors are %llux%u and its depth %llux%u, with %ux%u in use, which fits both: both go as they are", m.Width, m.Height, d.Width,
+                      d.Height, ngx_frame.width, ngx_frame.height);
+        log(text);
+      }
+    } else if (m.Width != d.Width || m.Height != d.Height) {
+      ID3D12Resource* const copy = EffectDepthCopy(runtime, dev);
+      const bool fits = copy != nullptr && copy->GetDesc().Width == m.Width && copy->GetDesc().Height == m.Height;
+      // The game's depth smaller than its full-resolution vectors: the depth fit pass can bring it up.
+      const bool depth_fit = !fits && ngx_frame.full_res && d.Width <= m.Width && d.Height <= m.Height;
+      const int how = fits ? 1 : depth_fit ? 2 : 0;
+      static int logged = -1;
+      if (logged != how) {
+        logged = how;
+        char text[260];
+        std::snprintf(text, sizeof(text),
+                      how == 1   ? "the game's DLSS vectors are %llux%u and its depth %llux%u: the vectors go with HSF.fx's depth copy, which is the vectors' size"
+                      : how == 2 ? "the game's DLSS vectors are %llux%u and its depth %llux%u, and HSF.fx's depth copy isn't the vectors' size: the game's depth is brought up to the vectors' size"
+                                 : "the game's DLSS vectors are %llux%u and its depth %llux%u, and HSF.fx's depth copy isn't the vectors' size: motion stays on flow",
+                      m.Width, m.Height, d.Width, d.Height);
+        log(text);
+      }
+      if (fits) {
+        ngx_depth = copy;
+        ngx_depth_from_effect = true;
+      } else if (!depth_fit) {
+        return false;
+      }
+    }
+  }
+  feed.motion = ngx_frame.motion;
+  feed.depth = ngx_depth;
+  feed.scale[0] = ngx_frame.scale[0];
+  feed.scale[1] = ngx_frame.scale[1];
+  // The effect's copy follows the flow route's convention (DepthInverted in HSF.ini)
+  feed.depth_inverted = ngx_depth_from_effect ? g_depth_inverted_setting != 0 : ngx_frame.depth_inverted;
+  feed.reset = ngx_frame.reset;
+  // The game's vectors are sharp and exact, so flow's clean-up has nothing to do. The HUD mask works at the picture's size, which these are not.
+  feed.compose = false;
+  feed.mask = false;
+  feed.x = ngx_frame.x;
+  feed.y = ngx_frame.y;
+  feed.width = ngx_frame.width;
+  feed.height = ngx_frame.height;
+  feed.jitter[0] = ngx_frame.jitter[0];
+  feed.jitter[1] = ngx_frame.jitter[1];
+  feed.jittered = ngx_frame.jittered;
+  feed.dilated = ngx_frame.full_res;
+  return true;
+}
+
 void BringFrame(effect_runtime* runtime, device* dev, resource target) {
   if (g_mfg_key != 0 && !g_menu_open && runtime->is_key_pressed(g_mfg_key)) {
     g_dlssg_frames = g_dlssg_frames >= std::max(hsf::slbring::GetStats().max_frames, 1u) ? 1 : g_dlssg_frames + 1;
@@ -2673,47 +2770,18 @@ void BringFrame(effect_runtime* runtime, device* dev, resource target) {
   bool use_ngx = false;
   if (g_ngx_input) {
     hsf::ngx::Poll();
-    if (hsf::ngx::Latest(&ngx_frame)) {
+    hsf::safetry::Tick();
+    const bool have = hsf::ngx::Latest(&ngx_frame);
+    if (have) {
       ngx_quiet = ngx_frame.serial != ngx_serial ? 0 : ngx_quiet + 1;
       ngx_serial = ngx_frame.serial;
       if (ngx_quiet < 3) g_dlss_seen = true;
-      use_ngx = ngx_quiet < 3 && MotionFrom() != 1;
     }
+    static SourceHold hold;
+    use_ngx = have && hold.Pick(ngx_quiet < 3, "D3D12") && MotionFrom() != 1;
   }
-  // Full-resolution vectors with render-size depth (DLSS without MVLowRes; Lies of P: 3440x1440 vectors, 2580x1080 depth). DLSS-G takes one size for both,
-  // and FeedFrame drops such frames, so generation stopped for good once the game's DLSS ran. HSF.fx's depth copy is the same depth at the back buffer's
-  // size, so it goes with the game's vectors instead. Without it (HSF.fx missing or off), full-resolution vectors keep the game's depth and Streamline's side
-  // brings that depth up to the vectors' size (depth_fit.h); only other size mismatches fall back to flow.
-  ID3D12Resource* ngx_depth = use_ngx ? ngx_frame.depth : nullptr;
-  bool ngx_depth_from_effect = false;
-  if (use_ngx && ngx_frame.motion != nullptr && ngx_frame.depth != nullptr) {
-    const D3D12_RESOURCE_DESC m = ngx_frame.motion->GetDesc();
-    const D3D12_RESOURCE_DESC d = ngx_frame.depth->GetDesc();
-    if (m.Width != d.Width || m.Height != d.Height) {
-      ID3D12Resource* const copy = EffectDepthCopy(runtime, dev);
-      const bool fits = copy != nullptr && copy->GetDesc().Width == m.Width && copy->GetDesc().Height == m.Height;
-      // The game's depth smaller than its full-resolution vectors: the depth fit pass can bring it up.
-      const bool depth_fit = !fits && ngx_frame.full_res && d.Width <= m.Width && d.Height <= m.Height;
-      const int how = fits ? 1 : depth_fit ? 2 : 0;
-      static int logged = -1;
-      if (logged != how) {
-        logged = how;
-        char text[260];
-        std::snprintf(text, sizeof(text),
-                      how == 1   ? "the game's DLSS vectors are %llux%u and its depth %llux%u: the vectors go with HSF.fx's depth copy, which is the vectors' size"
-                      : how == 2 ? "the game's DLSS vectors are %llux%u and its depth %llux%u, and HSF.fx's depth copy isn't the vectors' size: the game's depth is brought up to the vectors' size"
-                                 : "the game's DLSS vectors are %llux%u and its depth %llux%u, and HSF.fx's depth copy isn't the vectors' size: motion stays on flow",
-                      m.Width, m.Height, d.Width, d.Height);
-        hsf::slbring::LogLine(text);
-      }
-      if (fits) {
-        ngx_depth = copy;
-        ngx_depth_from_effect = true;
-      } else if (!depth_fit) {
-        use_ngx = false;
-      }
-    }
-  }
+  hsf::slbring::FrameFeed ngx_feed;
+  if (use_ngx) use_ngx = NgxFeed(runtime, dev, ngx_frame, ngx_feed, &hsf::slbring::LogLine);
   g_using_dlss = use_ngx;
   const bool source_changed = use_ngx != ngx_used;
   if (source_changed) {
@@ -2737,26 +2805,8 @@ void BringFrame(effect_runtime* runtime, device* dev, resource target) {
     hsf::slbring::Frame(feed);
   };
   if (use_ngx) {
-    hsf::slbring::FrameFeed feed;
-    feed.motion = ngx_frame.motion;
-    feed.depth = ngx_depth;
-    feed.scale[0] = ngx_frame.scale[0];
-    feed.scale[1] = ngx_frame.scale[1];
-    // The effect's copy follows the flow route's convention (DepthInverted in HSF.ini)
-    feed.depth_inverted = ngx_depth_from_effect ? g_depth_inverted_setting != 0 : ngx_frame.depth_inverted;
-    feed.reset = ngx_frame.reset || source_changed;
-    // The game's vectors are sharp and exact, so flow's clean-up has nothing to do. The HUD mask works at the picture's size, which these are not.
-    feed.compose = false;
-    feed.mask = false;
-    feed.x = ngx_frame.x;
-    feed.y = ngx_frame.y;
-    feed.width = ngx_frame.width;
-    feed.height = ngx_frame.height;
-    feed.jitter[0] = ngx_frame.jitter[0];
-    feed.jitter[1] = ngx_frame.jitter[1];
-    feed.jittered = ngx_frame.jittered;
-    feed.dilated = ngx_frame.full_res;
-    send_common(feed);
+    ngx_feed.reset = ngx_frame.reset || source_changed;
+    send_common(ngx_feed);
     return;
   }
 
@@ -2779,20 +2829,96 @@ void BringFrame(effect_runtime* runtime, device* dev, resource target) {
   send_common(feed);
 }
 
-// In-game route, every frame at present (effect events can be missing, as in Shadows with no effects loaded). AUTO: the game's DLSS data while it comes (it stops in
-// menus and with the game's DLSS off), flow otherwise. DLSS: the game's only. FLOW: flow only.
+// In-game route, every frame at present (effect events can be missing, as in Shadows with no effects loaded). The best motion the game gives, in this order:
+//   1. the game's own data through its Streamline (its frame generation tags, or what it gives Streamline's DLSS), with the game's camera;
+//   2. the game's DLSS read through NGX (a game that runs DLSS upscaling through NGX and has Streamline only for frame generation: Gothic 1 Remake);
+//   3. HSF's flow, which is no game data at all.
+// AUTO: that order. DLSS: 1 and 2, and flow fills the gaps once the game's data has been seen, so generation does not stop in menus. FLOW: flow only.
+// 2 and 3 both go through TagOptical (SlOpticalFrame); with NGX off or failing, the route is as it was before NGX came to it.
+bool g_sl_optical = false;
+bool g_sl_ngx = false;        // the NGX reader runs on this route (NgxInput=1, and the safe try allows it)
+bool g_sl_game_data = false;  // 1: the game's own Streamline data is in use, and HSF tags nothing of its own
+bool g_sl_ngx_ok = false;     // 2 is there: NGX gave a call within the last few real frames, held SOURCE_HOLD_MS either way
+bool g_sl_ngx_used = false;   // SlOpticalFrame sent the game's DLSS data through NGX this frame (its sizes fit)
 void DriveMotionChoice() {
   const bool flowing = hsf::slgame::GetStats().data_flowing;
   if (flowing) g_dlss_seen = true;
-  const bool optical = MotionFrom() == 1 || (MotionFrom() == 0 && !flowing);
-  g_using_dlss = !optical && flowing;
+  bool ngx_fresh = false;
+  if (g_sl_ngx) {
+    // A new way on this route: the safe try marks it before HSF first hooks NGX here, and turns it off for this game if a launch dies while it is in use.
+    static bool s_marked = false;
+    if (!s_marked && (GetModuleHandleW(L"_nvngx.dll") != nullptr || GetModuleHandleW(L"nvngx.dll") != nullptr)) {
+      s_marked = true;
+      hsf::safetry::Begin("T2_ngx_game_streamline");
+    }
+    hsf::ngx::Poll();
+    hsf::safetry::Tick();
+    // Fresh: a call taken within the last 3 real frames (the game's frame tokens: ReShade also sees DLSS-G's generated frames here) and 250 ms.
+    static uint64_t s_serial = 0, s_frame_at = 0;
+    static ULONGLONG s_time_at = 0;
+    hsf::ngx::Frame f;
+    if (hsf::ngx::Latest(&f) && f.serial != s_serial) {
+      s_serial = f.serial;
+      s_frame_at = hsf::slgame::GameFrames();
+      s_time_at = GetTickCount64();
+    }
+    ngx_fresh = s_serial != 0 && hsf::slgame::GameFrames() - s_frame_at < 3 && GetTickCount64() - s_time_at < 250;
+    if (ngx_fresh) g_dlss_seen = true;
+    static SourceHold hold;
+    g_sl_ngx_ok = hold.Pick(ngx_fresh, "game-Streamline route, NGX");
+  }
+  const bool optical = MotionFrom() == 1 || (!flowing && (MotionFrom() == 0 || g_dlss_seen));
+  g_sl_game_data = !optical && flowing;
+  g_using_dlss = g_sl_game_data || (optical && g_sl_ngx_used);
+  g_sl_optical = optical;
   hsf::slgame::SetOptical(optical);
+  hsf::slgame::SetFlowFill(MotionFrom() != 1);
 }
 
-// A Direct3D 12 game with its own Streamline, set to optical motion: this frame's flow and depth go through the game's Streamline, at the same place in the frame as BringFrame.
+// A Direct3D 12 game with its own Streamline, set to optical motion: this frame's motion and depth go through the game's Streamline, at the same place in the frame as BringFrame.
+// The game's DLSS data through NGX when it is there and fits, HSF's flow otherwise.
 void SlOpticalFrame(effect_runtime* runtime, device* dev, resource target) {
   // DriveMotionChoice, every frame at present, decided which.
-  if (g_using_dlss || MotionFrom() == 2) return;
+  if (g_sl_game_data || !g_sl_optical) {
+    g_sl_ngx_used = false;
+    return;
+  }
+  hsf::slbring::FrameFeed ngx_feed;
+  bool use_ngx = false;
+  static uint64_t frame_count = 0, ngx_refused_until = 0;
+  ++frame_count;
+  if (g_sl_ngx && g_sl_ngx_ok && MotionFrom() != 1 && frame_count >= ngx_refused_until) {
+    hsf::ngx::Frame f;
+    if (hsf::ngx::Latest(&f)) use_ngx = NgxFeed(runtime, dev, f, ngx_feed, &Log);
+  }
+  const bool source_changed = use_ngx != g_sl_ngx_used;
+  // What the log, the menu and the overlay say follows what DLSS-G got, never what was only tried.
+  static bool logged_ngx = false;
+  const auto note = [](bool used) {
+    if (used != logged_ngx) hsf::slgame::LogLine(used ? "motion from the game's DLSS, read through NGX" : "motion from HSF's flow, no game data");
+    logged_ngx = used;
+    g_sl_ngx_used = used;
+  };
+  if (use_ngx) {
+    runtime->get_command_queue()->flush_immediate_command_list();
+    ngx_feed.device = reinterpret_cast<ID3D12Device*>(dev->get_native());
+    ngx_feed.queue = reinterpret_cast<ID3D12CommandQueue*>(runtime->get_command_queue()->get_native());
+    ngx_feed.back_buffer = reinterpret_cast<ID3D12Resource*>(target.handle);
+    ngx_feed.back_buffer_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    ngx_feed.view = static_cast<unsigned>(g_bring_view);
+    ngx_feed.tag = &hsf::slgame::TagOptical;
+    hsf::slgame::SetOpticalJitter(ngx_feed.jitter, ngx_feed.jittered, ngx_feed.reset || source_changed);
+    if (hsf::slbring::Frame(ngx_feed)) {
+      note(true);
+      return;
+    }
+    // Refused (HSF_streamline log says why): flow for this frame, and NGX is not tried again for a while, so the source does not flip every frame.
+    ngx_refused_until = frame_count + 120;
+    hsf::slgame::LogLine("the game's DLSS data, read through NGX, was refused by the frame feed: flow for the next 120 frames");
+  }
+  note(false);
+  const float no_jitter[2] = {0.f, 0.f};
+  hsf::slgame::SetOpticalJitter(no_jitter, false, source_changed);
   ID3D12Resource* motion = nullptr;
   ID3D12Resource* depth = nullptr;
   if (!FindFlowAndDepth(runtime, dev, &motion, &depth)) return;
@@ -2816,6 +2942,14 @@ void SlOpticalFrame(effect_runtime* runtime, device* dev, resource target) {
   feed.view = static_cast<unsigned>(g_bring_view);
   feed.tag = &hsf::slgame::TagOptical;
   hsf::slbring::Frame(feed);
+}
+
+// What feeds DLSS-G's motion now, for the menu, the overlay and the finder. Flow is never shown as the game's data.
+const char* MotionSourceLabel(bool d3d12) {
+  if (!g_using_dlss) return "FLOW, NO GAME DATA";
+  if (g_sl_drive && g_sl_game_data) return "GAME DATA (STREAMLINE)";
+  if (!d3d12 && LumaLoaded()) return "LUMA (DLSS)";
+  return "GAME DLSS (NGX)";
 }
 #endif
 
@@ -3696,15 +3830,18 @@ void VkDlssMotion(effect_runtime* runtime, device* dev) {
     hsf::ngx::StartVk(&Log);
   }
   hsf::ngx::PollVk(dev);
+  hsf::safetry::Tick();
   static uint64_t last_serial = 0;
   static int quiet = 0;
   bool use = false;
-  if (hsf::ngx::LatestVk(&g_vk_dlss_frame)) {
+  const bool have = hsf::ngx::LatestVk(&g_vk_dlss_frame);
+  if (have) {
     quiet = g_vk_dlss_frame.serial != last_serial ? 0 : std::min(quiet + 1, 1000);
     last_serial = g_vk_dlss_frame.serial;
     if (quiet < 3) g_dlss_seen = true;
-    use = quiet < 3 && MotionFrom() != 1;
   }
+  static SourceHold hold;
+  use = have && hold.Pick(quiet < 3, "Vulkan") && MotionFrom() != 1;
   // Once: whether the calls go to the queue the frames are presented on. On another queue nothing orders HSF's bridge copy after the call's copy.
   static bool queue_logged = false;
   if (!queue_logged && use) {
@@ -4844,7 +4981,7 @@ void DrawD3d12Controls(uint32_t max_frames, const char* motion_now, bool reflex_
   ImGui::TextDisabled("These two work on optical motion only.");
   const char* const VIEWS[] = {"the game", "depth (near bright, far dark)", "motion (still grey, moving coloured)"};
   ImGui::Combo("Show", &g_bring_view, VIEWS, static_cast<int>(std::size(VIEWS)));
-  if (g_sl_drive && g_using_dlss) ImGui::TextDisabled("In this game, Show works with optical motion.");
+  if (g_sl_drive && g_sl_game_data) ImGui::TextDisabled("In this game, Show works with optical motion.");
 
   ImGui::SeparatorText("Frame rate");
   // FPS cap: applied while dragging, written to HSF.ini when let go.
@@ -5186,7 +5323,7 @@ void DrawDetails(effect_runtime* runtime) {
     ImGui::Text("DLSS-G inside the game: %s, asked for %ux", stats.generating ? "generating" : !stats.have_options ? "not found yet" : "waiting for vectors", stats.frames + 1);
     ImGui::Text("plugin loaded: %s", stats.plugin_loaded == 1 ? "yes" : stats.plugin_loaded == 0 ? "NO" : "not known yet");
     ImGui::Text("really showing %ux. Status 0x%x, up to %ux, vectors and depth tagged %llu%s", stats.presented, stats.status, stats.max_frames + 1, stats.tagged, stats.dynamic_resolution ? ", dynamic resolution" : "");
-    DrawD3d12Controls(stats.max_frames, g_using_dlss ? "the game's own vectors and depth" : "optical (needs LaunchPad and HSF.fx loaded)", false);
+    DrawD3d12Controls(stats.max_frames, g_sl_game_data ? "the game's own vectors and depth, through its Streamline" : g_using_dlss ? "the game's DLSS vectors and depth, read through NGX" : "optical, no game data (needs LaunchPad and HSF.fx loaded)", false);
     DrawLaunchPadTune(runtime);
     DrawOlderCardMod();
     ImGui::SeparatorText("The game's own vectors");
@@ -5426,10 +5563,10 @@ MenuView ReadMenuView() {
     if (v.generating) v.out_fps = v.base_fps * static_cast<float>(s.presented);
     if (g_drive_left) v.waiting = "This game never starts its own Streamline. HSF will bring its own: restart the game once.";
     else if (s.old_streamline) v.waiting = "This game's Streamline is too old for HSF (1.x). Use the game's own frame generation.";
-    else if (!s.have_options) v.waiting = "The game's DLSS-G is not found yet. Turn on DLSS (any mode) in the game.";
+    else if (!s.have_options) v.waiting = "The game's DLSS-G is not found yet. Turn on DLSS upscaling (any mode) or the game's own frame generation.";
     else if (s.plugin_loaded == 0) v.problem = "DLSS-G's plugin did not load (see HSF_sl_probe.log).";
     else if (s.status != 0) v.problem = "DLSS-G reports a problem (see HSF_sl_probe.log).";
-    else if (!s.data_flowing && MotionFrom() == 2) v.waiting = "Waiting for the game's motion vectors (menus send none).";
+    else if (!s.data_flowing && MotionFrom() == 2 && !g_dlss_seen) v.waiting = "Waiting for the game's motion vectors (menus send none).";
     if (!v.generating && v.problem == nullptr && v.waiting == nullptr) v.waiting = FinderReason();
     return v;
   }
@@ -5562,16 +5699,25 @@ void ReadFinderVk(Finder& f) {
 }
 
 #ifdef HSF_SL_GAME
-// Motion: the game's DLSS through NGX, or flow from LaunchPad and HSF.fx. Shared by both routes.
-void AddMotionStep(Finder& f, bool game_flowing, const char* game_note) {
+// What the NGX reader has, for the finder. log names the log its lines go to.
+void NgxNote(char* out, size_t size, const char* log) {
+  if (!g_ngx_input) std::snprintf(out, size, "off in HSF.ini (NgxInput=0)");
+  else if (!hsf::ngx::Loaded()) std::snprintf(out, size, "not loaded (DLSS off in the game, or a game without DLSS)");
+  else if (hsf::ngx::HookedCalls() < hsf::ngx::FoundCalls())
+    std::snprintf(out, size, "%d of %d calls hooked (another tool holds them, see %s)", hsf::ngx::HookedCalls(), hsf::ngx::FoundCalls(), log);
+  else std::snprintf(out, size, "hooked, no DLSS call seen lately (menus send none)");
+}
+
+// Motion: the game's data (game_source says which), or flow from LaunchPad and HSF.fx, which is no game data. Shared by both routes. turn_on: what the player can turn on in the game.
+void AddMotionStep(Finder& f, bool game_flowing, const char* game_note, const char* game_source, const char* turn_on) {
   const int from = MotionFrom();
-  if (from != 1 && game_flowing) return AddStep(f, "MOTION", StepState::ok, "from the game's DLSS");
-  if (from != 2 && g_flow_state == 1) return AddStep(f, "MOTION", StepState::ok, "from flow (LaunchPad)");
+  if (from != 1 && game_flowing) return AddStep(f, "MOTION", StepState::ok, "from %s", game_source);
+  if (from != 2 && g_flow_state == 1) return AddStep(f, "MOTION", StepState::ok, "from flow (LaunchPad), no game data");
   const char* const flow = g_flow_state == 2 ? "no flow effect (LaunchPad not loaded or off)"
                            : g_flow_state == 3 ? "no depth copy (HSF.fx not loaded)"
                            : g_flow_state == 4 ? "flow found, its direction not known yet"
                                                : "flow not looked for yet";
-  if (from == 2) return AddStep(f, "MOTION", StepState::waiting, "MOTION is set to DLSS: %s. Turn on DLSS (any mode) in the game, or set MOTION to AUTO", game_note);
+  if (from == 2) return AddStep(f, "MOTION", StepState::waiting, "MOTION is set to DLSS: %s. Turn on %s in the game, or set MOTION to AUTO", game_note, turn_on);
   if (from == 1) return AddStep(f, "MOTION", StepState::waiting, "MOTION is set to FLOW: %s", flow);
   AddStep(f, "MOTION", StepState::waiting, "game's DLSS: %s // flow: %s", game_note, flow);
 }
@@ -5603,12 +5749,8 @@ void ReadFinderD3d12(Finder& f) {
       AddStep(f, "DLSS-G STATUS", StepState::ok, "fine");
     }
     char ngx_note[120];
-    if (!g_ngx_input) std::snprintf(ngx_note, sizeof(ngx_note), "off in HSF.ini (NgxInput=0)");
-    else if (!hsf::ngx::Loaded()) std::snprintf(ngx_note, sizeof(ngx_note), "not loaded (DLSS off in the game, or a game without DLSS)");
-    else if (hsf::ngx::HookedCalls() < hsf::ngx::FoundCalls())
-      std::snprintf(ngx_note, sizeof(ngx_note), "%d of %d calls hooked (another tool holds them, see HSF_sl_bring.log)", hsf::ngx::HookedCalls(), hsf::ngx::FoundCalls());
-    else std::snprintf(ngx_note, sizeof(ngx_note), "hooked, no DLSS call seen lately (menus send none)");
-    AddMotionStep(f, g_bring_using_game, ngx_note);
+    NgxNote(ngx_note, sizeof(ngx_note), "HSF_sl_bring.log");
+    AddMotionStep(f, g_bring_using_game, ngx_note, "the game's DLSS, read through NGX", "DLSS upscaling (any mode)");
     static uint64_t s_fed = 0;
     static ULONGLONG s_fed_at = 0;
     const ULONGLONG now = GetTickCount64();
@@ -5634,7 +5776,7 @@ void ReadFinderD3d12(Finder& f) {
       else AddStep(f, "HOOKS", StepState::failed, "none went in: another tool holds the calls (HSF_sl_probe.log names them). RESCAN tries again");
     }
     if (s.have_options) AddStep(f, "GAME'S DLSS-G", StepState::ok, "found");
-    else AddStep(f, "GAME'S DLSS-G", StepState::waiting, "not found yet. Turn on DLSS (any mode) in the game; HSF looks again every 10 seconds");
+    else AddStep(f, "GAME'S DLSS-G", StepState::waiting, "not found yet. Turn on DLSS upscaling (any mode) or the game's own frame generation; HSF looks again every 10 seconds");
     if (s.plugin_loaded == 1) AddStep(f, "DLSS-G PLUGIN", StepState::ok, "loaded");
     else if (s.plugin_loaded == 0) AddStep(f, "DLSS-G PLUGIN", StepState::failed, "the game did not load it (frame generation off in the game, or its sl.dlss_g.dll missing)");
     else AddStep(f, "DLSS-G PLUGIN", StepState::waiting, "not known yet");
@@ -5646,7 +5788,16 @@ void ReadFinderD3d12(Finder& f) {
     }
     if (s.game_frames > 0) AddStep(f, "GAME FRAMES", StepState::ok, "%llu", static_cast<unsigned long long>(s.game_frames));
     else AddStep(f, "GAME FRAMES", StepState::waiting, "the game has not started a frame through Streamline yet");
-    AddMotionStep(f, s.data_flowing, "no vectors from the game now (menus send none)");
+    char game_note[220];
+    if (g_sl_ngx) {
+      char ngx_note[120];
+      NgxNote(ngx_note, sizeof(ngx_note), "ReShade.log");
+      std::snprintf(game_note, sizeof(game_note), "no vectors from the game's Streamline now (menus send none); NGX %s", ngx_note);
+    } else {
+      std::snprintf(game_note, sizeof(game_note), "no vectors from the game now (menus send none)");
+    }
+    AddMotionStep(f, g_using_dlss, game_note, g_sl_game_data ? "the game's own data, through its Streamline" : "the game's DLSS, read through NGX",
+                  "DLSS upscaling (any mode) or the game's own frame generation");
     static uint64_t s_failures = 0;
     static ULONGLONG s_failed_at = 0;
     const ULONGLONG now = GetTickCount64();
@@ -5654,11 +5805,11 @@ void ReadFinderD3d12(Finder& f) {
       s_failures = s.tag_failures;
       s_failed_at = now;
     }
-    if (!g_using_dlss) {
+    if (!g_sl_game_data) {
       if (s_failed_at != 0 && now - s_failed_at < 3000)
-        AddStep(f, "TAGS ACCEPTED", StepState::failed, "Streamline refuses HSF's flow tags (%llu so far, HSF_sl_probe.log has the code)", static_cast<unsigned long long>(s.tag_failures));
+        AddStep(f, "TAGS ACCEPTED", StepState::failed, "Streamline refuses HSF's tags (%llu so far, HSF_sl_probe.log has the code)", static_cast<unsigned long long>(s.tag_failures));
       else if (s.tagged > 0) AddStep(f, "TAGS ACCEPTED", StepState::ok, "yes");
-      else AddStep(f, "TAGS ACCEPTED", StepState::waiting, "no flow tagged yet");
+      else AddStep(f, "TAGS ACCEPTED", StepState::waiting, "nothing tagged by HSF yet");
     }
     if (s.generating && s.presented > 1) AddStep(f, "GENERATING", StepState::ok, "%u shown per real frame", s.presented);
     else AddStep(f, "GENERATING", StepState::waiting, "%s", s.generating ? "DLSS-G is on and shows 1 per real frame so far" : "DLSS-G is not on yet");
@@ -5700,7 +5851,7 @@ void Rescan(bool manual) {
   g_rescan_at = GetTickCount64();
   if (!manual) ++g_auto_rescans;
 #ifdef HSF_SL_GAME
-  if (g_sl_bring && g_ngx_input) hsf::ngx::Rescan();
+  if ((g_sl_bring && g_ngx_input) || g_sl_ngx) hsf::ngx::Rescan();
   if (g_sl_game) hsf::slgame::Rescan();
 #endif
   if (g_seen.api == device_api::vulkan) {
@@ -6166,8 +6317,9 @@ void DrawPanel(effect_runtime* runtime) {
       g_motion_from = BOX_TO_FROM[box];
       changed = true;
     }
-    const bool game_data = g_using_dlss;
-    ui::RightNote(game_data ? (luma_data ? "> LUMA (DLSS) DATA" : "> GAME DATA") : "> FLOW", c::DIM);
+    char source_note[64];
+    std::snprintf(source_note, sizeof(source_note), "> %s", MotionSourceLabel(now.d3d12));
+    ui::RightNote(source_note, c::DIM);
     // D3D11 with a DLSS mod: the flow effect off while the mod's data feeds DLSS-G (Dlss11Motion). It needs a few frames to settle when it comes back.
     if (!now.d3d12) {
       ui::RowLabel("FLOW PAUSE", c::BLUE);
@@ -6598,7 +6750,7 @@ void DrawPanel(effect_runtime* runtime) {
 #ifdef HSF_SL_GAME
     // In-game route on DLSS: the game's vectors and depth go to its own Streamline mid-frame and HSF has no copy at present, so the views and HSF's depth settings
     // have nothing to work on. Crossed out, and the view goes back to GAME, until motion is on flow.
-    const bool dlss_only = now.drive && g_using_dlss;
+    const bool dlss_only = now.drive && g_sl_game_data;
     if (dlss_only) g_bring_view = 0;
 #else
     const bool dlss_only = false;
@@ -7092,11 +7244,11 @@ void DrawOverlay(bool advanced) {
     const char* route = v.route;
     if (std::strncmp(route, "IN GAME // ", 11) == 0) route += 11;
     line(x, w, y1, "ROUTE", c::DIM, route, c::TEXT);
-    bool game_data = false;
+    const char* motion_source = "FLOW, NO GAME DATA";
 #ifdef HSF_SL_GAME
-    game_data = g_using_dlss;
+    motion_source = MotionSourceLabel(v.d3d12);
 #endif
-    line(x, w, y1, "MOTION", c::DIM, game_data ? (!v.d3d12 && LumaLoaded() ? "LUMA (DLSS)" : "GAME DATA") : "OPTICAL FLOW", c::TEXT);
+    line(x, w, y1, "MOTION", c::DIM, motion_source, c::TEXT);
     if (!v.d3d12) line(x, w, y1, "DEPTH", c::DIM, DepthSent() ? "FOUND" : "NONE (FLAT)", DepthSent() ? c::TEXT : c::AMBER);
     bool hud = g_hud_enabled;
 #ifdef HSF_SL_GAME
@@ -7367,6 +7519,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         break;
       }
       FindIni(module);
+      {
+        // New ways of hooking are tried with the old kept as the backup (safe_try.h); HSF keeps its marks in HSF_safe_try.ini next to HSF.ini.
+        std::wstring safe_try = g_ini_path;
+        const size_t slash = safe_try.rfind(L'\\');
+        safe_try = (slash == std::wstring::npos ? std::wstring() : safe_try.substr(0, slash + 1)) + L"HSF_safe_try.ini";
+        if (g_ini_path[0] != 0) hsf::safetry::Init(safe_try.c_str(), &Log);
+      }
       // Vulkan games: same-frame hand-off needs shared semaphores on the game's device, added at its vkCreateDevice (vk_hook.h).
       if (GetPrivateProfileIntW(L"HSF", L"VkDeviceHook", 1, g_ini_path) != 0)
         if (const char* const hooked = hsf::vk::HookCreateDevice()) reshade::log_message(reshade::log_level::info, (std::string("HSF: ") + hooked).c_str());
@@ -7404,6 +7563,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         if (wchar_t* const slash = wcsrchr(log_path, L'\\')) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - log_path), L"HSF_sl_probe.log");
         g_sl_dynamic_saved = GetPrivateProfileIntW(L"HSF", L"DlssgDynamicRes", 0, g_ini_path) != 0;
         hsf::slgame::Start(log_path, g_sl_drive, g_sl_dynamic_saved);
+        // The game's DLSS read through NGX, for a game that runs DLSS upscaling through NGX and has Streamline only for frame generation. The bring route starts its own.
+        if (g_sl_drive && !g_sl_bring) {
+          g_ngx_input = GetPrivateProfileIntW(L"HSF", L"NgxInput", 1, g_ini_path) != 0;
+          g_sl_ngx = g_ngx_input && hsf::safetry::Allowed("T2_ngx_game_streamline");
+          // Its lines go to ReShade's log, never to slgame::LogLine: hooking NGX goes through slgame::HookFunction, which holds that log's lock while it logs.
+          if (g_sl_ngx) hsf::ngx::Start(&Log);
+        }
       }
 #endif
       g_fault9_handler = AddVectoredExceptionHandler(0, OnFault9);
@@ -7416,7 +7582,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
       }
 #ifdef HSF_SL_GAME
       if (g_sl_game) hsf::slgame::Stop(reserved != nullptr);
-      if (g_sl_bring && g_ngx_input) hsf::ngx::Stop(reserved != nullptr);
+      if ((g_sl_bring && g_ngx_input) || g_sl_ngx) hsf::ngx::Stop(reserved != nullptr);
       hsf::ngx::Stop11(reserved != nullptr);
       if (reserved == nullptr && hsf::ngx::LoadedVk()) {
         hsf::slgame::UnhookFunctions();  // NGX's Vulkan calls: no hook into a freed HSF
@@ -7432,6 +7598,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
       UnhookNativePresent();
       UnhookNativePresent9();
       ClearDx9Run();  // a normal exit (a crash never gets here): the 9Ex crash rule must not count it
+      hsf::safetry::ClearAll();  // the same for the safe-try marks
       if (g_fault9_handler != nullptr) RemoveVectoredExceptionHandler(g_fault9_handler);
       reshade::unregister_addon(module);
       break;

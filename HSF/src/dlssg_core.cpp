@@ -1060,7 +1060,7 @@ void Run(Presenter& p, Host& host) {
         ++p.still_changes;
         const ULONGLONG now = GetTickCount64();
         if (now - p.last_still_log >= 1000) {
-          Log(verdict.still ? "still picture: zero motion (%u changes since the last line)" : "picture moving again (%u changes since the last line)", p.still_changes);
+          Log(verdict.still ? "still picture (information only, motion and generation go on as they are; %u changes since the last line)" : "picture moving again (%u changes since the last line)", p.still_changes);
           p.last_still_log = now;
           p.still_changes = 0;
         }
@@ -1162,7 +1162,9 @@ void Run(Presenter& p, Host& host) {
       p.frame_fence->SetEventOnCompletion(p.alloc_value[bi], p.frame_event);
       WaitForSingleObject(p.frame_event, 1000);
     }
-    RecordFrame(p, in, motion, reset, verdict.still, camera_now, slot, bi, *token);
+    // A still picture changes nothing: the motion goes to DLSS-G as it is, never zeroed, and generation never stops for it. Zeroing it made the picture
+    // jump between zero and real motion several times a second in scenes that stop and move.
+    RecordFrame(p, in, motion, reset, false, camera_now, slot, bi, *token);
     host.NvofState(in.nvof && motion ? static_cast<int>(p.nvof.GetState()) : 0);
     ID3D12CommandList* const lists[] = {p.list.Get()};
     queue->ExecuteCommandLists(1, lists);

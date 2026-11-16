@@ -2,6 +2,8 @@
 // jumps to the hook; the hook calls a trampoline holding the moved prologue, which jumps back. Anything unexpected at a function's start means no hook there, only a log line.
 #include "sl_game.h"
 
+#include "safe_try.h"
+
 #include <windows.h>
 #include <psapi.h>
 #include <d3d12.h>
@@ -23,6 +25,11 @@
 #include <cwctype>
 #include <iterator>
 #include <new>
+
+// MinHook's HDE64 length decoder (BSD-2-Clause), built as C in hsf_minhook.
+extern "C" {
+#include "../third_party/minhook/src/hde/hde64.h"
+}
 
 namespace hsf::slgame {
 namespace {
@@ -396,7 +403,12 @@ std::atomic<bool> g_optical{false};
 std::atomic<ULONGLONG> g_optical_last{0};
 std::atomic<float> g_optical_scale_x{0.0f}, g_optical_scale_y{0.0f};
 std::atomic<bool> g_optical_dilated{false};
+// The game's DLSS data through NGX goes the optical way too, with its own jitter and reset (SetOpticalJitter). All zero for flow.
+std::atomic<float> g_optical_jitter_x{0.0f}, g_optical_jitter_y{0.0f};
+std::atomic<bool> g_optical_jittered{false}, g_optical_reset{false};
 constexpr ULONGLONG OPTICAL_GONE_MS = 300;
+std::atomic<bool> g_flow_fill{false};
+constexpr ULONGLONG FLOW_FILL_MS = 3000;  // with flow fill on, generation stops only when neither the game's data nor HSF's flow came for this long
 bool OpticalActive() { return g_optical.load(std::memory_order_relaxed) && GetTickCount64() - g_optical_last.load(std::memory_order_relaxed) <= OPTICAL_GONE_MS; }
 std::atomic<uint32_t> g_cap_fps{0};
 std::atomic<bool> g_reflex_boost{false};
@@ -697,11 +709,13 @@ sl::Result HookConstants(const sl::Constants& values, const sl::FrameToken& fram
         const bool cut = CheckCut(fixed, token, SafeViewport(&viewport));
         const bool rebuilt = RebuildCamera(fixed, token, SafeViewport(&viewport));
         use_fixed = cut || rebuilt;
-        // Optical motion is the picture's own, so it has its scale, no jitter, and is dilated when the compose pass has run.
+        // Optical motion is the picture's own, so it has its scale, no jitter, and is dilated when the compose pass has run. The game's DLSS data through NGX
+        // goes the same way and brings its own jitter and reset.
         if (OpticalActive()) {
           fixed.mvecScale = {g_optical_scale_x.load(std::memory_order_relaxed), g_optical_scale_y.load(std::memory_order_relaxed)};
-          fixed.jitterOffset = {0.0f, 0.0f};
-          fixed.motionVectorsJittered = sl::Boolean::eFalse;
+          fixed.jitterOffset = {g_optical_jitter_x.load(std::memory_order_relaxed), g_optical_jitter_y.load(std::memory_order_relaxed)};
+          fixed.motionVectorsJittered = g_optical_jittered.load(std::memory_order_relaxed) ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+          if (g_optical_reset.exchange(false, std::memory_order_relaxed)) fixed.reset = sl::Boolean::eTrue;
           fixed.motionVectorsDilated = g_optical_dilated.load(std::memory_order_relaxed) ? sl::Boolean::eTrue : sl::Boolean::eFalse;
           use_fixed = true;
         }
@@ -1129,13 +1143,15 @@ bool CodeStillThere(const void* address) {
   return VirtualQuery(address, &mbi, sizeof(mbi)) != 0 && mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
 }
 
-// All 8 bytes in one write, so a thread entering the function sees the old start or the new one, never half of each.
+// All 8 bytes in one write, so a thread entering the function sees the old start or the new one, never half of each. A function that is not 8-byte aligned (only with the
+// full decoder, H3) cannot be written in one go: the bytes are copied, as MinHook does, and a thread entering at that very moment could see half of each.
 bool WriteFirstBytes(uint8_t* target, const uint8_t bytes[8]) {
   DWORD old = 0;
   if (!VirtualProtect(target, 8, PAGE_EXECUTE_READWRITE, &old)) return false;
   LONG64 value;
   std::memcpy(&value, bytes, 8);
-  _InterlockedExchange64(reinterpret_cast<volatile LONG64*>(target), value);
+  if ((reinterpret_cast<uintptr_t>(target) & 7) == 0) _InterlockedExchange64(reinterpret_cast<volatile LONG64*>(target), value);
+  else std::memcpy(target, bytes, 8);
   VirtualProtect(target, 8, old, &old);
   FlushInstructionCache(GetCurrentProcess(), target, 8);
   return true;
@@ -1242,8 +1258,8 @@ bool Install(Hook& hook, uint8_t* target) {
   if (first[0] == 0xE9 && Adopt(hook, target)) return true;
   for (int i = 0; i < 12; ++i) std::snprintf(bytes_text + i * 3, 4, "%02x ", first[i]);
   if (first[0] == 0xEB && first[1] == 0xF9) return ChainHotPatch(hook, target, bytes_text);
-  size_t rip_at[MAX_RIP_LOADS];
-  size_t rip_count = 0;
+  MovedFix fixes[MAX_RIP_LOADS];
+  size_t fix_count = 0;
   // Someone else's absolute jump (ff 25, the address in memory): HSF goes on top, and its trampoline makes the same jump.
   const void* absolute_to = nullptr;
   if (first[0] == 0xFF && first[1] == 0x25) {
@@ -1251,8 +1267,30 @@ bool Install(Hook& hook, uint8_t* target) {
     std::memcpy(&displacement, first + 2, 4);
     if (!SafeCopy(&absolute_to, target + 6 + displacement, sizeof(absolute_to)) || !CodeStillThere(absolute_to)) absolute_to = nullptr;
   }
-  const size_t length = absolute_to != nullptr ? 6 : PrologueLength(first, 5, rip_at, &rip_count);
-  if (length == 0 || length > 16 || (reinterpret_cast<uintptr_t>(target) & 7) != 0) {
+  size_t length = 0;
+  if (absolute_to != nullptr) {
+    length = 6;
+  } else {
+    size_t rip_at[MAX_RIP_LOADS];
+    length = PrologueLength(first, 5, rip_at, &fix_count);
+    for (size_t i = 0; i < fix_count; ++i) {
+      const bool is_jump = first[rip_at[i]] == 0xE9;
+      fixes[i] = {static_cast<uint8_t>(rip_at[i]), static_cast<uint8_t>(rip_at[i] + (is_jump ? 1 : 3)), static_cast<uint8_t>(rip_at[i] + (is_jump ? 5 : 7)), is_jump};
+    }
+  }
+  const bool aligned = (reinterpret_cast<uintptr_t>(target) & 7) == 0;
+  // HSF's short list does not know this start, or the function is not 8-byte aligned: a full length decoder (H3), unless it was the way in use when this game last went down.
+  bool decoded = false;
+  if ((length == 0 || !aligned) && safetry::Allowed("H3_decoder")) {
+    if (length == 0) {
+      length = PrologueLengthDecoded(first, 5, fixes, &fix_count);
+      decoded = length != 0;
+    }
+    if (length != 0) safetry::Begin("H3_decoder");
+  } else if (!aligned) {
+    length = 0;
+  }
+  if (length == 0 || length > 24) {
     if (Adopt(hook, target)) return true;
     Line("hook %s NOT installed at %p: starts %s(left alone)", hook.name, target, bytes_text);
     return false;
@@ -1272,17 +1310,16 @@ bool Install(Hook& hook, uint8_t* target) {
     WriteAbsoluteJump(trampoline, absolute_to);
     ends_in_jump = true;
   }
-  for (size_t i = 0; i < rip_count; ++i) {
-    const bool is_jump = first[rip_at[i]] == 0xE9;
-    const size_t DISP_AT = is_jump ? 1 : 3, INSTRUCTION_BYTES = is_jump ? 5 : 7;
+  for (size_t i = 0; i < fix_count; ++i) {
+    const MovedFix& fix = fixes[i];
     int32_t displacement;
-    std::memcpy(&displacement, first + rip_at[i] + DISP_AT, sizeof(displacement));
-    const uint8_t* const address = target + rip_at[i] + INSTRUCTION_BYTES + displacement;
-    const intptr_t moved = address - (trampoline + rip_at[i] + INSTRUCTION_BYTES);
+    std::memcpy(&displacement, first + fix.disp_at, sizeof(displacement));
+    const uint8_t* const address = target + fix.end + displacement;
+    const intptr_t moved = address - (trampoline + fix.end);
     // Someone else's jump as the last moved instruction (MFG-Unlocker on slDLSSGSetOptions, its module more than 2 GB from the trampoline in PBZ): an absolute jump to the
     // same place does the same and reaches anywhere. Nothing runs after a jump, so no jump back follows it.
-    if (is_jump && rip_at[i] + INSTRUCTION_BYTES == length && rip_at[i] + 14 <= SLOT_BYTES - 16) {
-      WriteAbsoluteJump(trampoline + rip_at[i], address);
+    if (fix.is_jump && fix.end == length && fix.at + 14u <= SLOT_BYTES - 16) {
+      WriteAbsoluteJump(trampoline + fix.at, address);
       ends_in_jump = true;
       continue;
     }
@@ -1291,7 +1328,7 @@ bool Install(Hook& hook, uint8_t* target) {
       return false;
     }
     const int32_t new_displacement = static_cast<int32_t>(moved);
-    std::memcpy(trampoline + rip_at[i] + DISP_AT, &new_displacement, sizeof(new_displacement));
+    std::memcpy(trampoline + fix.disp_at, &new_displacement, sizeof(new_displacement));
   }
   if (!ends_in_jump) WriteAbsoluteJump(trampoline + length, target + length);
   FlushInstructionCache(GetCurrentProcess(), slot, SLOT_BYTES);
@@ -1313,7 +1350,8 @@ bool Install(Hook& hook, uint8_t* target) {
   hook.adopted = false;
   hook.installed = true;
   PublishRelay(hook);
-  Line("hook %s installed at %p, moved %zu bytes, %zu loads relative to rip: %s", hook.name, target, length, rip_count, bytes_text);
+  Line("hook %s installed at %p, moved %zu bytes, %zu loads relative to rip%s%s: %s", hook.name, target, length, fix_count, decoded ? ", measured by the full decoder" : "",
+       aligned ? "" : ", not 8-byte aligned (written in two parts)", bytes_text);
   return true;
 }
 
@@ -1352,7 +1390,31 @@ void Remove(Hook& hook) {
   SetEnvironmentVariableW(name, nullptr);
 }
 
+// H1: what the plugin hook hands out in place of slDLSSGSetOptions, a jump to HookDlssgOptions in a code page that outlives HSF (see HandOutOptions). Under g_lock.
+uint8_t* g_options_stub = nullptr;
+std::atomic<bool> g_plugin_route{false};  // the game's slDLSSGSetOptions calls come through HSF's stub, with no patch on DLSS-G's code
+
+// The Steam overlay hooks DLSS-G's functions itself. Handed HSF's stub, it would patch HSF's code, which goes away when ReShade unloads HSF.
+bool FromSteamOverlay(const void* address) {
+  HMODULE module = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(address), &module)) return false;
+  wchar_t path[MAX_PATH] = L"";
+  GetModuleFileNameW(module, path, MAX_PATH);
+  const wchar_t* const slash = std::wcsrchr(path, L'\\');
+  return _wcsicmp(slash != nullptr ? slash + 1 : path, L"gameoverlayrenderer64.dll") == 0;
+}
+
 void InstallFeatureHook(const char* name, void* function) {
+  if (function != nullptr && function == g_options_stub) return;  // HSF's own, from the plugin hook: nothing to patch
+  // Names the file DLSS-G's options call lives in, once per address: the plugin hook looks for sl.dlss_g.dll, and a game that loads DLSS-G under another name shows here.
+  static void* s_named_options = nullptr;
+  if (function != nullptr && function != s_named_options && std::strcmp(name, "slDLSSGSetOptions") == 0) {
+    s_named_options = function;
+    HMODULE owner = nullptr;
+    wchar_t path[MAX_PATH] = L"(no module)";
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(function), &owner)) GetModuleFileNameW(owner, path, MAX_PATH);
+    Line("slDLSSGSetOptions %p lives in %p: %ls", function, static_cast<void*>(owner), path);
+  }
   for (Hook& hook : g_feature_hooks)
     if (std::strcmp(hook.name, name) == 0 && function != nullptr) Install(hook, static_cast<uint8_t*>(function));
 }
@@ -1361,7 +1423,12 @@ sl::Result HookGetFunction(sl::Feature feature, const char* name, void*& functio
   InFlight in_flight;
   const sl::Result result = g_real_get_function(feature, name, function);
   Lock lock;
-  Line("slGetFeatureFunction %s(%u) %s -> %p result %d", FeatureName(feature), feature, name != nullptr ? name : "(null)", result == sl::Result::eOk ? function : nullptr, static_cast<int>(result));
+  if (result == sl::Result::eOk && function != nullptr && function == g_options_stub && g_real_dlssg_options != nullptr && FromSteamOverlay(_ReturnAddress())) {
+    function = reinterpret_cast<void*>(g_real_dlssg_options);
+    Line("the Steam overlay asked for slDLSSGSetOptions: it gets DLSS-G's own, not HSF's");
+  }
+  Line("slGetFeatureFunction %s(%u) %s -> %p result %d%s", FeatureName(feature), feature, name != nullptr ? name : "(null)", result == sl::Result::eOk ? function : nullptr, static_cast<int>(result),
+       result == sl::Result::eOk && function != nullptr && function == g_options_stub ? " (HSF's, from the plugin hook)" : "");
   if (result == sl::Result::eOk && name != nullptr) InstallFeatureHook(name, function);
   return result;
 }
@@ -1424,15 +1491,42 @@ HMODULE FindGameInterposer() {
   return nullptr;
 }
 
+// The file version from the module's own version resource. Not through version.dll: in a D3D12 game version.dll may be another tool's stand-in (MFG-Unlocker loads as one),
+// and this also runs under the loader lock.
+bool ModuleVersion(HMODULE module, uint32_t out[4]) {
+  const HRSRC found = FindResourceW(module, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16));  // RT_VERSION
+  if (found == nullptr) return false;
+  const HGLOBAL loaded = LoadResource(module, found);
+  const DWORD size = SizeofResource(module, found);
+  const auto* const bytes = static_cast<const uint8_t*>(loaded != nullptr ? LockResource(loaded) : nullptr);
+  if (bytes == nullptr) return false;
+  for (DWORD at = 0; at + sizeof(VS_FIXEDFILEINFO) <= size; at += 4) {
+    VS_FIXEDFILEINFO info;
+    std::memcpy(&info, bytes + at, sizeof(info));
+    if (info.dwSignature != 0xFEEF04BD) continue;
+    out[0] = HIWORD(info.dwFileVersionMS);
+    out[1] = LOWORD(info.dwFileVersionMS);
+    out[2] = HIWORD(info.dwFileVersionLS);
+    out[3] = LOWORD(info.dwFileVersionLS);
+    return true;
+  }
+  return false;
+}
+
 void HookInterposer(HMODULE module) {
   wchar_t path[MAX_PATH] = L"?";
   GetModuleFileNameW(module, path, MAX_PATH);
-  Line("sl.interposer.dll at %p: %ls", module, path);
+  uint32_t version[4] = {};
+  const bool have_version = ModuleVersion(module, version);
+  if (have_version) Line("sl.interposer.dll at %p, version %u.%u.%u.%u: %ls", module, version[0], version[1], version[2], version[3], path);
+  else Line("sl.interposer.dll at %p, no version in the file: %ls", module, path);
   // Streamline 1.x (Returnal, 2023) has no slGetFeatureFunction, and its slSetTag, slSetConstants and slEvaluateFeature take different arguments from 2.x. HSF's hooks read
   // them as 2.x and its own tags are sent as 2.x, which crashed Returnal at start. So HSF leaves a 1.x Streamline alone: no hooks, no tags, the game's own FG as it was.
-  if (GetProcAddress(module, "slGetFeatureFunction") == nullptr) {
+  // The file's version says so first; a missing slGetFeatureFunction says so too.
+  const bool old_by_version = have_version && version[0] == 1;
+  if (old_by_version || GetProcAddress(module, "slGetFeatureFunction") == nullptr) {
     g_old_streamline.store(true, std::memory_order_relaxed);
-    Line("Streamline 1.x (no slGetFeatureFunction): HSF leaves the game's Streamline alone, no hooks");
+    Line("Streamline 1.x (%s): HSF leaves the game's Streamline alone, no hooks", old_by_version ? "by its file version" : "no slGetFeatureFunction");
     return;
   }
   g_is_loaded = reinterpret_cast<IsFeatureLoadedFn>(GetProcAddress(module, "slIsFeatureLoaded"));
@@ -1444,6 +1538,257 @@ void HookInterposer(HMODULE module) {
     }
     Install(hook, static_cast<uint8_t*>(function));
   }
+}
+
+// ---- DLSS-G at its plugin (H1, H4, H5) ----
+// Streamline's interposer gets DLSS-G's functions from sl.dlss_g.dll's export slGetPluginFunction. HSF hooks that export (one hook per loaded copy) and, asked for
+// slDLSSGSetOptions, hands back its own, so DLSS-G's code is never patched: that is where MFG-Unlocker and others put their jumps (PBZ: a far jump there blocked HSF's patch).
+// If the game's slDLSSGSetOptions still comes back as DLSS-G's own (the interposer asked before HSF's hook was in), HSF patches it as before (InstallFeatureHook).
+// What is handed out is a jump in a code page that outlives HSF: on unload it is pointed at DLSS-G's own function, and the next load takes it back (as with the relays).
+using PluginFunctionFn = void* (*)(const char* name);
+constexpr int PLUGIN_COPIES = 4;
+PluginFunctionFn g_plugin_real[PLUGIN_COPIES] = {};
+HMODULE g_plugin_module[PLUGIN_COPIES] = {};  // under g_lock
+constexpr wchar_t STUB_VARIABLE[] = L"HSF_DLSSG_STUB";
+
+void* PluginFunction(int copy, const char* name);
+template <int N>
+void* HookPluginFunction(const char* name) {
+  return PluginFunction(N, name);
+}
+Hook g_plugin_hooks[PLUGIN_COPIES] = {
+    {"slGetPluginFunction_dlssg0", reinterpret_cast<void*>(&HookPluginFunction<0>), reinterpret_cast<void**>(&g_plugin_real[0])},
+    {"slGetPluginFunction_dlssg1", reinterpret_cast<void*>(&HookPluginFunction<1>), reinterpret_cast<void**>(&g_plugin_real[1])},
+    {"slGetPluginFunction_dlssg2", reinterpret_cast<void*>(&HookPluginFunction<2>), reinterpret_cast<void**>(&g_plugin_real[2])},
+    {"slGetPluginFunction_dlssg3", reinterpret_cast<void*>(&HookPluginFunction<3>), reinterpret_cast<void**>(&g_plugin_real[3])},
+};
+
+bool OptionsPatched() {
+  for (const Hook& hook : g_feature_hooks)
+    if (std::strcmp(hook.name, "slDLSSGSetOptions") == 0) return hook.installed;
+  return false;
+}
+
+// Under g_lock. real is DLSS-G's slDLSSGSetOptions from one copy of the plugin.
+void* HandOutOptions(void* real) {
+  if (g_plugin_route.load() && g_options_stub != nullptr && reinterpret_cast<void*>(g_real_dlssg_options) == real) return g_options_stub;
+  // One at a time: a second copy, or DLSS-G's code is already patched, keeps its own.
+  if (g_plugin_route.load() || OptionsPatched()) return real;
+  uint8_t* const stub = g_options_stub != nullptr ? g_options_stub : NearSlot(static_cast<uint8_t*>(real));
+  if (stub == nullptr) return real;
+  g_real_dlssg_options = reinterpret_cast<SetDlssgOptionsFn>(real);  // ready before any call can arrive
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  if (g_options_stub == nullptr) {
+    WriteAbsoluteJump(stub, reinterpret_cast<const void*>(&HookDlssgOptions));
+    FlushInstructionCache(GetCurrentProcess(), stub, 16);
+  } else {
+    PointRelay(stub, reinterpret_cast<const void*>(&HookDlssgOptions));
+  }
+  g_options_stub = stub;
+  g_plugin_route.store(true);
+  wchar_t value[64];
+  std::swprintf(value, 64, L"%p %p", static_cast<void*>(stub), real);
+  SetEnvironmentVariableW(STUB_VARIABLE, value);
+  Line("DLSS-G's slDLSSGSetOptions (%p) handed to Streamline as HSF's (%p) through the plugin hook: DLSS-G's code is not patched", real, static_cast<void*>(stub));
+  return stub;
+}
+
+void* PluginFunction(int copy, const char* name) {
+  InFlight in_flight;
+  const PluginFunctionFn real = g_plugin_real[copy];
+  void* const function = real != nullptr ? real(name) : nullptr;
+  if (function == nullptr || name == nullptr || std::strcmp(name, "slDLSSGSetOptions") != 0) return function;
+  Lock lock;
+  return HandOutOptions(function);
+}
+
+// An earlier load of HSF handed out the stub: Streamline still calls it, so point it at this load's hook.
+void AdoptOptionsStub() {
+  wchar_t value[64] = L"";
+  if (GetEnvironmentVariableW(STUB_VARIABLE, value, 64) == 0) return;
+  void *stub = nullptr, *real = nullptr;
+  uint8_t head[6];
+  if (swscanf_s(value, L"%p %p", &stub, &real) != 2 || !CodeStillThere(stub) || !CodeStillThere(real) || !SafeCopy(head, stub, sizeof(head))) return;
+  if (head[0] != 0xFF || head[1] != 0x25 || head[2] != 0 || head[3] != 0 || head[4] != 0 || head[5] != 0) return;
+  g_real_dlssg_options = reinterpret_cast<SetDlssgOptionsFn>(real);
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  g_options_stub = static_cast<uint8_t*>(stub);
+  PointRelay(g_options_stub, reinterpret_cast<const void*>(&HookDlssgOptions));
+  g_plugin_route.store(true);
+  Line("DLSS-G's slDLSSGSetOptions: HSF's stub from the last load (%p) taken back", stub);
+}
+
+// Unload: Streamline keeps calling the stub, which now goes straight to DLSS-G.
+void ReleaseOptionsStub() {
+  if (g_options_stub != nullptr && g_real_dlssg_options != nullptr && CodeStillThere(g_options_stub)) PointRelay(g_options_stub, reinterpret_cast<const void*>(g_real_dlssg_options));
+  g_plugin_route.store(false);
+}
+
+bool IsHsfPath(const wchar_t* path) {
+  wchar_t lower[MAX_PATH];
+  wcsncpy_s(lower, path, _TRUNCATE);
+  for (wchar_t* c = lower; *c != 0; ++c) *c = static_cast<wchar_t>(towlower(*c));
+  return std::wcsstr(lower, L"\\hsf_streamline\\") != nullptr;
+}
+
+// DLSS-G's plugin: sl.dlss_g.dll, or a copy NVIDIA puts under its NGX models folder (the NVIDIA App's override, sl_dlss_g_override_0, and NVIDIA's own updates,
+// sl_dlss_g_0), which Streamline loads under a numbered name such as 1B0_E658700.dll (Witcher 3).
+bool IsNgxPluginPath(const wchar_t* path) {
+  wchar_t lower[MAX_PATH];
+  wcsncpy_s(lower, path, _TRUNCATE);
+  for (wchar_t* c = lower; *c != 0; ++c) *c = static_cast<wchar_t>(towlower(*c));
+  return std::wcsstr(lower, L"\\ngx\\models\\sl_dlss_g") != nullptr;
+}
+
+// HSF runs its own Streamline in this process (a game without one): an NGX copy of the plugin may then be HSF's own, so only the game's sl.dlss_g.dll is hooked.
+bool HsfStreamlineLoaded() {
+  HMODULE modules[1024];
+  DWORD bytes = 0;
+  if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes)) return false;
+  const DWORD count = std::min<DWORD>(bytes / sizeof(HMODULE), 1024);
+  for (DWORD m = 0; m < count; ++m) {
+    wchar_t path[MAX_PATH] = L"";
+    if (GetModuleFileNameW(modules[m], path, MAX_PATH) == 0) continue;
+    const wchar_t* const slash = std::wcsrchr(path, L'\\');
+    if (_wcsicmp(slash != nullptr ? slash + 1 : path, L"sl.interposer.dll") == 0 && IsHsfPath(path)) return true;
+  }
+  return false;
+}
+
+// One loaded file is DLSS-G's plugin and the game's: sl.dlss_g.dll outside HSF's folder, or an NGX copy while HSF has no Streamline of its own here.
+bool IsGamePlugin(const wchar_t* path) {
+  const wchar_t* const slash = std::wcsrchr(path, L'\\');
+  if (_wcsicmp(slash != nullptr ? slash + 1 : path, L"sl.dlss_g.dll") == 0) return !IsHsfPath(path);
+  return IsNgxPluginPath(path) && !HsfStreamlineLoaded();
+}
+
+// Under g_lock. One copy of DLSS-G's plugin, not HSF's own.
+void HookPluginCopy(HMODULE module) {
+  if (!safetry::Allowed("H1_plugin")) return;
+  int free_slot = -1;
+  for (int i = 0; i < PLUGIN_COPIES; ++i) {
+    if (g_plugin_module[i] == module) return;
+    if (g_plugin_module[i] == nullptr && free_slot < 0) free_slot = i;
+  }
+  void* const function = reinterpret_cast<void*>(GetProcAddress(module, "slGetPluginFunction"));
+  if (free_slot < 0 || function == nullptr) {
+    static HMODULE s_said = nullptr;
+    if (s_said == module) return;
+    s_said = module;
+    Line("DLSS-G's plugin at %p not hooked: %s", static_cast<void*>(module), free_slot < 0 ? "no free slot (4 copies already)" : "it has no slGetPluginFunction export");
+    return;
+  }
+  g_plugin_module[free_slot] = module;
+  safetry::Begin("H1_plugin");
+  if (Install(g_plugin_hooks[free_slot], static_cast<uint8_t*>(function))) Line("DLSS-G's plugin at %p: its slGetPluginFunction is hooked (copy %d)", static_cast<void*>(module), free_slot);
+}
+
+// Under g_lock: every sl.dlss_g.dll loaded is hooked, and copies that went away are dropped (OTA updates can swap one).
+void ScanPlugins() {
+  HMODULE modules[1024];
+  DWORD bytes = 0;
+  if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes)) return;
+  const DWORD count = std::min<DWORD>(bytes / sizeof(HMODULE), 1024);
+  for (int i = 0; i < PLUGIN_COPIES; ++i) {
+    if (g_plugin_module[i] == nullptr) continue;
+    bool still = false;
+    for (DWORD m = 0; m < count && !still; ++m) still = modules[m] == g_plugin_module[i];
+    if (still) continue;
+    Line("DLSS-G's plugin copy %d (%p) was unloaded: dropped", i, static_cast<void*>(g_plugin_module[i]));
+    if (g_plugin_route.load() && g_real_dlssg_options != nullptr && !CodeStillThere(reinterpret_cast<const void*>(g_real_dlssg_options))) g_plugin_route.store(false);
+    g_plugin_module[i] = nullptr;
+    g_plugin_real[i] = nullptr;
+    g_plugin_hooks[i].installed = false;
+    g_plugin_hooks[i].target = nullptr;
+  }
+  for (DWORD m = 0; m < count; ++m) {
+    wchar_t path[MAX_PATH] = L"";
+    if (GetModuleFileNameW(modules[m], path, MAX_PATH) == 0) continue;
+    const wchar_t* const slash = std::wcsrchr(path, L'\\');
+    const bool named_plugin = _wcsicmp(slash != nullptr ? slash + 1 : path, L"sl.dlss_g.dll") == 0;
+    if (!named_plugin && !IsNgxPluginPath(path)) continue;
+    // Each copy named once in the log.
+    static HMODULE s_named[8] = {};
+    bool known = false;
+    for (HMODULE& named : s_named) {
+      if (named == modules[m]) known = true;
+      else if (named == nullptr && !known) {
+        named = modules[m];
+        break;
+      }
+    }
+    const bool game_plugin = IsGamePlugin(path);
+    if (!known) Line("DLSS-G's plugin loaded at %p: %ls%s", static_cast<void*>(modules[m]), path, game_plugin ? "" : " (may be HSF's own, left alone)");
+    if (game_plugin) HookPluginCopy(modules[m]);
+  }
+}
+
+// ---- Hooking at load time (H2) ----
+// Windows tells HSF when a DLL loads (LdrRegisterDllNotification, no patching), so the game's Streamline and DLSS-G's plugin are hooked before their first call.
+// The once-a-second look in Poll stays as the backup.
+struct LdrString {
+  USHORT length, maximum;
+  PWSTR buffer;
+};
+struct LdrLoaded {
+  ULONG flags;
+  const LdrString* full_name;
+  const LdrString* base_name;
+  PVOID base;
+  ULONG size;
+};
+using LdrCallback = VOID(CALLBACK*)(ULONG reason, const LdrLoaded* data, PVOID context);
+using LdrRegisterFn = LONG(NTAPI*)(ULONG flags, LdrCallback callback, PVOID context, PVOID* cookie);
+using LdrUnregisterFn = LONG(NTAPI*)(PVOID cookie);
+PVOID g_load_cookie = nullptr;
+std::atomic<bool> g_load_seen{false};  // a load the callback could not handle at once: the next Poll looks without waiting
+
+bool NameIs(const LdrString* name, const wchar_t* want) {
+  const size_t chars = std::wcslen(want);
+  return name != nullptr && name->buffer != nullptr && name->length == chars * sizeof(wchar_t) && _wcsnicmp(name->buffer, want, chars) == 0;
+}
+
+VOID CALLBACK OnDllLoad(ULONG reason, const LdrLoaded* data, PVOID) {
+  if (reason != 1 || data == nullptr) return;  // 1: loaded
+  const bool interposer = NameIs(data->base_name, L"sl.interposer.dll");
+  wchar_t path[MAX_PATH] = L"";
+  if (data->full_name != nullptr && data->full_name->buffer != nullptr)
+    wcsncpy_s(path, data->full_name->buffer, std::min<size_t>(data->full_name->length / sizeof(wchar_t), MAX_PATH - 1));
+  const bool plugin = NameIs(data->base_name, L"sl.dlss_g.dll") || IsNgxPluginPath(path);
+  if (!interposer && !plugin) return;
+  // Under the loader lock. A thread holding g_lock may be waiting for the loader lock (GetModuleFileNameW takes it), so only try: if busy, the next Poll does it.
+  if (!TryAcquireSRWLockExclusive(&g_lock)) {
+    g_load_seen.store(true);
+    return;
+  }
+  if (g_started && !IsHsfPath(path)) {
+    const HMODULE module = static_cast<HMODULE>(data->base);
+    if (interposer && g_interposer == nullptr && g_picked == nullptr) {
+      Line("sl.interposer.dll is loading: hooked now (%ls)", path);
+      g_interposer = module;
+      HookInterposer(module);
+    }
+    if (plugin && IsGamePlugin(path)) HookPluginCopy(module);
+  }
+  ReleaseSRWLockExclusive(&g_lock);
+}
+
+// Under g_lock, from Start (DllMain): registering is allowed under the loader lock.
+void WatchLoads() {
+  if (g_load_cookie != nullptr || !safetry::Allowed("H2_load_notify")) return;
+  const auto reg = reinterpret_cast<LdrRegisterFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification"));
+  if (reg == nullptr) return;
+  safetry::Begin("H2_load_notify");
+  const LONG status = reg(0, &OnDllLoad, nullptr, &g_load_cookie);
+  if (status != 0) g_load_cookie = nullptr;
+  Line("DLL load notification: %s", status == 0 ? "on, Streamline is hooked as it loads" : "refused, the once-a-second look finds it");
+}
+
+void UnwatchLoads() {
+  if (g_load_cookie == nullptr) return;
+  const auto unreg = reinterpret_cast<LdrUnregisterFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrUnregisterDllNotification"));
+  if (unreg != nullptr) unreg(g_load_cookie);
+  g_load_cookie = nullptr;
 }
 
 template <typename F>
@@ -1526,6 +1871,50 @@ size_t PrologueLength(const uint8_t* code, size_t min_bytes, size_t* rip_at, siz
   }
   if (at < min_bytes) return 0;  // ended by a jump before there was room for the patch
   if (rip_count != nullptr) *rip_count = rips;
+  return at;
+}
+
+size_t PrologueLengthDecoded(const uint8_t* code, size_t min_bytes, MovedFix* fixes, size_t* fix_count) {
+  size_t at = 0;
+  size_t count = 0;
+  while (at < min_bytes) {
+    hde64s hs;
+    const unsigned int length = hde64_disasm(code + at, &hs);
+    if (length == 0 || (hs.flags & F_ERROR) != 0) return 0;
+    const size_t end = at + length;
+    const uint8_t op = hs.opcode;
+    // A return or a stop before there is room for the patch: the function is too short.
+    if (op == 0xC3 || op == 0xC2 || op == 0xCC) return 0;
+    const bool rip_relative = (hs.flags & F_MODRM) != 0 && hs.modrm_mod == 0 && hs.modrm_rm == 5;
+    if (rip_relative || (hs.flags & F_RELATIVE) != 0) {
+      const bool jump = op == 0xE9;
+      const bool call = op == 0xE8;
+      const bool far_branch = op == 0x0F && hs.opcode2 >= 0x80 && hs.opcode2 <= 0x8F;  // jcc rel32
+      if ((hs.flags & F_RELATIVE) != 0 && !jump && !call && !far_branch) return 0;  // a short branch (rel8) cannot be moved
+      if (count == MAX_RIP_LOADS) return 0;
+      size_t immediate = 0;
+      if (rip_relative) {
+        if (hs.flags & F_IMM8) immediate = 1;
+        else if (hs.flags & F_IMM16) immediate = 2;
+        else if (hs.flags & F_IMM32) immediate = 4;
+        else if (hs.flags & F_IMM64) immediate = 8;
+      }
+      const size_t disp_at = end - 4 - immediate;
+      int32_t displacement;
+      std::memcpy(&displacement, code + disp_at, 4);
+      // A branch back into the bytes being moved would land in the patch.
+      const intptr_t lands = static_cast<intptr_t>(end) + displacement;
+      if (!rip_relative && lands >= 0 && lands < static_cast<intptr_t>(std::max<size_t>(end, min_bytes))) return 0;
+      fixes[count++] = {static_cast<uint8_t>(at), static_cast<uint8_t>(disp_at), static_cast<uint8_t>(end), jump};
+      at = end;
+      if (jump) break;  // nothing after a jump belongs to this path
+      continue;
+    }
+    if (op == 0xEB || (op >= 0x70 && op <= 0x7F) || (op >= 0xE0 && op <= 0xE3)) return 0;
+    at = end;
+  }
+  if (at < min_bytes) return 0;
+  if (fix_count != nullptr) *fix_count = count;
   return at;
 }
 
@@ -1708,6 +2097,9 @@ void Start(const wchar_t* log_path, bool drive, bool dynamic_resolution_known) {
   g_interposer = FindGameInterposer();
   if (g_interposer != nullptr) HookInterposer(g_interposer);
   else Line("sl.interposer.dll not loaded yet");
+  AdoptOptionsStub();
+  ScanPlugins();
+  WatchLoads();
 }
 
 // The lock is not reentrant, so it comes off around the call into Streamline. Call with it held.
@@ -1717,6 +2109,10 @@ static void* AskFor(sl::Feature feature, const char* name) {
   const sl::Result result = g_real_get_function(feature, name, function);
   AcquireSRWLockExclusive(&g_lock);
   if (result != sl::Result::eOk) function = nullptr;
+  if (function != nullptr && function == g_options_stub) {
+    Line("asked Streamline for %s: HSF's own through the plugin hook, DLSS-G's is %p", name, reinterpret_cast<void*>(g_real_dlssg_options));
+    return reinterpret_cast<void*>(g_real_dlssg_options);
+  }
   if (function != nullptr) InstallFeatureHook(name, function);
   Line("asked Streamline for %s: %p result %d", name, function, static_cast<int>(result));
   return function;
@@ -1739,7 +2135,12 @@ static void DriveFrame() {
   if (g_generating.load(std::memory_order_relaxed) && now - s_on_at < ON_SETTLE_MS) gone_ms = ON_SETTLE_MS;
   // With optical motion DLSS-G gets HSF's flow and depth, so the game need not run DLSS at all: with TAA (AC Shadows) there are no evaluates, and
   // waiting for them held generation off although the game sent its constants and HSF tagged every frame.
-  const bool data_flowing = OpticalActive() || GameDataFlowing(now, gone_ms);
+  bool data_flowing = OpticalActive() || GameDataFlowing(now, gone_ms);
+  // Flow fill: the game's vectors stop in menus, and HSF's flow takes over a moment later (SetOptical). Generation stays on across that moment instead of going off
+  // and on, so it never stops while either source comes.
+  if (!data_flowing && g_flow_fill.load(std::memory_order_relaxed) && g_generating.load(std::memory_order_relaxed) &&
+      now - std::max(LastGameData(), g_optical_last.load(std::memory_order_relaxed)) <= FLOW_FILL_MS)
+    data_flowing = true;
   const bool allowed = g_allowed.load(std::memory_order_relaxed);
   // The score judges the game's vectors, which optical motion does not use.
   const bool doubted = g_score_guard.load(std::memory_order_relaxed) && g_vectors_doubted.load(std::memory_order_relaxed) && !OpticalActive();
@@ -1772,7 +2173,7 @@ static void DriveFrame() {
   uint32_t optimal_width = 0, optimal_height = 0;
   {
     OptionsLock options_lock;
-    const SetDlssgOptionsFn send = FeatureHook("slDLSSGSetOptions").installed ? g_real_dlssg_options : g_direct_dlssg_options;
+    const SetDlssgOptionsFn send = FeatureHook("slDLSSGSetOptions").installed || g_plugin_route.load(std::memory_order_relaxed) ? g_real_dlssg_options : g_direct_dlssg_options;
     if (send == nullptr) return;
     alignas(16) unsigned char bytes[OPTIONS_BYTES] = {};
     if (g_have_game_options) std::memcpy(bytes, g_game_options, OPTIONS_BYTES);
@@ -1848,6 +2249,7 @@ void Rescan() {
       if (function != nullptr) Install(hook, static_cast<uint8_t*>(function));
     }
   }
+  ScanPlugins();
   g_asked_features = false;
   g_next_ask = 0;
   g_next_poll = 0;
@@ -1858,7 +2260,9 @@ void Poll() {
     DriveFrame();
     ResendReflex();
   }
+  safetry::Tick();
   const ULONGLONG now = GetTickCount64();
+  if (g_load_seen.exchange(false)) g_next_poll = 0;  // a load the notification could not handle
   // Only this thread's frame loop calls Poll, so the rate limit needs no lock.
   if (now < g_next_poll) return;
   g_next_poll = now + 1000;
@@ -1866,6 +2270,7 @@ void Poll() {
     Lock lock;
     if (!g_started) return;
     Summary();
+    ScanPlugins();
     const HMODULE module = FindGameInterposer();
     if (module != g_interposer) {
       Line("sl.interposer.dll changed: %p to %p", g_interposer, module);
@@ -1995,6 +2400,19 @@ void SetOptical(bool on) {
   }
 }
 
+void SetOpticalJitter(const float jitter[2], bool jittered, bool reset) {
+  g_optical_jitter_x.store(jitter[0], std::memory_order_relaxed);
+  g_optical_jitter_y.store(jitter[1], std::memory_order_relaxed);
+  g_optical_jittered.store(jittered, std::memory_order_relaxed);
+  if (reset) g_optical_reset.store(true, std::memory_order_relaxed);
+}
+
+void SetFlowFill(bool on) {
+  if (g_flow_fill.exchange(on, std::memory_order_relaxed) == on) return;
+  Lock lock;
+  Line("flow fills gaps in the game's vectors: %s", on ? "on" : "off");
+}
+
 void SetReflex(uint32_t fps_cap, bool boost) {
   g_cap_fps.store(fps_cap, std::memory_order_relaxed);
   g_reflex_boost.store(boost, std::memory_order_relaxed);
@@ -2013,8 +2431,9 @@ void SendOwnConstants(const uint32_t extent[4], const float scale[2], bool dilat
   const uint32_t index = SafeToken(frame);
   if (index == UINT32_MAX || s_last_index.exchange(index, std::memory_order_relaxed) == index) return;
   static std::atomic<ULONGLONG> s_last_sent{0};
-  // After a gap nothing moved from anywhere.
-  const bool reset = now - s_last_sent.exchange(now, std::memory_order_relaxed) > EVALUATE_GONE_MS;
+  // After a gap nothing moved from anywhere. The game's DLSS data through NGX also brings its own reset.
+  const bool gap = now - s_last_sent.exchange(now, std::memory_order_relaxed) > EVALUATE_GONE_MS;
+  const bool reset = g_optical_reset.exchange(false, std::memory_order_relaxed) || gap;
   sl::float4x4 identity{};
   identity.setRow(0, {1, 0, 0, 0});
   identity.setRow(1, {0, 1, 0, 0});
@@ -2022,7 +2441,7 @@ void SendOwnConstants(const uint32_t extent[4], const float scale[2], bool dilat
   identity.setRow(3, {0, 0, 0, 1});
   sl::Constants c{};
   c.cameraViewToClip = c.clipToCameraView = c.clipToLensClip = c.clipToPrevClip = c.prevClipToClip = identity;
-  c.jitterOffset = {0.0f, 0.0f};
+  c.jitterOffset = {g_optical_jitter_x.load(std::memory_order_relaxed), g_optical_jitter_y.load(std::memory_order_relaxed)};
   c.mvecScale = {scale[0], scale[1]};
   c.cameraPinholeOffset = {0, 0};
   c.cameraPos = {0, 0, 0};
@@ -2038,7 +2457,7 @@ void SendOwnConstants(const uint32_t extent[4], const float scale[2], bool dilat
   c.motionVectors3D = sl::Boolean::eFalse;
   c.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
   c.motionVectorsDilated = dilated ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-  c.motionVectorsJittered = sl::Boolean::eFalse;
+  c.motionVectorsJittered = g_optical_jittered.load(std::memory_order_relaxed) ? sl::Boolean::eTrue : sl::Boolean::eFalse;
   const sl::ViewportHandle viewport(g_viewport.load(std::memory_order_relaxed));
   // Straight to Streamline, not through HookConstants, so these never count as the game's.
   const sl::Result result = g_real_constants(c, *frame, viewport);
@@ -2168,7 +2587,7 @@ void Stop(bool process_exiting) {
   if (!process_exiting && g_drive.load() && g_generating.load()) {
     OptionsLock options_lock;
     const Hook& hook = FeatureHook("slDLSSGSetOptions");
-    if (hook.installed && CodeStillThere(hook.target)) {
+    if ((hook.installed && CodeStillThere(hook.target)) || (g_plugin_route.load() && g_real_dlssg_options != nullptr && CodeStillThere(reinterpret_cast<const void*>(g_real_dlssg_options)))) {
       alignas(16) unsigned char bytes[OPTIONS_BYTES] = {};
       if (g_have_game_options) std::memcpy(bytes, g_game_options, OPTIONS_BYTES);
       else new (bytes) sl::DLSSGOptions{};
@@ -2180,6 +2599,7 @@ void Stop(bool process_exiting) {
   }
   g_drive.store(false);
   g_vectors_hook.store(nullptr, std::memory_order_release);
+  UnwatchLoads();
   {
     Lock lock;
     if (!g_started) return;
@@ -2187,6 +2607,11 @@ void Stop(bool process_exiting) {
       Line("=== process exiting ===");
     } else {
       ForEachHook([](Hook& hook) { Remove(hook); });
+      for (int i = 0; i < PLUGIN_COPIES; ++i) {
+        Remove(g_plugin_hooks[i]);
+        g_plugin_module[i] = nullptr;
+      }
+      ReleaseOptionsStub();
       Line("=== stopped: add-on unloading, game's bytes put back ===");
     }
     g_started = false;

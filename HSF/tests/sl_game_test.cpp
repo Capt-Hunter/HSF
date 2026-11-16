@@ -329,7 +329,9 @@ void TestDrive(sl::Result (*set_loaded)(sl::Feature, bool), EvaluateFn evaluate,
   hsf::slgame::Poll();
   Check(g_fake_mode == sl::DLSSGMode::eOn && g_fake_frames == 2, "drive: then on with the new count, on the next frame");
 
-  // Quick off: a gap much shorter than EVALUATE_GONE_MS stops generation, only with the option on.
+  // Quick off: a gap much shorter than EVALUATE_GONE_MS stops generation, only with the option on. Not in the first second after generation went on
+  // (ON_SETTLE_MS: DLSS-G starting up stalls the game's frames), so that second passes first.
+  Sleep(1100);
   for (uint32_t i = 0; i < 12; ++i) evaluate(sl::kFeatureDLSS, token, inputs, 3, reinterpret_cast<sl::CommandBuffer*>(list.Get()));
   Sleep(100);
   hsf::slgame::Poll();
@@ -435,7 +437,7 @@ void TestDrive(sl::Result (*set_loaded)(sl::Feature, bool), EvaluateFn evaluate,
     Check(s_seen == 1 && s_motion == texture && s_state == static_cast<uint32_t>(D3D12_RESOURCE_STATE_UNORDERED_ACCESS) && s_extent[2] == desc.Width && s_extent[3] == desc.Height, "drive: the checks get each frame's vectors once, with state and size");
   }
 
-  Sleep(400);  // past EVALUATE_GONE_MS: a menu
+  Sleep(1100);  // past EVALUATE_GONE_MS (a menu), and past the second after generation last went on
   hsf::slgame::Poll();
   Check(g_fake_mode == sl::DLSSGMode::eOff, "drive: evaluates stopping means off");
   evaluate(sl::kFeatureDLSS, token, inputs, 3, reinterpret_cast<sl::CommandBuffer*>(list.Get()));
