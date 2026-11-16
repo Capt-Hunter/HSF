@@ -5,6 +5,7 @@
 #include <d3dcompiler.h>
 
 #include <cstring>
+#include <iterator>
 
 namespace hsf::hud {
 
@@ -156,6 +157,7 @@ ID3D11Texture2D* Remover::Make(ID3D11DeviceContext* context, ID3D11Texture2D* fi
     SavedComputeState saved(context);
     ID3D11ShaderResourceView* const srv[3] = {finished_srv_.Get(), at_effects_srv_.Get(), before_srv_.Get()};
     ID3D11UnorderedAccessView* const uav[2] = {out_uav_.Get(), count_uav_.Get()};
+    static_assert(std::size(srv) <= SavedComputeState::VIEWS && std::size(uav) <= SavedComputeState::OUTPUTS);
     context->CSSetShader(shader_.Get(), nullptr, 0);
     context->CSSetShaderResources(0, 3, srv);
     context->CSSetUnorderedAccessViews(0, 2, uav, nullptr);

@@ -1,6 +1,8 @@
 // See sl_game.h. Hooks are written here, in HSF's own code: a 5-byte jump at the start of each function goes to a relay in a page HSF allocates near the module, which
 // jumps to the hook; the hook calls a trampoline holding the moved prologue, which jumps back. Anything unexpected at a function's start means no hook there, only a log line.
 #include "sl_game.h"
+#include "version.h"
+#include "motion_timing.h"
 
 #include "hook_patch.h"
 #include "safe_try.h"
@@ -416,9 +418,9 @@ std::atomic<bool> g_optical_dilated{false};
 // The game's DLSS data through NGX goes the optical way too, with its own jitter and reset (SetOpticalJitter). All zero for flow.
 std::atomic<float> g_optical_jitter_x{0.0f}, g_optical_jitter_y{0.0f};
 std::atomic<bool> g_optical_jittered{false}, g_optical_reset{false};
-constexpr ULONGLONG OPTICAL_GONE_MS = 300;
+constexpr ULONGLONG OPTICAL_GONE_MS = motiontiming::OPTICAL_GONE_MS;
 std::atomic<bool> g_flow_fill{false};
-constexpr ULONGLONG FLOW_FILL_MS = 3000;  // with flow fill on, generation stops only when neither the game's data nor HSF's flow came for this long
+constexpr ULONGLONG FLOW_FILL_MS = motiontiming::FLOW_FILL_MS;  // with flow fill on, generation stops only when neither the game's data nor HSF's flow came for this long
 bool OpticalActive() { return g_optical.load(std::memory_order_relaxed) && GetTickCount64() - g_optical_last.load(std::memory_order_relaxed) <= OPTICAL_GONE_MS; }
 std::atomic<uint32_t> g_cap_fps{0};
 std::atomic<bool> g_reflex_boost{false};
@@ -459,8 +461,8 @@ std::atomic<bool> g_token_pick_highest{false};
 std::atomic<ULONGLONG> g_own_constants_last{0};
 
 // Generation needs vectors and depth, which come with evaluate calls, or with the game's own tags for DLSS-G. Menus have none, so generation waits for a run of them and stops when they stop.
-constexpr ULONGLONG EVALUATE_GONE_MS = 250;
-constexpr ULONGLONG ON_SETTLE_MS = 1000;  // after generation goes on, quick off waits this long (DriveFrame)
+constexpr ULONGLONG EVALUATE_GONE_MS = motiontiming::EVALUATE_GONE_MS;
+constexpr ULONGLONG ON_SETTLE_MS = motiontiming::ON_SETTLE_MS;  // after generation goes on, quick off waits this long (DriveFrame)
 constexpr uint32_t EVALUATE_STREAK_TO_START = 10;
 constexpr float QUICK_OFF_GAPS = 3.0f, QUICK_OFF_LEAST_MS = 50.0f;
 
@@ -1685,7 +1687,7 @@ void Start(const wchar_t* log_path, bool drive, bool dynamic_resolution_known) {
   if (g_file != nullptr) std::setvbuf(g_file, nullptr, _IOFBF, 8192);
   wchar_t exe[MAX_PATH] = L"?";
   GetModuleFileNameW(nullptr, exe, MAX_PATH);
-  Line("=== HSF started in %ls. %s ===", exe, drive ? "Driving DLSS-G inside the game." : "Only logging: every call goes on unchanged.");
+  Line("=== HSF %s started in %ls. %s ===", HSF_VERSION, exe, drive ? "Driving DLSS-G inside the game." : "Only logging: every call goes on unchanged.");
   g_interposer = FindGameInterposer();
   if (g_interposer != nullptr) HookInterposer(g_interposer);
   else Line("sl.interposer.dll not loaded yet");

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <iterator>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -189,8 +190,6 @@ uint32_t g_flat_hold = 0;  // SetFlatHold
 uint32_t g_reads = 0;      // Reads
 int g_upside_down_setting = -1;
 bool g_fit_picture = false;
-// Shapes closer than this are the same shape: a depth buffer a few rows taller than the picture (1088 for 1080) is stretched, not fitted.
-constexpr float SAME_SHAPE = 0.03f;
 char g_problem[200] = "";
 
 void SetProblem(const char* text, HRESULT hr = S_OK) {
@@ -389,6 +388,7 @@ void MeasureEdges(ID3D11Texture2D* picture) {
   ID3D11Buffer* const constants = g_s.edge_constants.Get();
   ID3D11ShaderResourceView* const views[] = {g_s.copy_srv.Get(), g_s.picture_srv.Get()};
   ID3D11UnorderedAccessView* const target = g_s.cells_uav.Get();
+  static_assert(std::size(views) <= SavedComputeState::VIEWS);
   g_s.context->CSSetShader(g_s.edge_shader.Get(), nullptr, 0);
   g_s.context->CSSetConstantBuffers(0, 1, &constants);
   g_s.context->CSSetShaderResources(0, 2, views);

@@ -23,23 +23,30 @@ inline DXGI_FORMAT ReadFormat(DXGI_FORMAT format) {
   }
 }
 
-// The game's compute state, put back after HSF's dispatches.
+// The game's compute state, put back after HSF's dispatches. Only the first VIEWS views, OUTPUTS outputs, BUFFERS constant buffers and
+// SAMPLERS samplers are saved: a dispatch that binds more would leave the game's state changed. Callers check their counts against these.
 class SavedComputeState {
  public:
+  static constexpr UINT VIEWS = 3;
+  static constexpr UINT OUTPUTS = 4;
+  static constexpr UINT BUFFERS = 1;
+  static constexpr UINT SAMPLERS = 2;
+
   explicit SavedComputeState(ID3D11DeviceContext* context) : context_(context) {
     context_->CSGetShader(&shader_, instances_, &instance_count_);
-    context_->CSGetShaderResources(0, 3, srv_);
-    context_->CSGetUnorderedAccessViews(0, 4, uav_);
-    context_->CSGetConstantBuffers(0, 1, &constants_);
-    context_->CSGetSamplers(0, 2, samplers_);
+    context_->CSGetShaderResources(0, VIEWS, srv_);
+    context_->CSGetUnorderedAccessViews(0, OUTPUTS, uav_);
+    context_->CSGetConstantBuffers(0, BUFFERS, constants_);
+    context_->CSGetSamplers(0, SAMPLERS, samplers_);
   }
   ~SavedComputeState() {
     context_->CSSetShader(shader_, instances_, instance_count_);
-    context_->CSSetShaderResources(0, 3, srv_);
-    const UINT keep[4] = {static_cast<UINT>(-1), static_cast<UINT>(-1), static_cast<UINT>(-1), static_cast<UINT>(-1)};
-    context_->CSSetUnorderedAccessViews(0, 4, uav_, keep);
-    context_->CSSetConstantBuffers(0, 1, &constants_);
-    context_->CSSetSamplers(0, 2, samplers_);
+    context_->CSSetShaderResources(0, VIEWS, srv_);
+    UINT keep[OUTPUTS];
+    for (UINT& k : keep) k = static_cast<UINT>(-1);
+    context_->CSSetUnorderedAccessViews(0, OUTPUTS, uav_, keep);
+    context_->CSSetConstantBuffers(0, BUFFERS, constants_);
+    context_->CSSetSamplers(0, SAMPLERS, samplers_);
     if (shader_ != nullptr) shader_->Release();
     for (UINT i = 0; i < instance_count_; ++i)
       if (instances_[i] != nullptr) instances_[i]->Release();
@@ -47,7 +54,8 @@ class SavedComputeState {
       if (view != nullptr) view->Release();
     for (auto* view : uav_)
       if (view != nullptr) view->Release();
-    if (constants_ != nullptr) constants_->Release();
+    for (auto* buffer : constants_)
+      if (buffer != nullptr) buffer->Release();
     for (auto* sampler : samplers_)
       if (sampler != nullptr) sampler->Release();
   }
@@ -59,10 +67,10 @@ class SavedComputeState {
   ID3D11ComputeShader* shader_ = nullptr;
   ID3D11ClassInstance* instances_[256] = {};
   UINT instance_count_ = 256;
-  ID3D11ShaderResourceView* srv_[3] = {};
-  ID3D11UnorderedAccessView* uav_[4] = {};
-  ID3D11Buffer* constants_ = nullptr;
-  ID3D11SamplerState* samplers_[2] = {};
+  ID3D11ShaderResourceView* srv_[VIEWS] = {};
+  ID3D11UnorderedAccessView* uav_[OUTPUTS] = {};
+  ID3D11Buffer* constants_[BUFFERS] = {};
+  ID3D11SamplerState* samplers_[SAMPLERS] = {};
 };
 
 }  // namespace hsf

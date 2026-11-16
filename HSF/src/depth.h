@@ -11,6 +11,10 @@
 
 namespace hsf::depth {
 
+// Shapes closer than this are the same shape: a depth buffer a few rows taller than the picture (1088 for 1080) is stretched, not fitted.
+// Used by depth.cpp's fit and by the add-on's depth fit for HSF.fx; one number, so both always agree.
+constexpr float SAME_SHAPE = 0.03f;
+
 struct Status {
   bool source = false;    // the game's depth buffer is there
   UINT width = 0, height = 0, samples = 0;  // the game's depth buffer

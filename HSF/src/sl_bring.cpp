@@ -1,5 +1,6 @@
 // See sl_bring.h. Streamline is loaded by hand and its calls looked up by name, so the add-on keeps loading in games and folders that have none.
 #include "sl_bring.h"
+#include "version.h"
 
 #include <windows.h>
 #include <d3d12.h>
@@ -1315,6 +1316,7 @@ void Start(const wchar_t* log_path, const wchar_t* folder, const StartOptions& o
   g_log_path = log_path;
   g_folder = folder;
   g_start_options = options;
+  Line("HSF %s", HSF_VERSION);
   // RenoDX DLSS decides when it starts whether to hook Streamline's Present or ReShade's, and ReShade starts it right after HSF. With ReShade's, DLSS-G showed no frames
   // in Jusant. Loading the DLL does not start Streamline: slInit still waits for the first device. HSF's reference is kept for the life of the process.
   if (options.early_load && GetModuleHandleW(L"sl.interposer.dll") == nullptr) {

@@ -1,6 +1,7 @@
 #include "score.h"
 
 #include "compute_state.h"
+#include "score_limits.h"
 
 #include <d3dcompiler.h>
 #include <windows.h>
@@ -10,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -18,19 +20,19 @@ namespace hsf::score {
 namespace {
 
 // Grid width in cells; the height follows the frame's shape. 240 x 135 patches of 9 samples, a few times a second, is a very small GPU cost.
-constexpr UINT GRID_WIDTH = 240;
+constexpr UINT GRID_WIDTH = scorelimits::GRID_WIDTH;
 constexpr size_t HISTORY = 128;
 // A patch counts as changed from about 2 levels in 255: below that it is noise and dither.
-constexpr float MOVING_ERROR = 2.f / 255.f;
+constexpr float MOVING_ERROR = scorelimits::MOVING_ERROR;
 // "Clearly" better or worse: 10% either way.
-constexpr float CLEARLY = 0.1f;
+constexpr float CLEARLY = scorelimits::CLEARLY;
 // Fewer changed patches than this: the frames are the same picture, nothing to rate.
-constexpr float STILL_SHARE = 0.01f;
+constexpr float STILL_SHARE = scorelimits::STILL_SHARE;
 // A cut: the two frames' brightness histograms differ by over this share of the picture, and the motion explains little of the change. A pan or bad
 // motion vectors leave the histogram about the same, so they are rated and not excused as cuts. Both are first guesses, to tune in play.
-constexpr int HISTOGRAM_BINS = 32;
-constexpr float CUT_HISTOGRAM = 0.35f;
-constexpr float CUT_GAIN = 0.2f;
+constexpr int HISTOGRAM_BINS = scorelimits::HISTOGRAM_BINS;
+constexpr float CUT_HISTOGRAM = scorelimits::CUT_HISTOGRAM;
+constexpr float CUT_GAIN = scorelimits::CUT_GAIN;
 // Fewer pairs or less of the picture changing than this in a window: shown as too little to rate.
 constexpr uint32_t MIN_PAIRS = 3;
 constexpr float MIN_MOVING = 0.1f;
@@ -288,6 +290,7 @@ bool MakeSlot(Slot& slot, ID3D11Texture2D* motion) {
 void Measure(const Input* inputs) {
   SavedComputeState saved(g_s.context.Get());
   ID3D11SamplerState* const samplers[] = {g_s.linear.Get(), g_s.point.Get()};
+  static_assert(std::size(samplers) <= SavedComputeState::SAMPLERS);
   g_s.context->CSSetShader(g_s.shader.Get(), nullptr, 0);
   g_s.context->CSSetSamplers(0, 2, samplers);
   ID3D11Buffer* const constants = g_s.constants.Get();
@@ -305,6 +308,7 @@ void Measure(const Input* inputs) {
     g_s.context->UpdateSubresource(g_s.constants.Get(), 0, nullptr, &values, 0, 0);
     ID3D11ShaderResourceView* const views[] = {g_s.before_srv.Get(), g_s.after_srv.Get(), slot.motion_srv.Get()};
     ID3D11UnorderedAccessView* const targets[] = {slot.cells_uav.Get(), slot.view_uav[0].Get(), slot.view_uav[1].Get(), slot.view_uav[2].Get()};
+    static_assert(std::size(views) <= SavedComputeState::VIEWS && std::size(targets) <= SavedComputeState::OUTPUTS);
     g_s.context->CSSetShaderResources(0, 3, views);
     g_s.context->CSSetUnorderedAccessViews(0, 4, targets, nullptr);
     g_s.context->Dispatch((g_s.grid_width + 7) / 8, (g_s.grid_height + 7) / 8, 1);

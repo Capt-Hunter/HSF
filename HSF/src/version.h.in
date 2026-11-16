@@ -1,0 +1,4 @@
+// Made by CMake from version.h.in (project VERSION in CMakeLists.txt). Do not edit the generated copy.
+#pragma once
+
+#define HSF_VERSION "@PROJECT_VERSION@"

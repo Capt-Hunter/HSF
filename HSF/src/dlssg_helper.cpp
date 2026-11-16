@@ -10,6 +10,7 @@
 
 #include "dlssg_core.h"
 #include "dlssg_link.h"
+#include "version.h"
 
 #include <windows.h>
 
@@ -362,7 +363,7 @@ int wmain(int argc, wchar_t** argv) {
   g_record_folder = g_folder.substr(0, g_folder.find_last_of(L'\\')) + L"\\HSF_recordings";  // beside this exe's folder, in the game's
   // Appended, shared: a stopping helper and the next one can overlap (the add-on starts the file fresh once per game run).
   core::OpenLog((g_folder + L"\\hsf_dlssg.log").c_str(), L"a", _SH_DENYNO);
-  Log("HSF DLSS-G helper (64-bit), pid %lu", GetCurrentProcessId());
+  Log("HSF DLSS-G helper " HSF_VERSION " (64-bit), pid %lu", GetCurrentProcessId());
   const bool system_dxgi = LoadSystemGraphicsDlls();
   if (argc < 2) {
     Log("no shared block named on the command line");

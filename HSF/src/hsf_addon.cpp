@@ -11,6 +11,8 @@
 #include <reshade.hpp>
 
 #include "camera_record.h"
+#include "version.h"
+#include "motion_timing.h"
 #include "dlssg.h"
 #include "dlssg_link.h"
 #include "dx9_bridge.h"
@@ -33,6 +35,7 @@
 #include "ngx_input.h"
 #include "frame_checks.h"
 #include "sl_game.h"
+#include <sl_core_types.h>  // Streamline's feature and result numbers (GameStreamlineStarted)
 #endif
 
 #include <d3d11.h>
@@ -52,6 +55,7 @@
 #include <functional>
 #include <new>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -96,13 +100,16 @@ struct Source {
   const char* names[2];  // texture variable names, tried in order
   int convention;
 };
-const Source SOURCES[] = {
+constexpr Source SOURCES[] = {
     // Delta UV from this frame to the previous one, full size. LaunchPad computes it only when an effect asks (HSF.fx does, see EnableRequest).
     {"launchpad", "iMMERSE LaunchPad optical flow", {"Deferred::MotionVectorsTex", "MotionVectorsTex"}, 1},
     // Delta UV, this frame to the previous one, at 1/8 size (LumeniteFX's own effects fetch the previous frame at uv + flow).
     {"lumenite", "LumeniteFX Kernel optical flow", {"Kernel::tFlow", "tFlow"}, 1},
 };
-constexpr int SOURCE_COUNT = 2;
+constexpr int SOURCE_COUNT = static_cast<int>(std::size(SOURCES));
+// The sources by name, as indexes into SOURCES (g_seen.source). Checked below, so a new source cannot shift what they mean.
+enum SourceIndex : int { SOURCE_LAUNCHPAD = 0, SOURCE_LUMENITE = 1 };
+static_assert(std::string_view(SOURCES[SOURCE_LAUNCHPAD].key) == "launchpad" && std::string_view(SOURCES[SOURCE_LUMENITE].key) == "lumenite");
 // HSF.ini Source= and the panel: 0 = auto (the first of SOURCES that is there), i + 1 = SOURCES[i].
 const char* const SOURCE_NAMES[] = {"auto", "launchpad", "lumenite"};
 int g_source_setting = 0;
@@ -161,6 +168,8 @@ uint32_t g_fps_cap = 0;
 // The FPS cap's range when one is set: below 30 on screen frame generation has too little to work with; 1000 is the most HSF.ini ever held.
 constexpr uint32_t FPS_CAP_MIN = 30;
 constexpr uint32_t FPS_CAP_MAX = 1000;
+// The FPS cap bar stops here; higher caps (up to FPS_CAP_MAX) are typed by hand. A bar needs a limit (Hunter).
+constexpr int FPS_CAP_BAR_MAX = 360;
 bool g_cap_wheel_used = false;  // the menu's mouse wheel went to the FPS cap this frame, not to scrolling the menu
 // Every way of setting the cap (menu bar, typed number, mouse wheel, HSF.ini) goes through this: 0 or less is no cap, anything else is kept in range.
 uint32_t CapRule(long long value) {
@@ -928,7 +937,7 @@ int Convention() {
 // source it is switched on here (it costs nothing otherwise, but is left as the user set it).
 void EnableRequest(effect_runtime* runtime) {
   static bool warned = false;
-  if (g_seen.source != 0) return;
+  if (g_seen.source != SOURCE_LAUNCHPAD) return;
   const effect_technique request = runtime->find_technique("HSF.fx", "HSF_Motion");
   if (request.handle == 0) {
     if (!warned) Log("HSF.fx (technique HSF_Motion) is not loaded: LaunchPad computes its optical flow only while another effect asks for it");
@@ -2083,11 +2092,11 @@ void FitDepthCopy(effect_runtime* runtime) {
   float want[4] = {0.f, 0.f, 1.f, 1.f};
   uint32_t width = 0, height = 0;
   if (BoundDepthSize(runtime, width, height)) {
-    // Shapes closer than 3% are the same shape: a depth buffer a few rows taller than the picture (1088 for 1080) is stretched, as before.
+    // Shapes closer than SAME_SHAPE (3%) are the same shape: a depth buffer a few rows taller than the picture (1088 for 1080) is stretched, as before.
     const float shape = (static_cast<float>(width) / height) / (static_cast<float>(g_seen.width) / g_seen.height);
-    if (shape < 0.97f)
+    if (shape < 1.f - hsf::depth::SAME_SHAPE)
       want[2] = shape;  // bars at the sides
-    else if (shape > 1.03f)
+    else if (shape > 1.f + hsf::depth::SAME_SHAPE)
       want[3] = 1.f / shape;  // bars above and below
     want[0] = (1.f - want[2]) * 0.5f;
     want[1] = (1.f - want[3]) * 0.5f;
@@ -2148,7 +2157,7 @@ void PinDepthSize(effect_runtime* runtime) {
     return;
   }
   const float shape = bound && height != 0 ? (static_cast<float>(width) / height) / (static_cast<float>(g_seen.width) / g_seen.height) : 1.f;
-  if (!bound || width == height || (shape >= 0.97f && shape <= 1.03f)) {
+  if (!bound || width == height || (shape >= 1.f - hsf::depth::SAME_SHAPE && shape <= 1.f + hsf::depth::SAME_SHAPE)) {
     seen_width = seen_height = 0;
     return;
   }
@@ -2373,7 +2382,7 @@ void UpdateDlssgMotionScale() {
 // keep reading the flow.
 // Whether the game's DLSS data counts as coming, held: a change between it and the flow has to last SOURCE_HOLD_MS. So the data is kept over short gaps (a game that
 // presents more often than it runs DLSS, a hitch), and comes back only once it keeps coming, rather than the source flapping several times a second.
-constexpr ULONGLONG SOURCE_HOLD_MS = 1000;
+constexpr ULONGLONG SOURCE_HOLD_MS = hsf::motiontiming::SOURCE_HOLD_MS;
 struct SourceHold {
   bool dlss = false;
   ULONGLONG since = 0;  // when what comes first differed from the source in use
@@ -2544,13 +2553,24 @@ bool GameStreamlineStarted() {
   using IsFeatureLoadedFn = int (*)(uint32_t, bool&);
   const auto is_loaded = reinterpret_cast<IsFeatureLoadedFn>(GetProcAddress(module, "slIsFeatureLoaded"));
   if (is_loaded == nullptr) return true;
-  constexpr uint32_t FEATURE_DLSS_G = 1000;      // sl::kFeatureDLSS_G
-  constexpr int NOT_INITIALIZED = 21, INIT_NOT_CALLED = 23;  // sl::Result::eErrorNotInitialized, eErrorInitNotCalled
   bool loaded = false;
-  const int result = is_loaded(FEATURE_DLSS_G, loaded);
-  return result != NOT_INITIALIZED && result != INIT_NOT_CALLED;
+  const int result = is_loaded(sl::kFeatureDLSS_G, loaded);
+  return result != static_cast<int>(sl::Result::eErrorNotInitialized) && result != static_cast<int>(sl::Result::eErrorInitNotCalled);
 }
 #endif
+
+// A D3D12 route switch in HSF.ini (SlBringIn, InGameDlssg). unset: the key is not there; on: 1 (or any other value above 0), set by hand or by an
+// installer; by_hsf: 2, written by PickD3d12Route or LeaveUnstartedStreamline, which LeaveAutoD3d12Route may take back.
+enum class Route { unset, off, on, by_hsf };
+Route ReadRoute(const wchar_t* key) {
+  const int value = GetPrivateProfileIntW(L"HSF", key, -1, g_ini_path);
+  if (value < 0) return Route::unset;
+  if (value == 0) return Route::off;
+  return value == 2 ? Route::by_hsf : Route::on;
+}
+bool RouteOn(Route route) { return route == Route::on || route == Route::by_hsf; }
+// Writes HSF's own value (2), or removes the key for Route::unset. Only these two are ever written.
+void WriteRoute(const wchar_t* key, Route route) { WritePrivateProfileStringW(L"HSF", key, route == Route::by_hsf ? L"2" : nullptr, g_ini_path); }
 
 // A D3D12 game with neither D3D12 route on in HSF.ini. Both routes must start when HSF loads, before the game makes its device, so HSF picks one now, writes it
 // to HSF.ini and asks for one restart (without it, FF7R in DX12 showed "only Direct3D 11 and DX9" with no way on). A game with its own Streamline gets
@@ -2563,19 +2583,17 @@ void PickD3d12Route() {
   const uint32_t d3d12 = g_d3d12_frames.load(std::memory_order_relaxed);
   if (d3d12 < ROUTE_DECIDE_FRAMES || d3d12 <= g_d3d11_frames.load(std::memory_order_relaxed)) return;
   g_route_decided = true;
-  const int bring = GetPrivateProfileIntW(L"HSF", L"SlBringIn", -1, g_ini_path);
-  const int drive = GetPrivateProfileIntW(L"HSF", L"InGameDlssg", -1, g_ini_path);
-  if (bring == 0 || drive == 0) {
+  if (ReadRoute(L"SlBringIn") == Route::off || ReadRoute(L"InGameDlssg") == Route::off) {
     Note("D3D12: HSF's D3D12 routes are off in HSF.ini (SlBringIn=0 or InGameDlssg=0)");
     return;
   }
   if (GameStreamlineStarted()) {
-    WritePrivateProfileStringW(L"HSF", L"InGameDlssg", L"2", g_ini_path);
+    WriteRoute(L"InGameDlssg", Route::by_hsf);
     Log("route: a D3D12 game with its own Streamline: InGameDlssg=2 written, it starts at the next launch");
   } else {
     if (GetModuleHandleW(L"sl.interposer.dll") != nullptr)
       Log("route: sl.interposer.dll is loaded but the game never started it (a stray copy in the game folder?), so HSF brings its own Streamline");
-    WritePrivateProfileStringW(L"HSF", L"SlBringIn", L"2", g_ini_path);
+    WriteRoute(L"SlBringIn", Route::by_hsf);
     Log("route: a D3D12 game with no Streamline: SlBringIn=2 written (HSF brings Streamline), it starts at the next launch");
     // A game that runs DLSS itself, through NGX: Streamline must be told where its nvngx_dlss.dll is, or the game loses DLSS (see sl_bring's FindGameDlssFolder)
     if (const HMODULE dlss = GetModuleHandleW(L"nvngx_dlss.dll")) {
@@ -2603,8 +2621,8 @@ void LeaveUnstartedStreamline() {
   if (s_done || !D3d12Run() || g_d3d12_frames.load(std::memory_order_relaxed) < ROUTE_DECIDE_FRAMES) return;
   s_done = true;
   if (GameStreamlineStarted() || hsf::slgame::GameFrames() != 0 || hsf::slgame::GetStats().have_options) return;
-  WritePrivateProfileStringW(L"HSF", L"InGameDlssg", nullptr, g_ini_path);
-  if (GetPrivateProfileIntW(L"HSF", L"SlBringIn", -1, g_ini_path) != 0) WritePrivateProfileStringW(L"HSF", L"SlBringIn", L"2", g_ini_path);
+  WriteRoute(L"InGameDlssg", Route::unset);
+  if (ReadRoute(L"SlBringIn") != Route::off) WriteRoute(L"SlBringIn", Route::by_hsf);
   Log("route: the game never started its sl.interposer.dll (a stray copy in the game folder?), so the in-game route can do nothing; SlBringIn=2 written, HSF brings its own Streamline from the next launch");
   g_drive_left = true;
 }
@@ -2618,13 +2636,12 @@ void LeaveAutoD3d12Route() {
   const uint32_t d3d11 = g_d3d11_frames.load(std::memory_order_relaxed);
   if (d3d11 < ROUTE_DECIDE_FRAMES || d3d11 <= g_d3d12_frames.load(std::memory_order_relaxed)) return;
   g_route_decided = true;
-  if (GetPrivateProfileIntW(L"HSF", L"SlBringIn", 0, g_ini_path) == 2) {
-    WritePrivateProfileStringW(L"HSF", L"SlBringIn", nullptr, g_ini_path);
+  if (ReadRoute(L"SlBringIn") == Route::by_hsf) {
+    WriteRoute(L"SlBringIn", Route::unset);
     Log("route: this run is D3D11, so the D3D12 route HSF set up (SlBringIn=2) is off again from the next launch");
   }
-  const int drive = GetPrivateProfileIntW(L"HSF", L"InGameDlssg", 0, g_ini_path);
-  if (drive == 1 || drive == 2) {
-    WritePrivateProfileStringW(L"HSF", L"InGameDlssg", nullptr, g_ini_path);
+  if (RouteOn(ReadRoute(L"InGameDlssg"))) {
+    WriteRoute(L"InGameDlssg", Route::unset);
     Log("route: this run is D3D11, so the game-Streamline D3D12 route (InGameDlssg) is off again from the next launch");
   }
 #endif
@@ -2923,7 +2940,8 @@ void DriveMotionChoice() {
       s_frame_at = hsf::slgame::GameFrames();
       s_time_at = GetTickCount64();
     }
-    ngx_fresh = s_serial != 0 && hsf::slgame::GameFrames() - s_frame_at < 3 && GetTickCount64() - s_time_at < 250;
+    ngx_fresh = s_serial != 0 && hsf::slgame::GameFrames() - s_frame_at < hsf::motiontiming::NGX_FRESH_FRAMES &&
+                GetTickCount64() - s_time_at < hsf::motiontiming::NGX_FRESH_MS;
     if (ngx_fresh) g_dlss_seen = true;
     static SourceHold hold;
     g_sl_ngx_ok = hold.Pick(ngx_fresh, "game-Streamline route, NGX");
@@ -2974,8 +2992,8 @@ void SlOpticalFrame(effect_runtime* runtime, device* dev, resource target) {
       return;
     }
     // Refused (HSF_streamline log says why): flow for this frame, and NGX is not tried again for a while, so the source does not flip every frame.
-    ngx_refused_until = frame_count + 120;
-    hsf::slgame::LogLine("the game's DLSS data, read through NGX, was refused by the frame feed: flow for the next 120 frames");
+    ngx_refused_until = frame_count + hsf::motiontiming::NGX_REFUSED_FRAMES;
+    hsf::slgame::LogLine("the game's DLSS data, read through NGX, was refused by the frame feed: flow for the next 120 frames (NGX_REFUSED_FRAMES)");
   }
   note(false);
   const float no_jitter[2] = {0.f, 0.f};
@@ -5047,7 +5065,7 @@ void DrawD3d12Controls(uint32_t max_frames, const char* motion_now, bool reflex_
   ImGui::SeparatorText("Frame rate");
   // FPS cap: applied while dragging, written to HSF.ini when let go.
   int cap = static_cast<int>(g_fps_cap);
-  if (ImGui::SliderInt("FPS cap (on screen, 0 = off)", &cap, 0, 360, cap == 0 ? "off" : "%d fps")) g_fps_cap = CapRule(cap);
+  if (ImGui::SliderInt("FPS cap (on screen, 0 = off)", &cap, 0, FPS_CAP_BAR_MAX, cap == 0 ? "off" : "%d fps")) g_fps_cap = CapRule(cap);
   changed |= ImGui::IsItemDeactivatedAfterEdit();
   const uint32_t monitor_hz = MainMonitorHz();
   if (monitor_hz == 0) {
@@ -5256,7 +5274,7 @@ bool LaunchPadPlaced(const LaunchPadState& state) { return state.first && (!stat
 // AUTO, the default: once a second, the whole tune for the game's size now (the player can change resolution in game): the quality, LaunchPad
 // first in ReShade's order, its depth settings as HSF's once HSF knows the depth. Nothing while Lumenite gives the flow.
 void KeepLaunchPadAuto(effect_runtime* runtime) {
-  if (g_launchpad_mode != hsf::launchpad::MODE_AUTO || g_seen.source == 1) return;
+  if (g_launchpad_mode != hsf::launchpad::MODE_AUTO || g_seen.source == SOURCE_LUMENITE) return;
   static ULONGLONG next = 0;
   const ULONGLONG now = GetTickCount64();
   if (now < next) return;
@@ -5419,7 +5437,7 @@ void DrawDetails(effect_runtime* runtime) {
   if (ImGui::Combo("Overlay", &g_overlay_mode, OVERLAY_NAMES, 3)) changed = true;
   // FPS cap: applied while dragging, written to HSF.ini when let go.
   int cap = static_cast<int>(g_fps_cap);
-  if (ImGui::SliderInt("FPS cap (on screen, 0 = off)", &cap, 0, 360, cap == 0 ? "off" : "%d fps")) g_fps_cap = CapRule(cap);
+  if (ImGui::SliderInt("FPS cap (on screen, 0 = off)", &cap, 0, FPS_CAP_BAR_MAX, cap == 0 ? "off" : "%d fps")) g_fps_cap = CapRule(cap);
   changed |= ImGui::IsItemDeactivatedAfterEdit();
   // One click sets the cap to the main monitor's refresh rate.
   const uint32_t monitor_hz = MainMonitorHz();
@@ -6469,7 +6487,7 @@ void DrawPanel(effect_runtime* runtime) {
   // first in ReShade's order, its depth settings as HSF's. A box is lit only when LaunchPad really is set that way, so a change made in ReShade's own
   // menu shows. AUTO, the default, tunes by itself and picks again when the game's size changes (KeepLaunchPadAuto). UNDO puts back what the player had before the first tune.
   {
-    const bool launchpad_flow = g_flow_engine == 0 && g_seen.source != 1 && !(now.d3d12 && g_using_dlss);
+    const bool launchpad_flow = g_flow_engine == 0 && g_seen.source != SOURCE_LUMENITE && !(now.d3d12 && g_using_dlss);
     const LaunchPadState launchpad = launchpad_flow ? ReadLaunchPad(runtime) : LaunchPadState{};
     if (launchpad.loaded) {
       ui::RowLabel("LAUNCHPAD", c::BLUE);
@@ -6525,7 +6543,7 @@ void DrawPanel(effect_runtime* runtime) {
   const float font = ImGui::GetFontSize();
   int cap = static_cast<int>(g_fps_cap);
   bool released = false;
-  if (ui::Bar("##cap", &cap, static_cast<int>(FPS_CAP_MIN), 360, font * 11.f, c::TEXT, &released)) g_fps_cap = CapRule(cap);
+  if (ui::Bar("##cap", &cap, static_cast<int>(FPS_CAP_MIN), FPS_CAP_BAR_MAX, font * 11.f, c::TEXT, &released)) g_fps_cap = CapRule(cap);
   changed |= released;
   const ImVec2 bar_min = ImGui::GetItemRectMin(), bar_max = ImGui::GetItemRectMax();
   const bool bar_hovered = ImGui::IsItemHovered();
@@ -6913,7 +6931,7 @@ void DrawPanel(effect_runtime* runtime) {
     }
   }
   ui::Rule();
-  ui::Caps("HSF V1 // BY CAPT-HUNTER", c::FAINT, 0.75f);
+  ui::Caps("HSF " HSF_VERSION " // BY CAPT-HUNTER", c::FAINT, 0.75f);
   ui::EndPanel();
   // The wheel moved the FPS cap: undo the scroll ImGui gave the window for it. Otherwise remember where the window is scrolled to.
   static float s_scroll = 0.f;
@@ -7582,6 +7600,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
   switch (reason) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(module)) return FALSE;
+      reshade::log_message(reshade::log_level::info, "HSF " HSF_VERSION
+#ifdef _WIN64
+                           " (64-bit) loaded");
+#else
+                           " (32-bit) loaded");
+#endif
       // In HSF's own helper the add-on does nothing else: no route pick, no HSF.ini writes, no menu or overlay.
       g_fresh_attach = true;
       g_in_helper = InHelperProcess();
@@ -7604,10 +7628,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         if (const char* const hooked = hsf::vk::HookCreateDevice()) reshade::log_message(reshade::log_level::info, (std::string("HSF: ") + hooked).c_str());
 #ifdef HSF_SL_GAME
       // A native D3D12 game with its own Streamline. StreamlineProbe=1 logs what it sends and changes nothing; InGameDlssg=1 also runs DLSS-G inside the game.
-      g_sl_drive = GetPrivateProfileIntW(L"HSF", L"InGameDlssg", 0, g_ini_path) != 0;
+      g_sl_drive = RouteOn(ReadRoute(L"InGameDlssg"));
       g_sl_game = g_sl_drive || GetPrivateProfileIntW(L"HSF", L"StreamlineProbe", 0, g_ini_path) != 0;
       // A native D3D12 game with no Streamline. On its own this only starts Streamline in the game: nothing is generated yet, as nothing feeds DLSS-G.
-      g_sl_bring = GetPrivateProfileIntW(L"HSF", L"SlBringIn", 0, g_ini_path) != 0;
+      g_sl_bring = RouteOn(ReadRoute(L"SlBringIn"));
       if (g_sl_bring) {
         wchar_t folder[MAX_PATH];
         wcscpy_s(folder, g_ini_path);

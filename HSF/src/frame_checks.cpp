@@ -3,6 +3,7 @@
 #include "frame_checks.h"
 
 #include "camera.h"
+#include "score_limits.h"
 
 #include <d3dcompiler.h>
 
@@ -608,10 +609,11 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
-// The same thresholds as score.cpp.
-constexpr UINT SCORE_GRID_WIDTH = 240;
-constexpr float SCORE_MOVING_ERROR = 2.f / 255.f, SCORE_CLEARLY = 0.1f, SCORE_STILL_SHARE = 0.01f, SCORE_CUT_HISTOGRAM = 0.35f, SCORE_CUT_GAIN = 0.2f;
-constexpr int SCORE_BINS = 32;
+// The same thresholds as score.cpp (score_limits.h).
+constexpr UINT SCORE_GRID_WIDTH = scorelimits::GRID_WIDTH;
+constexpr float SCORE_MOVING_ERROR = scorelimits::MOVING_ERROR, SCORE_CLEARLY = scorelimits::CLEARLY, SCORE_STILL_SHARE = scorelimits::STILL_SHARE,
+                SCORE_CUT_HISTOGRAM = scorelimits::CUT_HISTOGRAM, SCORE_CUT_GAIN = scorelimits::CUT_GAIN;
+constexpr int SCORE_BINS = scorelimits::HISTOGRAM_BINS;
 
 DXGI_FORMAT ReadableFormat(DXGI_FORMAT format) {
   switch (format) {

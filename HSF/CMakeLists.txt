@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.23)
-project(hsf VERSION 0.3.0 LANGUAGES C CXX)
+project(hsf VERSION 0.9.8.8 LANGUAGES C CXX)
 
 # HSF (Hunter's Sloppy Frames) by Capt-Hunter. DLSS Frame Generation for ReShade.
 # One ReShade add-on, built twice: a 32-bit configure makes hsf.addon32, a 64-bit one makes hsf.addon64. See ../docs/.
@@ -10,6 +10,10 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
 add_compile_options(/utf-8 /W4 /permissive- /EHsc)
+
+# The one version number (project() above): the menu and the first line of every HSF log name it. Raise it for each release.
+configure_file(src/version.h.in "${CMAKE_BINARY_DIR}/generated/version.h" @ONLY)
+include_directories("${CMAKE_BINARY_DIR}/generated")
 
 # ReShade add-on API headers (tag v6.0.0) and the Dear ImGui header that tag pins.
 set(HSF_RESHADE_INCLUDE "${CMAKE_SOURCE_DIR}/third_party/reshade/include")
