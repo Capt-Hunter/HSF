@@ -38,7 +38,7 @@ else()
   set(HSF_STREAMLINE "${CMAKE_SOURCE_DIR}/../Streamline SDK")
   # NVIDIA Optical Flow SDK 5.0 interface headers (NVIDIA's permissive licence, in each file). The engine itself is the driver's nvofapi64.dll.
   set(HSF_NVOF "${CMAKE_SOURCE_DIR}/third_party/nvof")
-  target_sources(hsf_addon PRIVATE src/compose.cpp src/frame_checks.cpp src/sl_game.cpp src/sl_bring.cpp src/debug_view.cpp src/depth_fit.cpp src/ngx_input.cpp src/ngx_vk.cpp src/nvof_flow.cpp)
+  target_sources(hsf_addon PRIVATE src/compose.cpp src/frame_checks.cpp src/sl_game.cpp src/hook_patch.cpp src/sl_bring.cpp src/debug_view.cpp src/depth_fit.cpp src/ngx_input.cpp src/ngx_vk.cpp src/nvof_flow.cpp)
   target_compile_definitions(hsf_addon PRIVATE HSF_SL_GAME)
   target_include_directories(hsf_addon SYSTEM PRIVATE "${HSF_STREAMLINE}/include" "${HSF_NVOF}")
   target_link_libraries(hsf_addon PRIVATE "${HSF_STREAMLINE}/lib/x64/sl.interposer.lib" delayimp version)
@@ -55,7 +55,7 @@ else()
   target_link_libraries(compose_test PRIVATE d3d12 dxgi d3dcompiler)
   target_link_options(compose_test PRIVATE "/ENTRY:wmainCRTStartup")
   # Offline test of the hooks on a game's Streamline: needs only a copy of sl.interposer.dll, which it hooks and calls.
-  add_executable(sl_game_test tests/sl_game_test.cpp src/sl_game.cpp src/safe_try.cpp)
+  add_executable(sl_game_test tests/sl_game_test.cpp src/sl_game.cpp src/hook_patch.cpp src/safe_try.cpp)
   target_include_directories(sl_game_test SYSTEM PRIVATE "${HSF_STREAMLINE}/include")
   target_link_libraries(sl_game_test PRIVATE d3d12 dxgi hsf_minhook)
   target_link_options(sl_game_test PRIVATE "/ENTRY:wmainCRTStartup")
@@ -67,12 +67,12 @@ else()
   target_link_options(sl_bring_test PRIVATE "/ENTRY:wmainCRTStartup")
 
   # The hook on this machine's real _nvngx.dll, and a stand-in DLSS call on a real device.
-  add_executable(ngx_input_test tests/ngx_input_test.cpp src/ngx_input.cpp src/sl_game.cpp src/safe_try.cpp)
+  add_executable(ngx_input_test tests/ngx_input_test.cpp src/ngx_input.cpp src/sl_game.cpp src/hook_patch.cpp src/safe_try.cpp)
   target_include_directories(ngx_input_test SYSTEM PRIVATE "${HSF_STREAMLINE}/include")
   target_link_libraries(ngx_input_test PRIVATE d3d12 dxgi hsf_minhook)
 
   # Offline test of HSF's patcher on made-up functions: the full length decoder (H3), unaligned functions, and the safe-try switch for it.
-  add_executable(hook_test tests/hook_test.cpp src/sl_game.cpp src/safe_try.cpp)
+  add_executable(hook_test tests/hook_test.cpp src/sl_game.cpp src/hook_patch.cpp src/safe_try.cpp)
   target_include_directories(hook_test SYSTEM PRIVATE "${HSF_STREAMLINE}/include")
   target_link_libraries(hook_test PRIVATE d3d12 dxgi hsf_minhook)
 

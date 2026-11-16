@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "hook_patch.h"
+
 namespace hsf::slgame {
 
 // HSF's hook code for a call in another module (ngx_input.cpp), which works with or without the rest of this file running. real gets what calls the original. The hook's messages go to log.
@@ -114,19 +116,11 @@ struct CameraPose {
 // a sound right-handed set or the result is not finite, and then out is left alone. Public for the test.
 bool RebuildClipToPrev(const float clip_to_view_cur[4][4], const CameraPose& cur, const float view_to_clip_prev[4][4], const CameraPose& prev, float out[4][4]);
 
-// How many bytes of whole instructions at code cover at least min_bytes, or 0 if an instruction is not on the short list of prologue instructions HSF can move. A function that does
-// not start with those is left alone. rip_at, if given, receives the offsets of the instructions relative to rip (loads, and a jump that ends a small forwarding function), which need a
-// new displacement when moved; rip_count is how many, at most MAX_RIP_LOADS. Public for the test.
-constexpr size_t MAX_RIP_LOADS = 4;
-size_t PrologueLength(const uint8_t* code, size_t min_bytes, size_t* rip_at = nullptr, size_t* rip_count = nullptr);
-// A moved instruction that needs a new 4-byte displacement: where it starts, where its displacement is and where it ends, and whether it is a jump (rel32).
-struct MovedFix {
-  uint8_t at, disp_at, end;
-  bool is_jump;
-};
-// For a start PrologueLength does not know: a full x64 length decoder (MinHook's HDE64, BSD) measures whole instructions covering at least min_bytes. Loads relative to rip,
-// calls and far jumps (rel32) are listed in fixes (at most MAX_RIP_LOADS); short branches, a return before min_bytes, or a branch back into the moved bytes give 0. Public for the test.
-size_t PrologueLengthDecoded(const uint8_t* code, size_t min_bytes, MovedFix* fixes, size_t* fix_count);
+// The prologue measures live in hook_patch.h; these names stay for the tests.
+using hookpatch::MAX_RIP_LOADS;
+using hookpatch::MovedFix;
+using hookpatch::PrologueLength;
+using hookpatch::PrologueLengthDecoded;
 // How many hooks are in place now. For the test.
 int HooksInstalled();
 // Hooks a function as if the game had just asked Streamline for it by this name. For the test.
