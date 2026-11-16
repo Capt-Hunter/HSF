@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <vector>
 
-#include "hook_patch.h"
+#include "sl_game.h"
 
 namespace hsf::ngx {
 namespace {
@@ -99,7 +99,6 @@ uint32_t g_create_width = 0, g_create_height = 0, g_create_out_width = 0, g_crea
 uint64_t g_largest_area = 0, g_largest_serial = 0;
 int g_refused_motion = 0, g_refused_depth = 0;
 bool g_tried = false;
-hookpatch::HookSet g_hooks;  // NGX's Vulkan calls: removed by UnhookVk only
 int g_hooked = 0, g_found = 0;
 // TakeTimesVk: when the last call was taken and its command buffer went to a queue, and the times between them since the last read.
 LARGE_INTEGER g_freq{};
@@ -505,7 +504,7 @@ void PollVk(api::device* device) {
     void* const target = reinterpret_cast<void*>(GetProcAddress(module, name));
     if (target == nullptr) return;
     ++found;
-    if (g_hooks.Add(name, target, detour, real, g_log)) ++hooked;
+    if (slgame::HookFunction(name, target, detour, real, g_log)) ++hooked;
   };
   hook("NVSDK_NGX_VULKAN_CreateFeature", reinterpret_cast<void*>(&HookCreate), reinterpret_cast<void**>(&g_real_create));
   hook("NVSDK_NGX_VULKAN_CreateFeature1", reinterpret_cast<void*>(&HookCreate1), reinterpret_cast<void**>(&g_real_create1));
@@ -561,12 +560,10 @@ int FoundCallsVk() { return g_found; }
 bool LoadedVk() { return g_tried; }
 
 void RescanVk() {
-  // Hooks already in stay in (the hook set skips them); the next poll tries the rest again, and finds _nvngx.dll if it was loaded since.
+  // Hooks already in stay in (HookFunction skips them); the next poll tries the rest again, and finds _nvngx.dll if it was loaded since.
   if (g_tried && g_hooked >= g_found && g_found > 0) return;
   g_tried = false;
 }
-
-void UnhookVk() { g_hooks.RemoveAll(nullptr); }
 
 void StopVk(bool release) {
   Lock lock;

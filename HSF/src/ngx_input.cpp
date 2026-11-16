@@ -10,7 +10,7 @@
 #include <cstring>
 #include <vector>
 
-#include "hook_patch.h"
+#include "sl_game.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -186,7 +186,6 @@ int __cdecl HookEvaluateC(ID3D12GraphicsCommandList* list, const void* handle, c
 int g_hooked = 0;
 int g_found = 0;  // of the three calls, how many this driver's _nvngx.dll has
 bool g_tried = false;
-hookpatch::HookSet g_hooks;  // NGX's D3D12 calls: removed by Stop only
 
 }  // namespace
 
@@ -311,7 +310,7 @@ void Poll() {
     void* const target = reinterpret_cast<void*>(GetProcAddress(module, name));
     if (target == nullptr) return;
     ++found;
-    if (g_hooks.Add(name, target, detour, real, g_log)) ++g_hooked;
+    if (slgame::HookFunction(name, target, detour, real, g_log)) ++g_hooked;
   };
   hook("NVSDK_NGX_D3D12_CreateFeature", reinterpret_cast<void*>(&HookCreate), reinterpret_cast<void**>(&g_real_create));
   hook("NVSDK_NGX_D3D12_EvaluateFeature", reinterpret_cast<void*>(&HookEvaluate), reinterpret_cast<void**>(&g_real_evaluate));
@@ -328,7 +327,6 @@ Evaluate11Fn g_real_evaluate11 = nullptr, g_real_evaluate11_c = nullptr;
 Create11Fn g_real_create11 = nullptr;
 LogFunction g_log11 = nullptr;
 bool g_tried11 = false;
-hookpatch::HookSet g_hooks11;  // NGX's D3D11 calls: removed by Stop11 only
 LONG g_calls11 = 0;
 char g_last_shape11[400] = "";
 // From the last feature made: its flags (-1 = not known) and output size, for calls that do not repeat them.
@@ -546,7 +544,7 @@ void Poll11() {
   int hooked = 0;
   const auto hook = [&](const char* name, void* detour, void** real) {
     void* const target = reinterpret_cast<void*>(GetProcAddress(module, name));
-    if (target != nullptr && g_hooks11.Add(name, target, detour, real, g_log11)) ++hooked;
+    if (target != nullptr && slgame::HookFunction(name, target, detour, real, g_log11)) ++hooked;
   };
   hook("NVSDK_NGX_D3D11_CreateFeature", reinterpret_cast<void*>(&HookCreate11), reinterpret_cast<void**>(&g_real_create11));
   hook("NVSDK_NGX_D3D11_EvaluateFeature", reinterpret_cast<void*>(&HookEvaluate11), reinterpret_cast<void**>(&g_real_evaluate11));
@@ -563,7 +561,7 @@ bool Latest11(Frame11* out) {
 
 void Stop11(bool process_exiting) {
   if (process_exiting || !g_tried11) return;
-  g_hooks11.RemoveAll(nullptr);
+  slgame::UnhookFunctions();
   Lock lock;
   g_have_frame11 = false;
   g_frame11 = {};
@@ -572,7 +570,7 @@ void Stop11(bool process_exiting) {
 
 void Stop(bool process_exiting) {
   if (process_exiting) return;
-  g_hooks.RemoveAll(nullptr);
+  slgame::UnhookFunctions();
   Lock lock;
   g_have_frame = false;
   g_frame = {};

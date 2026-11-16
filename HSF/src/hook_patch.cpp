@@ -31,36 +31,15 @@ bool SafeCopy(void* to, const void* from, size_t bytes) {
   }
 }
 
-// The patcher's own lock. A leaf: nothing is called while it is held but memory and code-page work (and safetry's marks), never a log. It guards the code pages and every
-// Hook it patches. Lines written under it wait in Lines and go to the caller's log once it is released, so a log that hooks or takes a lock of its own cannot deadlock here.
-SRWLOCK g_lock = SRWLOCK_INIT;
-
-struct Lines {
-  static constexpr int MAX = 8;
-  char text[MAX][512];
-  int count = 0;
-};
-
-void Say(Lines& out, const char* format, ...) {
-  if (out.count == Lines::MAX) return;
+void Say(Log log, const char* format, ...) {
+  if (log == nullptr) return;
+  char text[512];
   va_list args;
   va_start(args, format);
-  std::vsnprintf(out.text[out.count], sizeof(out.text[0]), format, args);
+  std::vsnprintf(text, sizeof(text), format, args);
   va_end(args);
-  ++out.count;
+  log(text);
 }
-
-void Flush(const Lines& lines, Log log) {
-  if (log == nullptr) return;
-  for (int i = 0; i < lines.count; ++i) log(lines.text[i]);
-}
-
-struct PatchLock {
-  PatchLock() { AcquireSRWLockExclusive(&g_lock); }
-  ~PatchLock() { ReleaseSRWLockExclusive(&g_lock); }
-  PatchLock(const PatchLock&) = delete;
-  PatchLock& operator=(const PatchLock&) = delete;
-};
 
 }  // namespace
 
@@ -90,7 +69,7 @@ static uint8_t* AllocateNear(const uint8_t* near_address) {
 }
 
 // A slot in a page near target. Pages stay for good: a thread can still be inside a trampoline when hooks come off, and add-on reloads are few.
-static uint8_t* NearSlotLocked(const uint8_t* target) {
+uint8_t* NearSlot(const uint8_t* target) {
   for (CodePage& page : g_pages) {
     if (page.base == nullptr) {
       page.base = AllocateNear(target);
@@ -154,7 +133,7 @@ void PointRelay(uint8_t* relay, const void* to) {
 }
 
 // target starts with someone else's jump. If an earlier load of HSF hooked it and left its relay, take that relay back: their jump still leads through it.
-static bool Adopt(Hook& hook, uint8_t* target, Lines& out) {
+static bool Adopt(Hook& hook, uint8_t* target, Log log) {
   wchar_t name[64], value[96] = L"";
   RelayName(hook, name, 64);
   if (GetEnvironmentVariableW(name, value, 96) == 0) return false;
@@ -171,30 +150,30 @@ static bool Adopt(Hook& hook, uint8_t* target, Lines& out) {
   PointRelay(hook.relay, hook.hook);
   hook.installed = true;
   hook.adopted = true;
-  Say(out, "hook %s taken back at %p: someone else's jump is on top, and it leads through HSF's relay from the last load", hook.name, target);
+  Say(log, "hook %s taken back at %p: someone else's jump is on top, and it leads through HSF's relay from the last load", hook.name, target);
   return true;
 }
 
 // target starts with "eb f9", a 2-byte jump back to a 5-byte jump in the padding before the function: another tool's hot-patch hook. Moving their short jump would break the way
 // back into the function their hook uses, so HSF leaves the function alone and changes only where the 5-byte jump leads: to HSF's relay, whose trampoline jumps on to their hook.
 // HSF runs first, then their hook, then the function. The displacement is 4 bytes, written in one go when it is 4-byte aligned.
-static bool ChainHotPatch(Hook& hook, uint8_t* target, const char* bytes_text, Lines& out) {
+static bool ChainHotPatch(Hook& hook, uint8_t* target, const char* bytes_text, Log log) {
   uint8_t* const stub = target - 5;
   uint8_t head[5];
   if (!SafeCopy(head, stub, sizeof(head)) || head[0] != 0xE9) {
-    Say(out, "hook %s NOT installed at %p: starts %s, a short jump back, but no jump before the function", hook.name, target, bytes_text);
+    Say(log, "hook %s NOT installed at %p: starts %s, a short jump back, but no jump before the function", hook.name, target, bytes_text);
     return false;
   }
   if ((reinterpret_cast<uintptr_t>(stub + 1) & 3) != 0) {
-    Say(out, "hook %s NOT installed at %p: starts %s, a hot-patch jump that cannot be changed in one write", hook.name, target, bytes_text);
+    Say(log, "hook %s NOT installed at %p: starts %s, a hot-patch jump that cannot be changed in one write", hook.name, target, bytes_text);
     return false;
   }
   int32_t old_displacement;
   std::memcpy(&old_displacement, head + 1, 4);
   const uint8_t* const theirs = stub + 5 + old_displacement;
-  uint8_t* const slot = NearSlotLocked(stub);
+  uint8_t* const slot = NearSlot(stub);
   if (slot == nullptr) {
-    Say(out, "hook %s NOT installed: no memory near %p", hook.name, stub);
+    Say(log, "hook %s NOT installed: no memory near %p", hook.name, stub);
     return false;
   }
   uint8_t* const trampoline = slot + 16;
@@ -206,7 +185,7 @@ static bool ChainHotPatch(Hook& hook, uint8_t* target, const char* bytes_text, L
   std::atomic_thread_fence(std::memory_order_seq_cst);
   DWORD old = 0;
   if (!VirtualProtect(stub, 5, PAGE_EXECUTE_READWRITE, &old)) {
-    Say(out, "hook %s NOT installed: could not write at %p", hook.name, stub);
+    Say(log, "hook %s NOT installed: could not write at %p", hook.name, stub);
     return false;
   }
   _InterlockedExchange(reinterpret_cast<volatile long*>(stub + 1), new_displacement);
@@ -220,20 +199,20 @@ static bool ChainHotPatch(Hook& hook, uint8_t* target, const char* bytes_text, L
   hook.chained_old = old_displacement;
   hook.chained_new = new_displacement;
   hook.installed = true;
-  Say(out, "hook %s installed at %p behind another tool's hot-patch jump (to %p): starts %s", hook.name, target, theirs, bytes_text);
+  Say(log, "hook %s installed at %p behind another tool's hot-patch jump (to %p): starts %s", hook.name, target, theirs, bytes_text);
   return true;
 }
 
-// Under g_lock. A function already hooked by someone else starts with a jump. If that jump leads through HSF's own relay (an earlier load of HSF, under someone
+// Call with the caller's lock held. A function already hooked by someone else starts with a jump. If that jump leads through HSF's own relay (an earlier load of HSF, under someone
 // else's hook), the relay is taken back. Otherwise HSF hooks on top: the jump is moved into the trampoline, so HSF runs first and then their hook (RenoDX DLSS on NGX in Jusant).
-static bool InstallLocked(Hook& hook, uint8_t* target, Lines& out) {
+bool Install(Hook& hook, uint8_t* target, Log log) {
   if (hook.installed && hook.target == target) return true;
   char bytes_text[64] = "";
   uint8_t first[32] = {};
   if (!SafeCopy(first, target, sizeof(first))) return false;
-  if (first[0] == 0xE9 && Adopt(hook, target, out)) return true;
+  if (first[0] == 0xE9 && Adopt(hook, target, log)) return true;
   for (int i = 0; i < 12; ++i) std::snprintf(bytes_text + i * 3, 4, "%02x ", first[i]);
-  if (first[0] == 0xEB && first[1] == 0xF9) return ChainHotPatch(hook, target, bytes_text, out);
+  if (first[0] == 0xEB && first[1] == 0xF9) return ChainHotPatch(hook, target, bytes_text, log);
   MovedFix fixes[MAX_RIP_LOADS];
   size_t fix_count = 0;
   // Someone else's absolute jump (ff 25, the address in memory): HSF goes on top, and its trampoline makes the same jump.
@@ -267,13 +246,13 @@ static bool InstallLocked(Hook& hook, uint8_t* target, Lines& out) {
     length = 0;
   }
   if (length == 0 || length > 24) {
-    if (Adopt(hook, target, out)) return true;
-    Say(out, "hook %s NOT installed at %p: starts %s(left alone)", hook.name, target, bytes_text);
+    if (Adopt(hook, target, log)) return true;
+    Say(log, "hook %s NOT installed at %p: starts %s(left alone)", hook.name, target, bytes_text);
     return false;
   }
-  uint8_t* const slot = NearSlotLocked(target);
+  uint8_t* const slot = NearSlot(target);
   if (slot == nullptr) {
-    Say(out, "hook %s NOT installed: no memory near %p", hook.name, target);
+    Say(log, "hook %s NOT installed: no memory near %p", hook.name, target);
     return false;
   }
   // [relay: jump to the hook][trampoline: the moved instructions, jump back]
@@ -300,7 +279,7 @@ static bool InstallLocked(Hook& hook, uint8_t* target, Lines& out) {
       continue;
     }
     if (moved > INT32_MAX || moved < INT32_MIN) {
-      Say(out, "hook %s NOT installed at %p: its load cannot reach from the trampoline. Starts %s", hook.name, target, bytes_text);
+      Say(log, "hook %s NOT installed at %p: its load cannot reach from the trampoline. Starts %s", hook.name, target, bytes_text);
       return false;
     }
     const int32_t new_displacement = static_cast<int32_t>(moved);
@@ -317,7 +296,7 @@ static bool InstallLocked(Hook& hook, uint8_t* target, Lines& out) {
   *hook.real = trampoline;  // ready before any call can arrive
   std::atomic_thread_fence(std::memory_order_seq_cst);
   if (!WriteFirstBytes(target, hook.patch)) {
-    Say(out, "hook %s NOT installed: could not write at %p", hook.name, target);
+    Say(log, "hook %s NOT installed: could not write at %p", hook.name, target);
     return false;
   }
   hook.target = target;
@@ -326,12 +305,12 @@ static bool InstallLocked(Hook& hook, uint8_t* target, Lines& out) {
   hook.adopted = false;
   hook.installed = true;
   PublishRelay(hook);
-  Say(out, "hook %s installed at %p, moved %zu bytes, %zu loads relative to rip%s%s: %s", hook.name, target, length, fix_count, decoded ? ", measured by the full decoder" : "",
+  Say(log, "hook %s installed at %p, moved %zu bytes, %zu loads relative to rip%s%s: %s", hook.name, target, length, fix_count, decoded ? ", measured by the full decoder" : "",
        aligned ? "" : ", not 8-byte aligned (written in two parts)", bytes_text);
   return true;
 }
 
-static void RemoveLocked(Hook& hook, Lines& out) {
+void Remove(Hook& hook, Log log) {
   if (!hook.installed) return;
   hook.installed = false;
   if (!CodeStillThere(hook.target)) return;
@@ -345,7 +324,7 @@ static void RemoveLocked(Hook& hook, Lines& out) {
       FlushInstructionCache(GetCurrentProcess(), hook.chained_at, 5);
     } else if (hook.relay != nullptr && CodeStillThere(hook.relay)) {
       PointRelay(hook.relay, hook.trampoline);
-      Say(out, "hook %s changed by someone else, not restored; its calls now skip HSF", hook.name);
+      Say(log, "hook %s changed by someone else, not restored; its calls now skip HSF", hook.name);
     }
     hook.chained_at = nullptr;
     return;
@@ -356,7 +335,7 @@ static void RemoveLocked(Hook& hook, Lines& out) {
   // function and never code of HSF's that is about to go. The next load of HSF takes the relay back (Adopt).
   if (hook.adopted || std::memcmp(now, hook.patch, 5) != 0) {
     if (hook.relay != nullptr && hook.trampoline != nullptr && CodeStillThere(hook.relay)) PointRelay(hook.relay, hook.trampoline);
-    Say(out, "hook %s changed by someone else, not restored; its calls now skip HSF", hook.name);
+    Say(log, "hook %s changed by someone else, not restored; its calls now skip HSF", hook.name);
     return;
   }
   WriteFirstBytes(hook.target, hook.saved);
@@ -364,71 +343,6 @@ static void RemoveLocked(Hook& hook, Lines& out) {
   wchar_t name[64];
   RelayName(hook, name, 64);
   SetEnvironmentVariableW(name, nullptr);
-}
-
-uint8_t* NearSlot(const uint8_t* target) {
-  PatchLock lock;
-  return NearSlotLocked(target);
-}
-
-bool Install(Hook& hook, uint8_t* target, Log log) {
-  Lines lines;
-  bool installed;
-  {
-    PatchLock lock;
-    installed = InstallLocked(hook, target, lines);
-  }
-  Flush(lines, log);
-  return installed;
-}
-
-void Remove(Hook& hook, Log log) {
-  Lines lines;
-  {
-    PatchLock lock;
-    RemoveLocked(hook, lines);
-  }
-  Flush(lines, log);
-}
-
-bool HookSet::Add(const char* name, void* target, void* hook_function, void** real, Log log) {
-  Lines lines;
-  bool installed = false;
-  {
-    PatchLock lock;
-    // Already hooked (a rescan asks again): nothing to do.
-    for (const Hook& hook : hooks_)
-      if (hook.name != nullptr && hook.installed && hook.target == target && std::strcmp(hook.name, name) == 0) return true;
-    Hook* free_hook = nullptr;
-    for (Hook& hook : hooks_)
-      if (hook.name == nullptr) {
-        free_hook = &hook;
-        break;
-      }
-    if (free_hook == nullptr) {
-      Say(lines, "hook %s NOT installed: all %d hook slots of this caller are in use", name, MAX_HOOKS);
-    } else {
-      free_hook->name = name;
-      free_hook->hook = hook_function;
-      free_hook->real = real;
-      installed = InstallLocked(*free_hook, static_cast<uint8_t*>(target), lines);
-      if (!installed) *free_hook = Hook{};
-    }
-  }
-  Flush(lines, log);
-  return installed;
-}
-
-void HookSet::RemoveAll(Log log) {
-  Lines lines;
-  {
-    PatchLock lock;
-    for (Hook& hook : hooks_) {
-      RemoveLocked(hook, lines);
-      hook = Hook{};
-    }
-  }
-  Flush(lines, log);
 }
 
 size_t PrologueLength(const uint8_t* code, size_t min_bytes, size_t* rip_at, size_t* rip_count) {
