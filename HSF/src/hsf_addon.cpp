@@ -7527,7 +7527,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         if (g_sl_drive && !g_sl_bring) {
           g_ngx_input = GetPrivateProfileIntW(L"HSF", L"NgxInput", 1, g_ini_path) != 0;
           g_sl_ngx = g_ngx_input && hsf::safetry::Allowed("T2_ngx_game_streamline");
-          // Its lines go to ReShade's log, never to slgame::LogLine: hooking NGX goes through slgame::HookFunction, which holds that log's lock while it logs.
+          // Its lines go to ReShade's log. The hook patcher hands them over with no lock held (hook_patch.h), so the HSF_sl_probe log would be safe too.
           if (g_sl_ngx) hsf::ngx::Start(&Log);
         }
       }
@@ -7545,7 +7545,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
       if ((g_sl_bring && g_ngx_input) || g_sl_ngx) hsf::ngx::Stop(reserved != nullptr);
       hsf::ngx::Stop11(reserved != nullptr);
       if (reserved == nullptr && hsf::ngx::LoadedVk()) {
-        hsf::slgame::UnhookFunctions();  // NGX's Vulkan calls: no hook into a freed HSF
+        hsf::ngx::UnhookVk();  // NGX's Vulkan calls: no hook into a freed HSF
         hsf::ngx::StopVk(false);
       }
       if (g_sl_bring) hsf::slbring::Stop(reserved != nullptr);
