@@ -118,6 +118,7 @@ std::atomic<uint32_t> g_max_frames{0};
 uint64_t g_next_report = 0;
 std::atomic<uint32_t> g_flip_queue_waits{0};
 std::atomic<uint32_t> g_presented{0}, g_fed{0};
+std::atomic<uint64_t> g_presented_total{0}, g_fed_total{0};  // for the menu's DLSS finder, never reset
 std::atomic<bool> g_generating{false};
 std::atomic<uint32_t> g_shown_per_real{0};
 std::atomic<uint32_t> g_cap_fps{0};
@@ -893,6 +894,7 @@ void AfterPresent() {
   if (g_sl_new_token == nullptr) return;
   Mark(sl::PCLMarker::ePresentEnd);
   g_presented.fetch_add(1);
+  g_presented_total.fetch_add(1, std::memory_order_relaxed);
   BeginFrame(true);
 }
 
@@ -1569,6 +1571,7 @@ bool FeedFrame(const FrameFeed& in) {
   }
   g_fed_this_frame = true;
   g_fed.fetch_add(1);
+  g_fed_total.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 }  // namespace
@@ -1616,6 +1619,8 @@ Stats GetStats() {
   s.shown_per_real = g_shown_per_real.load();
   s.nvof_state = g_nvof_state.load();
   s.fp16 = g_fp16.load();
+  s.presented_total = g_presented_total.load(std::memory_order_relaxed);
+  s.fed_total = g_fed_total.load(std::memory_order_relaxed);
   return s;
 }
 

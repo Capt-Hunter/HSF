@@ -18,6 +18,17 @@ void UnhookFunctions();
 void Start(const wchar_t* log_path, bool drive, bool dynamic_resolution_known = false);
 // Call once a frame on the thread that presents: notices the interposer arriving, going away or coming back, and with drive on sets DLSS-G's mode.
 void Poll();
+// RESCAN in the menu: tries the hooks that did not go in again, finds the game's sl.interposer.dll again and asks for DLSS-G's functions again.
+void Rescan();
+// The sl.interposer.dll copies loaded, for the menu's manual pick. A picked copy is hooked instead of the one HSF chose, while it stays loaded.
+struct Interposer {
+  void* module;
+  wchar_t path[260];
+  bool hsf_own;   // HSF's own, from HSF_streamline
+  bool in_use;    // the one HSF has hooked
+};
+int ListInterposers(Interposer* out, int max);
+void PickInterposer(void* module);
 // What HSF wants, with drive on. allowed false holds generation off. frames is generated per real frame (1 = 2x).
 void SetGeneration(bool allowed, uint32_t frames);
 // True holds generation off while the game's window is not in front and for a moment after it comes back. Crimson Desert drops its device (DXGI_ERROR_ACCESS_DENIED)
@@ -79,6 +90,11 @@ struct Stats {
   uint32_t score_pairs;      // pairs behind score_gain, 0 until there are some
   bool vectors_doubted;      // score_gain is low enough that the score guard stops generation, if it is on
   bool old_streamline;       // the game's Streamline is 1.x, which HSF leaves alone (no slGetFeatureFunction)
+  uint64_t tag_failures;     // HSF's own tags that Streamline refused
+  uint64_t game_frames;      // frame tokens the game has asked for
+  bool interposer_found;     // the game's sl.interposer.dll is loaded and HSF looked at it
+  bool only_hsf_streamline;  // the only sl.interposer.dll loaded is HSF's own (the bring route's)
+  uint32_t hooks_installed;  // of HSF's hooks on the game's Streamline
 };
 Stats GetStats();
 // Real frames the game has made so far (new frame tokens). No lock: cheap enough for every present. On this route ReShade also sees DLSS-G's generated frames,

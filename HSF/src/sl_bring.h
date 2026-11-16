@@ -80,6 +80,8 @@ struct Stats {
   uint32_t shown_per_real;   // what DLSS-G last said it shows per real frame
   int nvof_state;            // NVIDIA Optical Flow on the last frame fed: 0 off, 1 waiting, 2 active, 3 failed (nvof::State)
   bool fp16;                 // the swap chain is FP16 (scRGB), which DLSS-G does not take
+  uint64_t presented_total;  // frames presented through Streamline since the start
+  uint64_t fed_total;        // of those, frames that went to DLSS-G with motion and depth
 };
 Stats GetStats();
 

@@ -38,7 +38,7 @@ else()
   set(HSF_STREAMLINE "${CMAKE_SOURCE_DIR}/../Streamline SDK")
   # NVIDIA Optical Flow SDK 5.0 interface headers (NVIDIA's permissive licence, in each file). The engine itself is the driver's nvofapi64.dll.
   set(HSF_NVOF "${CMAKE_SOURCE_DIR}/third_party/nvof")
-  target_sources(hsf_addon PRIVATE src/dlssg_core.cpp src/hdr_out.cpp src/compose.cpp src/frame_checks.cpp src/sl_game.cpp src/sl_bring.cpp src/debug_view.cpp src/depth_fit.cpp src/ngx_input.cpp src/nvof_flow.cpp)
+  target_sources(hsf_addon PRIVATE src/dlssg_core.cpp src/hdr_out.cpp src/compose.cpp src/frame_checks.cpp src/sl_game.cpp src/sl_bring.cpp src/debug_view.cpp src/depth_fit.cpp src/ngx_input.cpp src/ngx_vk.cpp src/nvof_flow.cpp)
   target_compile_definitions(hsf_addon PRIVATE HSF_SL_GAME)
   target_include_directories(hsf_addon SYSTEM PRIVATE "${HSF_STREAMLINE}/include" "${HSF_NVOF}")
   target_link_libraries(hsf_addon PRIVATE "${HSF_STREAMLINE}/lib/x64/sl.interposer.lib" delayimp version)

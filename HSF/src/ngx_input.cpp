@@ -184,6 +184,7 @@ int __cdecl HookEvaluateC(ID3D12GraphicsCommandList* list, const void* handle, c
 }
 
 int g_hooked = 0;
+int g_found = 0;  // of the three calls, how many this driver's _nvngx.dll has
 bool g_tried = false;
 
 }  // namespace
@@ -282,6 +283,15 @@ bool Latest(Frame* out) {
 }
 
 int HookedCalls() { return g_hooked; }
+int FoundCalls() { return g_found; }
+bool Loaded() { return g_tried; }
+
+void Rescan() {
+  // Hooks already in stay in; the next Poll tries the rest again, and finds _nvngx.dll if the game loaded it since.
+  if (g_tried && g_hooked >= g_found && g_found > 0) return;
+  g_tried = false;
+  g_hooked = 0;
+}
 
 void Start(LogFunction log) { g_log = log; }
 
@@ -295,14 +305,18 @@ void Poll() {
   wchar_t path[MAX_PATH] = L"";
   GetModuleFileNameW(module, path, MAX_PATH);
   GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(module), &pinned);
+  int found = 0;
   const auto hook = [&](const char* name, void* detour, void** real) {
     void* const target = reinterpret_cast<void*>(GetProcAddress(module, name));
-    if (target != nullptr && slgame::HookFunction(name, target, detour, real, g_log)) ++g_hooked;
+    if (target == nullptr) return;
+    ++found;
+    if (slgame::HookFunction(name, target, detour, real, g_log)) ++g_hooked;
   };
   hook("NVSDK_NGX_D3D12_CreateFeature", reinterpret_cast<void*>(&HookCreate), reinterpret_cast<void**>(&g_real_create));
   hook("NVSDK_NGX_D3D12_EvaluateFeature", reinterpret_cast<void*>(&HookEvaluate), reinterpret_cast<void**>(&g_real_evaluate));
   hook("NVSDK_NGX_D3D12_EvaluateFeature_C", reinterpret_cast<void*>(&HookEvaluateC), reinterpret_cast<void**>(&g_real_evaluate_c));
-  Line("NGX: %ls found, %d of 3 calls hooked", path, g_hooked);
+  g_found = found;
+  Line("NGX: %ls found, %d of the %d calls this driver has hooked (older drivers have a third, _C call)", path, g_hooked, found);
 }
 
 namespace {

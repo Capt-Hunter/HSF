@@ -3,6 +3,7 @@
 #include "sl_game.h"
 
 #include <windows.h>
+#include <psapi.h>
 #include <d3d12.h>
 #include <intrin.h>
 
@@ -19,6 +20,7 @@
 #include <cmath>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
 #include <iterator>
 #include <new>
 
@@ -1048,6 +1050,9 @@ struct Hook {
   uint8_t* relay;       // in a code page that outlives HSF: an absolute jump to the hook
   uint8_t* trampoline;  // the moved instructions, then a jump back into the target
   bool adopted;         // took over the relay from an earlier load of HSF, with someone else's jump on top
+  uint8_t* chained_at;  // a hot-patch jump before the function that now leads to HSF (see ChainHotPatch), or null
+  int32_t chained_old;  // that jump's displacement before HSF changed it
+  int32_t chained_new;  // the displacement HSF wrote
 };
 
 sl::Result HookGetFunction(sl::Feature feature, const char* name, void*& function);
@@ -1178,6 +1183,55 @@ bool Adopt(Hook& hook, uint8_t* target) {
   return true;
 }
 
+// target starts with "eb f9", a 2-byte jump back to a 5-byte jump in the padding before the function: another tool's hot-patch hook. Moving their short jump would break the way
+// back into the function their hook uses, so HSF leaves the function alone and changes only where the 5-byte jump leads: to HSF's relay, whose trampoline jumps on to their hook.
+// HSF runs first, then their hook, then the function. The displacement is 4 bytes, written in one go when it is 4-byte aligned.
+bool ChainHotPatch(Hook& hook, uint8_t* target, const char* bytes_text) {
+  uint8_t* const stub = target - 5;
+  uint8_t head[5];
+  if (!SafeCopy(head, stub, sizeof(head)) || head[0] != 0xE9) {
+    Line("hook %s NOT installed at %p: starts %s, a short jump back, but no jump before the function", hook.name, target, bytes_text);
+    return false;
+  }
+  if ((reinterpret_cast<uintptr_t>(stub + 1) & 3) != 0) {
+    Line("hook %s NOT installed at %p: starts %s, a hot-patch jump that cannot be changed in one write", hook.name, target, bytes_text);
+    return false;
+  }
+  int32_t old_displacement;
+  std::memcpy(&old_displacement, head + 1, 4);
+  const uint8_t* const theirs = stub + 5 + old_displacement;
+  uint8_t* const slot = NearSlot(stub);
+  if (slot == nullptr) {
+    Line("hook %s NOT installed: no memory near %p", hook.name, stub);
+    return false;
+  }
+  uint8_t* const trampoline = slot + 16;
+  WriteAbsoluteJump(slot, hook.hook);
+  WriteAbsoluteJump(trampoline, theirs);
+  FlushInstructionCache(GetCurrentProcess(), slot, SLOT_BYTES);
+  const int32_t new_displacement = static_cast<int32_t>(slot - (stub + 5));
+  *hook.real = trampoline;  // ready before any call can arrive
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  DWORD old = 0;
+  if (!VirtualProtect(stub, 5, PAGE_EXECUTE_READWRITE, &old)) {
+    Line("hook %s NOT installed: could not write at %p", hook.name, stub);
+    return false;
+  }
+  _InterlockedExchange(reinterpret_cast<volatile long*>(stub + 1), new_displacement);
+  VirtualProtect(stub, 5, old, &old);
+  FlushInstructionCache(GetCurrentProcess(), stub, 5);
+  hook.target = target;
+  hook.relay = slot;
+  hook.trampoline = trampoline;
+  hook.adopted = false;
+  hook.chained_at = stub;
+  hook.chained_old = old_displacement;
+  hook.chained_new = new_displacement;
+  hook.installed = true;
+  Line("hook %s installed at %p behind another tool's hot-patch jump (to %p): starts %s", hook.name, target, theirs, bytes_text);
+  return true;
+}
+
 // Call with the lock held. A function already hooked by someone else starts with a jump. If that jump leads through HSF's own relay (an earlier load of HSF, under someone
 // else's hook), the relay is taken back. Otherwise HSF hooks on top: the jump is moved into the trampoline, so HSF runs first and then their hook (RenoDX DLSS on NGX in Jusant).
 bool Install(Hook& hook, uint8_t* target) {
@@ -1187,9 +1241,17 @@ bool Install(Hook& hook, uint8_t* target) {
   if (!SafeCopy(first, target, sizeof(first))) return false;
   if (first[0] == 0xE9 && Adopt(hook, target)) return true;
   for (int i = 0; i < 12; ++i) std::snprintf(bytes_text + i * 3, 4, "%02x ", first[i]);
+  if (first[0] == 0xEB && first[1] == 0xF9) return ChainHotPatch(hook, target, bytes_text);
   size_t rip_at[MAX_RIP_LOADS];
   size_t rip_count = 0;
-  const size_t length = PrologueLength(first, 5, rip_at, &rip_count);
+  // Someone else's absolute jump (ff 25, the address in memory): HSF goes on top, and its trampoline makes the same jump.
+  const void* absolute_to = nullptr;
+  if (first[0] == 0xFF && first[1] == 0x25) {
+    int32_t displacement;
+    std::memcpy(&displacement, first + 2, 4);
+    if (!SafeCopy(&absolute_to, target + 6 + displacement, sizeof(absolute_to)) || !CodeStillThere(absolute_to)) absolute_to = nullptr;
+  }
+  const size_t length = absolute_to != nullptr ? 6 : PrologueLength(first, 5, rip_at, &rip_count);
   if (length == 0 || length > 16 || (reinterpret_cast<uintptr_t>(target) & 7) != 0) {
     if (Adopt(hook, target)) return true;
     Line("hook %s NOT installed at %p: starts %s(left alone)", hook.name, target, bytes_text);
@@ -1206,6 +1268,10 @@ bool Install(Hook& hook, uint8_t* target) {
   std::memcpy(trampoline, first, length);
   // A moved load relative to rip must still reach the same address. The page is near the target and what it loads usually is too, but check.
   bool ends_in_jump = false;
+  if (absolute_to != nullptr) {
+    WriteAbsoluteJump(trampoline, absolute_to);
+    ends_in_jump = true;
+  }
   for (size_t i = 0; i < rip_count; ++i) {
     const bool is_jump = first[rip_at[i]] == 0xE9;
     const size_t DISP_AT = is_jump ? 1 : 3, INSTRUCTION_BYTES = is_jump ? 5 : 7;
@@ -1255,6 +1321,21 @@ void Remove(Hook& hook) {
   if (!hook.installed) return;
   hook.installed = false;
   if (!CodeStillThere(hook.target)) return;
+  if (hook.chained_at != nullptr) {
+    // Put their hot-patch jump back only if it still leads to HSF's relay; otherwise the relay skips HSF from now on.
+    int32_t now_displacement;
+    DWORD old = 0;
+    if (SafeCopy(&now_displacement, hook.chained_at + 1, 4) && now_displacement == hook.chained_new && VirtualProtect(hook.chained_at, 5, PAGE_EXECUTE_READWRITE, &old)) {
+      _InterlockedExchange(reinterpret_cast<volatile long*>(hook.chained_at + 1), hook.chained_old);
+      VirtualProtect(hook.chained_at, 5, old, &old);
+      FlushInstructionCache(GetCurrentProcess(), hook.chained_at, 5);
+    } else if (hook.relay != nullptr && CodeStillThere(hook.relay)) {
+      PointRelay(hook.relay, hook.trampoline);
+      Line("hook %s changed by someone else, not restored; its calls now skip HSF", hook.name);
+    }
+    hook.chained_at = nullptr;
+    return;
+  }
   uint8_t now[8];
   if (!SafeCopy(now, hook.target, 8)) return;
   // Someone patched on top of us (RenoDX DLSS, for one): leave their jump in place rather than cut it out, and point HSF's relay straight at the trampoline, so their calls reach the real
@@ -1292,6 +1373,56 @@ std::atomic<bool> g_old_streamline{false};  // the game's Streamline is 1.x: HSF
 bool g_started = false;
 bool g_asked_features = false;
 ULONGLONG g_next_poll = 0;
+ULONGLONG g_next_ask = 0;  // when to ask Streamline for the feature functions again
+
+// The game's own sl.interposer.dll. HSF's own copy, from its HSF_streamline folder (the bring route), is not the game's: hooking it sent HSF's own tags back through these
+// hooks and failed with eErrorInvalidIntegration thousands of times (Townfall, Rise of the Tomb Raider). Both can be loaded at once, so every loaded module is checked.
+bool IsHsfStreamline(HMODULE module) {
+  wchar_t path[MAX_PATH] = L"";
+  if (GetModuleFileNameW(module, path, MAX_PATH) == 0) return false;
+  for (wchar_t* c = path; *c != 0; ++c) *c = static_cast<wchar_t>(towlower(*c));
+  return std::wcsstr(path, L"\\hsf_streamline\\") != nullptr;
+}
+
+bool g_only_hsf_streamline = false;  // the only sl.interposer.dll loaded is HSF's own
+HMODULE g_picked = nullptr;           // a copy picked in the menu, used while it stays loaded
+
+// Every sl.interposer.dll loaded, HSF's own too.
+int AllInterposers(HMODULE* out, int max) {
+  HMODULE modules[1024];
+  DWORD bytes = 0;
+  if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes)) return 0;
+  int count = 0;
+  for (DWORD i = 0; i < std::min<DWORD>(bytes / sizeof(HMODULE), 1024) && count < max; ++i) {
+    wchar_t path[MAX_PATH] = L"";
+    if (GetModuleFileNameW(modules[i], path, MAX_PATH) == 0) continue;
+    const wchar_t* const slash = std::wcsrchr(path, L'\\');
+    if (_wcsicmp(slash != nullptr ? slash + 1 : path, L"sl.interposer.dll") == 0) out[count++] = modules[i];
+  }
+  return count;
+}
+
+HMODULE FindGameInterposer() {
+  HMODULE all[8];
+  const int count = AllInterposers(all, 8);
+  g_only_hsf_streamline = false;
+  if (g_picked != nullptr) {
+    for (int i = 0; i < count; ++i)
+      if (all[i] == g_picked) return g_picked;
+    g_picked = nullptr;
+  }
+  const HMODULE first = GetModuleHandleW(L"sl.interposer.dll");
+  if (first == nullptr || !IsHsfStreamline(first)) return first;
+  for (int i = 0; i < count; ++i)
+    if (!IsHsfStreamline(all[i])) return all[i];
+  g_only_hsf_streamline = true;
+  static bool s_said = false;
+  if (!s_said) {
+    s_said = true;
+    Line("sl.interposer.dll loaded is HSF's own (HSF_streamline), not the game's: left to the bring route, no hooks here");
+  }
+  return nullptr;
+}
 
 void HookInterposer(HMODULE module) {
   wchar_t path[MAX_PATH] = L"?";
@@ -1329,6 +1460,9 @@ Hook g_other_hooks[8];
 
 bool HookFunction(const char* name, void* target, void* hook_function, void** real, void (*log)(const char* text)) {
   Lock lock;
+  // Already hooked (a rescan asks again): nothing to do.
+  for (const Hook& hook : g_other_hooks)
+    if (hook.name != nullptr && hook.installed && hook.target == target && std::strcmp(hook.name, name) == 0) return true;
   for (Hook& hook : g_other_hooks) {
     if (hook.name != nullptr) continue;
     hook.name = name;
@@ -1571,7 +1705,7 @@ void Start(const wchar_t* log_path, bool drive, bool dynamic_resolution_known) {
   wchar_t exe[MAX_PATH] = L"?";
   GetModuleFileNameW(nullptr, exe, MAX_PATH);
   Line("=== HSF started in %ls. %s ===", exe, drive ? "Driving DLSS-G inside the game." : "Only logging: every call goes on unchanged.");
-  g_interposer = GetModuleHandleW(L"sl.interposer.dll");
+  g_interposer = FindGameInterposer();
   if (g_interposer != nullptr) HookInterposer(g_interposer);
   else Line("sl.interposer.dll not loaded yet");
 }
@@ -1683,6 +1817,42 @@ void ResendReflex() {
   }
 }
 
+int ListInterposers(Interposer* out, int max) {
+  HMODULE all[8];
+  const int count = AllInterposers(all, std::min(max, 8));
+  Lock lock;
+  for (int i = 0; i < count; ++i) {
+    out[i] = Interposer{};
+    out[i].module = all[i];
+    GetModuleFileNameW(all[i], out[i].path, MAX_PATH);
+    out[i].hsf_own = IsHsfStreamline(all[i]);
+    out[i].in_use = all[i] == g_interposer;
+  }
+  return count;
+}
+
+void PickInterposer(void* module) {
+  Lock lock;
+  g_picked = static_cast<HMODULE>(module);
+  Line("sl.interposer.dll %p picked in the menu", module);
+  g_next_poll = 0;  // the next Poll sees the change and hooks it
+}
+
+void Rescan() {
+  Lock lock;
+  Line("=== rescan: hooks that did not go in are tried again, and DLSS-G's functions asked for again ===");
+  if (g_interposer != nullptr && !g_old_streamline.load(std::memory_order_relaxed)) {
+    for (Hook& hook : g_hooks) {
+      if (hook.installed) continue;
+      void* const function = reinterpret_cast<void*>(GetProcAddress(g_interposer, hook.name));
+      if (function != nullptr) Install(hook, static_cast<uint8_t*>(function));
+    }
+  }
+  g_asked_features = false;
+  g_next_ask = 0;
+  g_next_poll = 0;
+}
+
 void Poll() {
   if (g_drive.load(std::memory_order_relaxed) && !g_old_streamline.load(std::memory_order_relaxed)) {
     DriveFrame();
@@ -1696,7 +1866,7 @@ void Poll() {
     Lock lock;
     if (!g_started) return;
     Summary();
-    const HMODULE module = GetModuleHandleW(L"sl.interposer.dll");
+    const HMODULE module = FindGameInterposer();
     if (module != g_interposer) {
       Line("sl.interposer.dll changed: %p to %p", g_interposer, module);
       ForEachHook([](Hook& hook) { hook.installed = false; });
@@ -1711,9 +1881,8 @@ void Poll() {
       if (module != nullptr) HookInterposer(module);
     }
     // HSF may have arrived after the game asked for these, so ask too. Only reads a pointer. Waits until frames run, as Streamline must be up, and tries again now and then until DLSS-G answers.
-    static ULONGLONG s_next_ask = 0;
-    if (!g_asked_features && g_frames > 30 && g_real_get_function != nullptr && now >= s_next_ask) {
-      s_next_ask = now + 10000;
+    if (!g_asked_features && g_frames > 30 && g_real_get_function != nullptr && now >= g_next_ask) {
+      g_next_ask = now + 10000;
       void* const options = AskFor(sl::kFeatureDLSS_G, "slDLSSGSetOptions");
       void* const state = AskFor(sl::kFeatureDLSS_G, "slDLSSGGetState");
       AskFor(sl::kFeatureDLSS, "slDLSSSetOptions");
@@ -1975,6 +2144,14 @@ Stats GetStats() {
   }
   stats.vectors_doubted = g_vectors_doubted.load();
   stats.old_streamline = g_old_streamline.load();
+  stats.tag_failures = g_tag_failures.load(std::memory_order_relaxed);
+  {
+    Lock lock;
+    stats.game_frames = g_frames;
+    stats.interposer_found = g_interposer != nullptr;
+    stats.only_hsf_streamline = g_only_hsf_streamline;
+    ForEachHook([&](Hook& hook) { stats.hooks_installed += hook.installed ? 1u : 0u; });
+  }
   return stats;
 }
 

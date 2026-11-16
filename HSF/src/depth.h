@@ -38,6 +38,8 @@ void SetUpsideDown(int setting);
 // Off (the default): the depth is stretched over the whole copy, as before.
 void SetFitPicture(bool on);
 Status Current();
+// How many read-backs have been measured since the start (one every read period): tells a caller whether Current() is newer than a moment.
+uint32_t Reads();
 // Game thread. Vectors of another shape than the picture (a game's own DLSS data, at the game's 16:9 picture centred on a wider screen) as R16G16_FLOAT at
 // width x height, in DLSS-G's units (offset towards the previous frame in UV of the whole copy). The part (x, y, used_width x used_height) of `motion` goes
 // into the copy's middle at its own shape (the whole copy when the shapes match), with no motion in the bars. `to_pixels` turns a vector into pixels of
@@ -51,6 +53,8 @@ ID3D11ShaderResourceView* View();
 const char* Problem();
 // How long to wait from one read-back to the next (default 250 ms; tests use 0).
 void SetPeriod(uint32_t ms);
+// Flat read-backs in a row a depth seen before is kept through (0, the default: dropped at the first).
+void SetFlatHold(uint32_t reads);
 // Releases everything. Call before the game's device goes away; Frame builds it all again.
 void Shutdown();
 

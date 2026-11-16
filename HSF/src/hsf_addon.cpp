@@ -25,6 +25,7 @@
 #include "motion_convention.h"
 #include "ui.h"
 #include "dxgi_guard.h"
+#include "ngx_vk.h"  // FrameVk only in the 32-bit build, which has no NGX hooks
 #ifdef HSF_SL_GAME
 #include <d3d12.h>
 #include "sl_bring.h"
@@ -41,6 +42,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdarg>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -145,6 +147,12 @@ bool g_motion_fitted = false;
 // HSF.ini FlowPause: while a DLSS mod's data feeds DLSS-G, the flow effect is switched off (it costs GPU time for nothing) and back on when the data stops.
 bool g_flow_pause = true;
 bool g_using_dlss = false;  // DLSS-G got the game's own DLSS data this frame, not flow (D3D12 routes)
+bool g_vk_dlss_live = false;  // Vulkan: the game's DLSS data (ngx_vk.h) goes to DLSS-G this frame in place of the flow
+bool g_vk_dlss_depth = false;  // and its depth with it
+// The game's DLSS depth read flat in every read-back from its start (CheckVkDlssDepth): the effect's depth is used in its place until the device goes.
+bool g_vk_dlss_depth_empty = false;
+bool g_vk_dlss_depth_good = false;      // a read-back of the DLSS depth was not flat: it is kept
+uint32_t g_vk_dlss_depth_since = 0;     // the read-back count from which Current() is of the DLSS depth, 0 before the first set with it
 uint32_t g_mfg_key = VK_F7;   // HSF.ini MfgKey: virtual-key code that cycles DlssgFrames in game (0 = none)
 // HSF.ini FpsCap: frames on screen per second (real + generated; 0 = no cap). With DLSS-G it is Reflex's FPS cap, applied where the game
 // thread sleeps on Reflex; otherwise HSF's own limiter holds the game thread after its Present.
@@ -162,8 +170,27 @@ uint32_t CapRule(long long value) {
 bool g_gpu_reserve = true;
 hsf::reserve::Governor g_reserve;
 hsf::reserve::LoadReader* const g_load_reader = new hsf::reserve::LoadReader;  // kept for the whole run: its thread uses it
-// The FPS cap sent through Reflex: the player's, or the reserve's while it is lower.
-uint32_t CapInForce() { return g_reserve.InForce(g_fps_cap); }
+uint32_t MainMonitorHz();
+void Log(const char* text);
+// With no FPS cap set, a Vulkan game with frame generation can send DLSS-G more frames than the monitor shows (Kyty: 62 real x3 on 155 Hz). The
+// helper's pacing then holds the game back unevenly: uneven frame times and latency spikes. Then HSF caps the frames on screen a little below the
+// main monitor's refresh rate. A cap the player sets always wins; below the cap it costs nothing.
+uint32_t RefreshCap() {
+  if (g_fps_cap != 0 || g_seen.api != device_api::vulkan || !hsf::dlssg::Feeding()) return 0;
+  const uint32_t hz = MainMonitorHz();
+  if (hz < 60) return 0;
+  const uint32_t cap = CapRule(hz - std::max(3u, hz / 20));
+  static uint32_t logged = 0;
+  if (logged != cap) {
+    logged = cap;
+    char text[200];
+    std::snprintf(text, sizeof(text), "FPS cap: none set, so frames on screen are held to %u (the main monitor runs at %u Hz) while DLSS-G runs on Vulkan", cap, hz);
+    Log(text);
+  }
+  return cap;
+}
+// The FPS cap sent through Reflex: the player's (or the refresh cap without one), or the reserve's while it is lower.
+uint32_t CapInForce() { return g_reserve.InForce(g_fps_cap != 0 ? g_fps_cap : RefreshCap()); }
 bool g_reflex_boost = false;  // HSF.ini ReflexBoost: Reflex low latency + boost (keeps GPU clocks up)
 bool g_vk_overlay_window = true;  // HSF.ini VkOverlayWindow (default 1; 0 = the child window as before): on the Vulkan route the helper presents from a click-through window of its own (dlssg_link.h, version 13)
 bool g_overlay_window = true;  // HSF.ini OverlayWindow (default 1; 0 = the child window as before): the same click-through window on the D3D11 and DX9 routes. A child window shares the game thread's input queue and lost mouse moves with the pointer inside the window (FF7R)
@@ -309,7 +336,7 @@ char g_note[160] = "waiting for the first frame";
 
 void Note(const char* text) { std::snprintf(g_note, sizeof(g_note), "%s", text); }
 
-// The main monitor's refresh rate in Hz, 0 if Windows does not say. Only the panel asks, and it looks again once a second so a changed mode shows up.
+// The main monitor's refresh rate in Hz, 0 if Windows does not say. The panel and RefreshCap ask; it looks again once a second so a changed mode shows up.
 uint32_t MainMonitorHz() {
   static uint32_t hz = 0;
   static ULONGLONG next_look = 0;
@@ -612,6 +639,16 @@ LONGLONG g_last_frame = 0;
 
 // HSF's own FPS cap, for when Reflex is not there (no DLSS-G presenter): holds the game thread after its Present until the next frame's time.
 // A high-resolution waitable timer for most of the wait, then a short spin. A frame later than one whole period restarts the timeline.
+// While DLSS-G runs, Reflex holds the FPS cap by sleeping the game thread. With REFLEX OFF nothing sleeps, so HSF's own limiter holds the cap
+// instead, per real frame; otherwise the game runs past the cap and only the helper's pacing holds it back, unevenly. 0: no wait here.
+uint32_t CapWithoutReflex() {
+  const uint32_t cap = CapInForce();
+  if (g_reflex_sleep || cap == 0) return 0;
+  uint32_t generated = g_extra_enabled ? std::max(g_dlssg_frames, 1u) : 0;
+  if (g_dlssg_stats.max_frames != 0) generated = std::min(generated, g_dlssg_stats.max_frames);
+  return std::max(cap / (generated + 1), 1u);
+}
+
 void CapWait(uint32_t fps) {
   static LONGLONG next = 0;
   static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -688,7 +725,7 @@ HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* self, UINT sync_interval
     // The game's next frame starts once its Present returns: Reflex sleeps the game thread here (low latency + FPS cap) with DLSS-G, HSF's
     // own limiter without it.
     if (hsf::dlssg::Feeding()) {
-      CapWait(0);
+      CapWait(CapWithoutReflex());
       hsf::dlssg::FrameStart();
     } else {
       CapWait(g_fps_cap);
@@ -745,7 +782,9 @@ void UnhookNativePresent() {
 }
 
 // Whether DLSS-G gets real depth: the D3D11/D3D12 copy, or in a DX9 game the HSF.fx depth the bridge carries.
-bool DepthSent() { return g_depth_texture != nullptr || ((g_depth9 != nullptr || g_depth_vk.handle != 0) && hsf::dlssg::Running()); }
+bool DepthSent() {
+  return g_depth_texture != nullptr || ((g_depth9 != nullptr || g_depth_vk.handle != 0 || g_vk_dlss_depth) && hsf::dlssg::Running());
+}
 
 bool Dx9DepthLine(char* text, size_t size, const char* sent);
 
@@ -764,7 +803,7 @@ void DepthLine(char* text, size_t size) {
   else if (!s.measured)
     std::snprintf(text, size, "depth: %s; %ux%u format %u, %u sample(s), not measured yet", sent, s.width, s.height, static_cast<unsigned>(s.format), s.samples);
   else
-    std::snprintf(text, size, "depth: %s; %ux%u format %u, %u sample(s), values %.4f / %.4f / %.4f%s, %s%s, %s%s (edges %.5f, mirrored %.5f)", sent, s.width, s.height, static_cast<unsigned>(s.format), s.samples,
+    std::snprintf(text, size, "depth: %s; %ux%u format %u, %u sample(s), values %.6g / %.6g / %.6g%s, %s%s, %s%s (edges %.5f, mirrored %.5f)", sent, s.width, s.height, static_cast<unsigned>(s.format), s.samples,
                   s.lowest, s.median, s.highest, s.flat ? ", flat" : "", g_depth_inverted ? "reversed" : "normal", g_depth_inverted_setting >= 0 ? " (HSF.ini)" : " (found)",
                   s.upside_down ? "upside down" : "upright", g_depth_upside_down_setting >= 0 ? " (HSF.ini)" : " (found)", s.edges_same, s.edges_mirrored);
 }
@@ -990,7 +1029,7 @@ bool StopHelperWhileOff() {
     Log("frame gen turned OFF and the helper closed: the GPU could not keep up with DLSS-G; the game shows its own frames again. Turn FRAME GEN on to try again");
   }
   if (g_extra_enabled) g_helper_closed = false;
-  const bool no_motion = g_extra_enabled && !g_seen.have_motion && !NvofOn();
+  const bool no_motion = g_extra_enabled && !g_seen.have_motion && !NvofOn() && !g_vk_dlss_live;
   const ULONGLONG now = GetTickCount64();
   if (!no_motion) g_no_motion_since = 0;
   else if (g_no_motion_since == 0) g_no_motion_since = now;
@@ -2510,6 +2549,9 @@ int g_bring_view = 0;
 bool g_bring_using_game = false;  // BringFrame sent the game's own DLSS data this frame, not flow
 
 // This frame's flow (LaunchPad) and depth copy (HSF.fx) as native textures, switching their techniques on as needed. False, with a line in the log once, while either is missing.
+// What the last look for flow and depth found, for the menu's DLSS finder: 0 not looked yet, 1 found, 2 no flow effect, 3 no depth copy, 4 the flow's direction not known.
+int g_flow_state = 0;
+
 bool FindFlowAndDepth(effect_runtime* runtime, device* dev, ID3D12Resource** motion_out, ID3D12Resource** depth_out) {
   static ULONGLONG next_search = 0;
   static effect_texture_variable depth_variable = {};
@@ -2553,6 +2595,7 @@ bool FindFlowAndDepth(effect_runtime* runtime, device* dev, ID3D12Resource** mot
   // With NVOF on and no flow effect, NVOF makes the flow alone: depth is enough, and the effect's sign convention does not apply (motion stays nullptr).
   const bool nvof_alone = motion == nullptr && NvofOn();
   if (nvof_alone && depth != nullptr) {
+    g_flow_state = 1;
     static bool logged_alone = false;
     if (!logged_alone) {
       logged_alone = true;
@@ -2562,6 +2605,8 @@ bool FindFlowAndDepth(effect_runtime* runtime, device* dev, ID3D12Resource** mot
     *depth_out = depth;
     return true;
   }
+  g_flow_state = motion == nullptr ? 2 : depth == nullptr ? 3 : Convention() == 0 ? 4 : 1;
+  if (nvof_alone && depth == nullptr) g_flow_state = 3;
   if (motion == nullptr || depth == nullptr || Convention() == 0) {
     static const ULONGLONG first_look = now;
     if (!logged_missing && now - first_look > 20000) {
@@ -2880,14 +2925,24 @@ void BeforePresent9() {
   hsf::dlssg::Submit(f.color, inputs);
 }
 
+// The last AfterPresent9's waits in ms, for the Vulkan frame-time log: HSF's own FPS cap, and the start of the frame (Reflex's sleep and the helper's pacing).
+float g_cap_wait_ms = 0, g_start_wait_ms = 0;
+void LogVkFrameTimes();
+
 void AfterPresent9() {
+  const LONGLONG before = Now();
+  LONGLONG capped = before;
   if (hsf::dlssg::Feeding()) {
-    CapWait(0);
+    CapWait(CapWithoutReflex());
+    capped = Now();
     hsf::dlssg::FrameStart();
   } else {
     CapWait(g_fps_cap);
+    capped = Now();
   }
   const LONGLONG now = Now();
+  g_cap_wait_ms = static_cast<float>(Seconds(capped - before) * 1000.0);
+  g_start_wait_ms = static_cast<float>(Seconds(now - capped) * 1000.0);
   if (g_last_frame != 0) g_frame_ms[g_frame_write++ % FRAME_HISTORY] = static_cast<float>(std::min(Seconds(now - g_last_frame) * 1000.0, 1000.0));
   g_last_frame = now;
 }
@@ -3393,10 +3448,18 @@ void Dx9Frame(effect_runtime* runtime, device* dev) {
 // helper exactly like a D3D11 game's. The copies are queued at ReShade's present (overlays drawn) and handed over one frame later, once the
 // game's GPU finished them. Reflex's frame start runs right after the hand-off, still before the game's own present.
 
+char g_vk_presenter_error[320] = "";  // why the presenter last refused to start, "" once it runs; the DLSS finder shows it
+bool g_vk_rescan = false;             // RESCAN: try the presenter again on a window and size it refused
+uint64_t g_vk_handed_total = 0;       // frames handed to DLSS-G over the bridge this run
+
 // Starts, restarts (new window or size) or stops DLSS-G for a Vulkan game.
 void UpdatePresenterVk(effect_runtime* runtime, device* dev) {
   static HWND running_window = nullptr, refused_window = nullptr;
   static UINT running_size[2] = {}, refused_size[2] = {};
+  if (g_vk_rescan) {
+    g_vk_rescan = false;
+    refused_window = nullptr;
+  }
   if (StopHelperWhileOff()) {
     refused_window = nullptr;
     return;
@@ -3411,6 +3474,13 @@ void UpdatePresenterVk(effect_runtime* runtime, device* dev) {
   const resource_desc desc = dev->get_resource_desc(back);
   const HWND window = static_cast<HWND>(runtime->get_hwnd());
   const UINT width = desc.texture.width, height = desc.texture.height;
+  // Once the game's DLSS data has been seen, the motion goes over at the back buffer's size (VkFitMotion), whichever source: the helper's slots
+  // keep the size of the first motion after a start, so slots made earlier at the flow's own size are made again.
+  UINT slot_width = 0, slot_height = 0;
+  if (g_dlss_seen && hsf::dlssg::Running() && hsf::dlssg::MotionSize(&slot_width, &slot_height) && (slot_width != width || slot_height != height)) {
+    stop("presenter restarted: the motion goes over at the back buffer's size from now on (the game's DLSS data was seen)");
+    return;
+  }
   if (hsf::dlssg::Running() && window == running_window && width == running_size[0] && height == running_size[1]) return;
   if (window == refused_window && width == refused_size[0] && height == refused_size[1]) return;  // failed for this window and size already
   if (hsf::dlssg::Running()) {
@@ -3429,6 +3499,7 @@ void UpdatePresenterVk(effect_runtime* runtime, device* dev) {
     started = hsf::dlssg::Start(hsf::vk::Device(), window, width, height, format, g_sl_folder, error, sizeof(error));
   }
   if (started) {
+    g_vk_presenter_error[0] = '\0';
     running_window = window;
     running_size[0] = width;
     running_size[1] = height;
@@ -3442,6 +3513,7 @@ void UpdatePresenterVk(effect_runtime* runtime, device* dev) {
     refused_window = window;
     refused_size[0] = width;
     refused_size[1] = height;
+    std::snprintf(g_vk_presenter_error, sizeof(g_vk_presenter_error), "%s", error);
     std::snprintf(text, sizeof(text), "presenter could not start: %s", error);
     Note(text);
   }
@@ -3530,35 +3602,66 @@ void UpdateVkView(device* dev) {
 
 // HSF's depth module (depth.h) on the bridged depth copy, on HSF's own D3D11 device: it finds whether the depth is reversed or upside down,
 // measures it for the log and the panel, and gives DLSS-G the copy at the flow's size, put right side up, like in a D3D11 game.
-struct VkDepthViews {
+// Views of the bridge's textures on HSF's D3D11 device, one per set (the bridge keeps 3), made once each.
+struct VkViews {
   ID3D11Texture2D* texture[3] = {};
   ComPtr<ID3D11ShaderResourceView> view[3];
+  int next = 0;
 };
-VkDepthViews g_vk_depth_views;
+VkViews g_vk_depth_views, g_vk_motion_views;
+
+ID3D11ShaderResourceView* VkView(VkViews& views, ID3D11Texture2D* texture) {
+  ID3D11Device* const d11 = hsf::vk::Device();
+  if (texture == nullptr || d11 == nullptr) return nullptr;
+  for (int i = 0; i < 3; ++i)
+    if (views.texture[i] == texture) return views.view[i].Get();
+  views.next = (views.next + 1) % 3;
+  views.view[views.next].Reset();
+  views.texture[views.next] = nullptr;
+  if (FAILED(d11->CreateShaderResourceView(texture, nullptr, &views.view[views.next]))) return nullptr;
+  views.texture[views.next] = texture;
+  return views.view[views.next].Get();
+}
 
 void StopVkDepth() {
   hsf::depth::Shutdown();
-  g_vk_depth_views = VkDepthViews{};
+  g_vk_depth_views = VkViews{};
+  g_vk_motion_views = VkViews{};
 }
 
-ID3D11Texture2D* VkDepth(const hsf::vk::Frame& f) {
-  ID3D11Device* const d11 = hsf::vk::Device();
-  if (f.depth == nullptr || d11 == nullptr) return nullptr;
-  ID3D11ShaderResourceView* srv = nullptr;
-  for (int i = 0; i < 3 && srv == nullptr; ++i)
-    if (g_vk_depth_views.texture[i] == f.depth) srv = g_vk_depth_views.view[i].Get();
-  if (srv == nullptr) {
-    static int next = 0;
-    next = (next + 1) % 3;
-    g_vk_depth_views.view[next].Reset();
-    g_vk_depth_views.texture[next] = nullptr;
-    if (FAILED(d11->CreateShaderResourceView(f.depth, nullptr, &g_vk_depth_views.view[next]))) return nullptr;
-    g_vk_depth_views.texture[next] = f.depth;
-    srv = g_vk_depth_views.view[next].Get();
+// A game can hand DLSS a depth image that holds nothing (Kyty's reads 0 everywhere). After the read-back in flight, every read-back of the DLSS
+// depth for about 2 s flat, and none of it ever not flat: the effect's depth (the game's depth buffer) is used in its place until the device goes.
+void CheckVkDlssDepth() {
+  if (g_vk_dlss_depth_good || g_vk_dlss_depth_empty) return;
+  const uint32_t reads = hsf::depth::Reads();
+  if (g_vk_dlss_depth_since == 0) {
+    g_vk_dlss_depth_since = reads + 2;  // the read in flight may still be of the depth before
+    return;
   }
+  if (reads < g_vk_dlss_depth_since) return;
+  const hsf::depth::Status s = hsf::depth::Current();
+  if (!s.flat) {
+    g_vk_dlss_depth_good = true;
+    return;
+  }
+  if (reads - g_vk_dlss_depth_since < 8) return;
+  g_vk_dlss_depth_empty = true;
+  g_vk_dlss_depth = false;
+  char text[260];
+  std::snprintf(text, sizeof(text), "Vulkan DLSS: the game's DLSS depth read flat (%g to %g) in every read-back for about 2 s, so the effect's depth is used in its place",
+                s.lowest, s.highest);
+  Log(text);
+}
+
+// The bridged depth at the size of `size_of` (the motion going to DLSS-G).
+ID3D11Texture2D* VkDepth(const hsf::vk::Frame& f, ID3D11Texture2D* size_of) {
+  ID3D11Device* const d11 = hsf::vk::Device();
+  ID3D11ShaderResourceView* const srv = VkView(g_vk_depth_views, f.depth);
+  if (srv == nullptr) return nullptr;
   D3D11_TEXTURE2D_DESC size{};
-  (f.motion != nullptr ? f.motion : f.color)->GetDesc(&size);
+  size_of->GetDesc(&size);
   hsf::depth::SetUpsideDown(g_depth_upside_down_setting);
+  hsf::depth::SetFlatHold(4);  // about a second of flat read-backs before the depth is dropped
   ID3D11Texture2D* const copy = hsf::depth::Frame(d11, srv, size.Width, size.Height, f.hudless != nullptr ? f.hudless : f.color);
   g_depth_inverted = g_depth_inverted_setting >= 0 ? g_depth_inverted_setting != 0 : hsf::depth::Current().inverted;
   return copy;
@@ -3579,9 +3682,86 @@ void VkScore(const hsf::vk::Frame& f) {
   hsf::score::Frame(hsf::vk::Device(), f.hudless != nullptr ? f.hudless : f.color, score_inputs);
 }
 
+// The game's DLSS data on Vulkan (ngx_vk.h): a mod that runs DLSS on the game (GITC Uplift in the Kyty emulator) hands NGX the game's vectors and depth.
+// While they keep coming and MOTION is not FLOW, DLSS-G gets them in place of the flow. From the first such frame on, the motion goes over at the back
+// buffer's size whichever source (VkFitMotion), so the two can take turns (no DLSS in menus) in the helper's one slot size. With FlowPause the flow
+// effect is off while the data comes.
+hsf::ngx::FrameVk g_vk_dlss_frame;
+
+void VkDlssMotion(effect_runtime* runtime, device* dev) {
+#ifdef HSF_SL_GAME
+  static bool started = false;
+  if (!started) {
+    started = true;
+    hsf::ngx::StartVk(&Log);
+  }
+  hsf::ngx::PollVk(dev);
+  static uint64_t last_serial = 0;
+  static int quiet = 0;
+  bool use = false;
+  if (hsf::ngx::LatestVk(&g_vk_dlss_frame)) {
+    quiet = g_vk_dlss_frame.serial != last_serial ? 0 : std::min(quiet + 1, 1000);
+    last_serial = g_vk_dlss_frame.serial;
+    if (quiet < 3) g_dlss_seen = true;
+    use = quiet < 3 && MotionFrom() != 1;
+  }
+  // Once: whether the calls go to the queue the frames are presented on. On another queue nothing orders HSF's bridge copy after the call's copy.
+  static bool queue_logged = false;
+  if (!queue_logged && use) {
+    if (void* const call_queue = hsf::ngx::SubmitQueueVk()) {
+      queue_logged = true;
+      Log(call_queue == reinterpret_cast<void*>(runtime->get_command_queue()->get_native())
+              ? "Vulkan DLSS: the calls go to the queue the frames are presented on"
+              : "Vulkan DLSS: the calls go to another queue than the one the frames are presented on");
+    }
+  }
+  PauseFlow(runtime, use && g_flow_pause);
+  if (use != g_vk_dlss_live) {
+    char text[240];
+    std::snprintf(text, sizeof(text),
+                  use ? "Vulkan: motion from the game's own DLSS data (%ux%u in use), put into the picture's middle at the back buffer's size, with %s"
+                      : "Vulkan: motion from flow (no DLSS data from the game now, or MOTION is FLOW)",
+                  g_vk_dlss_frame.width, g_vk_dlss_frame.height, g_vk_dlss_frame.depth.handle != 0 && !g_vk_dlss_depth_empty ? "its depth" : "the effect's depth");
+    Log(text);
+  }
+  g_vk_dlss_live = use;
+  g_vk_dlss_depth = use && g_vk_dlss_frame.depth.handle != 0 && !g_vk_dlss_depth_empty;
+  g_using_dlss = use;
+#else
+  (void)runtime;
+  (void)dev;
+#endif
+}
+
+#ifdef HSF_SL_GAME
+// ReShade's execute_command_list: a Vulkan DLSS call's copy is handed over only once its command buffer went to a queue (ngx_vk.h).
+void OnVkSubmit(command_queue* queue, command_list* cmd) {
+  if (hsf::ngx::LoadedVk()) hsf::ngx::OnSubmitVk(queue, cmd);
+}
+#endif
+
+// The motion for DLSS-G at the back buffer's size, in DLSS-G's units (scale 1), once the game's DLSS data has been seen: the DLSS vectors into the
+// picture's middle at their own shape, the flow scaled up. `dlss` says which the bridged set holds. Before any DLSS data: `motion` as it is (nullptr = as it is).
+ID3D11Texture2D* VkFitMotion(ID3D11Texture2D* motion, bool dlss) {
+  if (!g_dlss_seen || motion == nullptr || g_seen.width == 0 || g_seen.height == 0) return nullptr;
+  ID3D11ShaderResourceView* const srv = VkView(g_vk_motion_views, motion);
+  if (srv == nullptr) return nullptr;
+  D3D11_TEXTURE2D_DESC m{};
+  motion->GetDesc(&m);
+  if (dlss) return hsf::depth::FitMotion(hsf::vk::Device(), srv, 0, 0, m.Width, m.Height, g_vk_dlss_frame.to_pixels, g_seen.width, g_seen.height);
+  if (Convention() == 0) return nullptr;
+  float to_pixels[2];
+  hsf::motion::ConventionScale(Convention(), static_cast<float>(g_seen.width), static_cast<float>(g_seen.height), static_cast<float>(m.Width), static_cast<float>(m.Height),
+                                to_pixels);
+  to_pixels[0] *= static_cast<float>(m.Width) / static_cast<float>(g_seen.width);
+  to_pixels[1] *= static_cast<float>(m.Height) / static_cast<float>(g_seen.height);
+  return hsf::depth::FitMotion(hsf::vk::Device(), srv, 0, 0, m.Width, m.Height, to_pixels, g_seen.width, g_seen.height, true);
+}
+
 // At ReShade's finish_effects in a Vulkan game.
 void VkFrame(effect_runtime* runtime, device* dev, resource target) {
   FindDepth9(runtime, dev);
+  VkDlssMotion(runtime, dev);
   // No game depth: ReShade binds a placeholder (no view, or a tiny texture) to HSF.fx's DEPTH texture, and the copy holds nothing. DLSS-G then
   // gets a constant depth, as in a D3D11 game, instead of a copy of nothing.
   {
@@ -3626,6 +3806,7 @@ void VkFrame(effect_runtime* runtime, device* dev, resource target) {
   const ULONGLONG now = GetTickCount64();
   if (now >= next_log && hsf::dlssg::Running()) {
     next_log = now + 10000;
+    LogVkFrameTimes();
     const hsf::vk::Stats s = hsf::vk::TakeStats();
     char text[800];
     char waits[120] = "";
@@ -3640,26 +3821,129 @@ void VkFrame(effect_runtime* runtime, device* dev, resource target) {
 
 bool g_vk_finish_present = false;  // ReShade calls finish_present for the Vulkan game: the next frame starts there (OnVkFinishPresent)
 
+// Where each real frame's time goes on a Vulkan game's present thread, for LogVkFrameTimes. A frame runs from the end of one AfterPresent9 to
+// the end of the next: the game's own work, HSF at reshade_present, the game's vkQueuePresentKHR (only seen with finish_present), HSF's cap
+// wait, and the wait at the frame start (Reflex's sleep, the helper's pacing).
+struct VkFrameTime {
+  float total, hsf, present, cap, start;
+};
+std::vector<VkFrameTime> g_vk_times;
+LONGLONG g_vk_present_at = 0, g_vk_hsf_done = 0, g_vk_finish_at = 0, g_vk_frame_end = 0;
+
+void RecordVkFrame() {
+  const LONGLONG now = Now();
+  const auto ms = [](LONGLONG ticks) { return static_cast<float>(Seconds(ticks) * 1000.0); };
+  if (g_vk_frame_end != 0 && g_vk_present_at > g_vk_frame_end && g_vk_times.size() < 4000) {
+    VkFrameTime t;
+    t.total = ms(now - g_vk_frame_end);
+    t.hsf = ms(g_vk_hsf_done - g_vk_present_at);
+    t.present = g_vk_finish_present && g_vk_finish_at > g_vk_hsf_done ? ms(g_vk_finish_at - g_vk_hsf_done) : 0.f;
+    t.cap = g_cap_wait_ms;
+    t.start = g_start_wait_ms;
+    g_vk_times.push_back(t);
+  }
+  g_vk_frame_end = now;
+}
+
+struct Spread {
+  size_t count = 0;
+  float median = 0, p95 = 0, worst = 0, spikes = 0;
+};
+Spread SpreadOf(std::vector<float> v) {
+  Spread s;
+  s.count = v.size();
+  if (v.empty()) return s;
+  s.spikes = hsf::reserve::Spikes(v.data(), v.size());
+  std::sort(v.begin(), v.end());
+  s.median = v[v.size() / 2];
+  s.p95 = v[std::min(v.size() - 1, v.size() * 95 / 100)];
+  s.worst = v.back();
+  return s;
+}
+
+// Every 10 s while DLSS-G runs on Vulkan: how even the real frames are, and in the frames that spiked, which part took the extra time.
+void LogVkFrameTimes() {
+  std::vector<VkFrameTime> times;
+  times.swap(g_vk_times);
+  if (times.size() < 10) return;
+  std::vector<float> totals;
+  for (const VkFrameTime& t : times) totals.push_back(t.total);
+  const Spread s = SpreadOf(totals);
+  // Averages of each part, for the spike frames and for the rest.
+  float spike[5] = {}, normal[5] = {};
+  size_t spike_count = 0, normal_count = 0;
+  for (const VkFrameTime& t : times) {
+    const bool is_spike = t.total > s.median * 1.5f && t.total > s.median + 4.f;
+    float* const sum = is_spike ? spike : normal;
+    const float game = std::max(t.total - t.hsf - t.present - t.cap - t.start, 0.f);
+    sum[0] += game, sum[1] += t.hsf, sum[2] += t.present, sum[3] += t.cap, sum[4] += t.start;
+    ++(is_spike ? spike_count : normal_count);
+  }
+  for (int i = 0; i < 5; ++i) {
+    if (spike_count != 0) spike[i] /= static_cast<float>(spike_count);
+    if (normal_count != 0) normal[i] /= static_cast<float>(normal_count);
+  }
+  char text[900];
+  int at = std::snprintf(text, sizeof(text),
+                         "frame times (%zu real frames): median %.1f ms, 95%% %.1f, worst %.1f, spikes %.0f%%; parts in ms (game / HSF at present / present call%s / "
+                         "HSF cap wait / frame start wait): normal %.1f / %.2f / %.1f / %.1f / %.1f",
+                         s.count, s.median, s.p95, s.worst, s.spikes * 100.f, g_vk_finish_present ? "" : " not seen", normal[0], normal[1], normal[2], normal[3], normal[4]);
+  if (spike_count != 0 && at > 0 && static_cast<size_t>(at) < sizeof(text))
+    at += std::snprintf(text + at, sizeof(text) - at, ", spikes %.1f / %.2f / %.1f / %.1f / %.1f", spike[0], spike[1], spike[2], spike[3], spike[4]);
+#ifdef HSF_SL_GAME
+  std::vector<float> calls, submits;
+  hsf::ngx::TakeTimesVk(calls, submits);
+  const Spread c = SpreadOf(calls), u = SpreadOf(submits);
+  if (c.count != 0 && at > 0 && static_cast<size_t>(at) < sizeof(text))
+    at += std::snprintf(text + at, sizeof(text) - at,
+                        "; DLSS calls apart (%zu): median %.1f, 95%% %.1f, worst %.1f, spikes %.0f%%; their submits apart (%zu): median %.1f, 95%% %.1f, worst %.1f, spikes %.0f%%",
+                        c.count, c.median, c.p95, c.worst, c.spikes * 100.f, u.count, u.median, u.p95, u.worst, u.spikes * 100.f);
+#endif
+  Log(text);
+}
+
 // ReShade's present in a Vulkan game: the frame is finished. Queues its copies, hands an earlier finished one to DLSS-G, then the next frame starts.
 void OnVkPresent(effect_runtime* runtime) {
   if (runtime->get_device()->get_api() != device_api::vulkan) return;
+  g_vk_present_at = Now();
   ++g_game_presents;
   if (hsf::dlssg::Feeding()) {
-    const hsf::vk::Frame f =
-        hsf::vk::Bridge(runtime->get_command_queue(), runtime->get_current_back_buffer(), resource_usage::present, g_motion_vk, g_depth_vk);
-    if (f.color != nullptr) {
+    // The game's DLSS data (VkDlssMotion) in place of the flow, with its depth when it was copied.
+    const bool dlss = g_vk_dlss_live;
+    const resource motion = dlss ? g_vk_dlss_frame.motion : g_motion_vk;
+    const bool dlss_depth = dlss && g_vk_dlss_frame.depth.handle != 0 && !g_vk_dlss_depth_empty;
+    const resource depth = dlss_depth ? g_vk_dlss_frame.depth : g_depth_vk;
+    const hsf::vk::Frame f = hsf::vk::Bridge(runtime->get_command_queue(), runtime->get_current_back_buffer(), resource_usage::present, motion, depth);
+    // The set handed over can be an earlier frame's: it holds the DLSS vectors when its motion has their copy's size.
+    bool set_dlss = false;
+    if (f.motion != nullptr && g_dlss_seen) {
+      D3D11_TEXTURE2D_DESC m{};
+      f.motion->GetDesc(&m);
+      set_dlss = dlss && m.Width == g_vk_dlss_frame.width && m.Height == g_vk_dlss_frame.height;
+    }
+    ID3D11Texture2D* const fitted = VkFitMotion(f.motion, set_dlss);
+    // Once DLSS data was seen the helper takes motion only at the back buffer's size: a set that could not be fitted is not handed over.
+    if (f.color != nullptr && g_dlss_seen && f.motion != nullptr && fitted == nullptr) hsf::vk::Handed(f);
+    else if (f.color != nullptr) {
+      ++g_vk_handed_total;
       hsf::dlssg::FrameInputs inputs;
-      inputs.motion = f.motion;
-      inputs.motion_scale[0] = g_dlssg_motion_scale[0];
-      inputs.motion_scale[1] = g_dlssg_motion_scale[1];
-      inputs.depth = VkDepth(f);
+      inputs.motion = fitted != nullptr ? fitted : f.motion;
+      inputs.motion_scale[0] = fitted != nullptr ? 1.f : g_dlssg_motion_scale[0];
+      inputs.motion_scale[1] = fitted != nullptr ? 1.f : g_dlssg_motion_scale[1];
+      inputs.depth = inputs.motion != nullptr ? VkDepth(f, inputs.motion) : nullptr;
+      if (set_dlss && dlss_depth && f.depth != nullptr) CheckVkDlssDepth();
+      // DLSS's own flag for its depth, unless HSF.ini sets the direction.
+      if (set_dlss && dlss_depth && g_vk_dlss_frame.depth_inverted >= 0 && g_depth_inverted_setting < 0)
+        g_depth_inverted = g_vk_dlss_frame.depth_inverted != 0;
       inputs.depth_inverted = g_depth_inverted;
-      inputs.compose = g_compose_enabled;
+      // The game's vectors are sharp and exact, so the flow's clean-up has nothing to do.
+      inputs.compose = g_compose_enabled && !set_dlss;
+      inputs.reset = set_dlss && g_vk_dlss_frame.reset;
       inputs.checks = g_checks_enabled;
-      inputs.nvof = NvofOn();
+      inputs.nvof = NvofOn() && !set_dlss;
       inputs.nvof_size = static_cast<uint32_t>(g_nvof_size);
       inputs.hudless = f.hudless;
-      VkScore(f);
+      if (!set_dlss) VkScore(f);
       UpdateVkView(runtime->get_device());
       UpdateScoreView9(runtime->get_device());
       hsf::dlssg::Submit(f.color, inputs);
@@ -3668,7 +3952,11 @@ void OnVkPresent(effect_runtime* runtime) {
   }
   // reshade_present runs before the game's vkQueuePresentKHR. Sleeping here holds the finished frame back from its present, and the present
   // can then block again, so the next frame starts later than Reflex planned. With finish_present the sleep runs after the present instead.
-  if (!g_vk_finish_present) AfterPresent9();
+  g_vk_hsf_done = Now();
+  if (!g_vk_finish_present) {
+    AfterPresent9();
+    RecordVkFrame();
+  }
 }
 
 // ReShade 6.8's finish_present (event 100): the game's vkQueuePresentKHR has returned, so the next frame starts here, as after Present on
@@ -3682,7 +3970,9 @@ void OnVkFinishPresent(command_queue*, swapchain* swap) {
     Log("Vulkan: the next frame starts after the game's present (ReShade's finish_present)");
     return;
   }
+  g_vk_finish_at = Now();
   AfterPresent9();
+  RecordVkFrame();
 }
 
 void RegisterVkFinishPresent() {
@@ -4197,6 +4487,13 @@ void OnDestroyDevice(device* dev) {
     g_v9 = ScoreView9{};  // the device is already out of ReShade's table: its texture is left to it
     hsf::score::Shutdown();
     hsf::vk::Stop(false);
+#ifdef HSF_SL_GAME
+    hsf::ngx::StopVk(false);  // the DLSS data's images go with the device
+    g_vk_dlss_live = false;
+    g_vk_dlss_depth = false;
+    g_vk_dlss_depth_empty = g_vk_dlss_depth_good = false;
+    g_vk_dlss_depth_since = 0;
+#endif
     Log("Vulkan exit: the game's device goes away with HSF's bridge still up; HSF let its D3D11 side go and left the images to the device");
     return;
   }
@@ -5094,6 +5391,8 @@ struct MenuView {
   const char* waiting = nullptr;   // amber: not running yet, for a known reason
 };
 
+const char* FinderReason();
+
 MenuView ReadMenuView() {
   MenuView v;
   v.base_fps = g_menu_fps;
@@ -5114,6 +5413,7 @@ MenuView ReadMenuView() {
     else if (s.plugin_loaded == 0) v.problem = "DLSS-G's plugin did not load (see HSF_sl_bring.log).";
     else if (s.status > 0) v.problem = "DLSS-G reports a problem (see HSF_sl_bring.log).";
     else if (s.fp16 && g_extra_enabled) v.problem = "The game's swap chain is FP16 (scRGB), which DLSS-G does not take. Set the game, or RenoDX's swap chain format, to HDR10.";
+    if (!v.generating && v.problem == nullptr && v.waiting == nullptr) v.waiting = FinderReason();
     return v;
   }
   if (g_sl_drive && d3d12_run) {
@@ -5130,6 +5430,7 @@ MenuView ReadMenuView() {
     else if (s.plugin_loaded == 0) v.problem = "DLSS-G's plugin did not load (see HSF_sl_probe.log).";
     else if (s.status != 0) v.problem = "DLSS-G reports a problem (see HSF_sl_probe.log).";
     else if (!s.data_flowing && MotionFrom() == 2) v.waiting = "Waiting for the game's motion vectors (menus send none).";
+    if (!v.generating && v.problem == nullptr && v.waiting == nullptr) v.waiting = FinderReason();
     return v;
   }
 #endif
@@ -5154,10 +5455,350 @@ MenuView ReadMenuView() {
   } else {
     v.waiting = g_note;
   }
+  // Vulkan: the finder's first open step, so WAITING always says which step stops frame generation.
+  if (g_seen.api == device_api::vulkan && g_extra_enabled && !v.generating && v.problem == nullptr)
+    if (const char* const reason = FinderReason()) v.waiting = reason;
   return v;
 }
 
+// ---- DLSS finder ----
+// The steps to generated frames on the Direct3D 12 routes and the Vulkan route, each ticked or crossed, so the menu never says WAITING without saying which step
+// stops it and what HSF does about it. Every change of the first step that stops, and every rescan, goes to the route's log in full.
+enum class StepState { ok, waiting, failed };
+struct FinderStep {
+  const char* name = "";
+  StepState state = StepState::waiting;
+  char detail[200] = "";
+};
+enum class FinderRoute { game_streamline, hsf_streamline, vulkan };
+struct Finder {
+  FinderStep steps[10];
+  int count = 0;
+  int first_open = -1;  // the first step not ticked, -1 when all are
+  FinderRoute route = FinderRoute::game_streamline;
+};
+
+ULONGLONG g_rescan_at = 0;      // the last rescan, manual or automatic
+uint32_t g_auto_rescans = 0;    // automatic ones this run; they stop after a few, the button stays
+ULONGLONG g_stuck_since = 0;    // frame generation on and not generating since then, 0 when generating or off
+
+void DlssgStatusWords(int status, char* out, size_t size) {
+  out[0] = '\0';
+  static const char* const WORDS[] = {"the picture is too small", "Reflex is not seen running", "the swap chain's format is not supported (HDR)",
+                                      "the camera constants are not valid", "the game never calls GetCurrentBackBufferIndex"};
+  for (int bit = 0; bit < 5; ++bit) {
+    if ((status & (1 << bit)) == 0) continue;
+    const size_t used = std::strlen(out);
+    std::snprintf(out + used, size - used, "%s%s", used != 0 ? "; " : "", WORDS[bit]);
+  }
+  if (out[0] == '\0') std::snprintf(out, size, "status 0x%x", status);
+}
+
+void AddStep(Finder& f, const char* name, StepState state, const char* format, ...) {
+  if (f.count == 10) return;
+  FinderStep& step = f.steps[f.count];
+  step.name = name;
+  step.state = state;
+  va_list args;
+  va_start(args, format);
+  std::vsnprintf(step.detail, sizeof(step.detail), format, args);
+  va_end(args);
+  if (state != StepState::ok && f.first_open < 0) f.first_open = f.count;
+  ++f.count;
+}
+
+// The Vulkan route: flow and depth from ReShade, copied over the bridge (vk_bridge.h) to HSF's helper, where DLSS-G runs.
+void ReadFinderVk(Finder& f) {
+  f.route = FinderRoute::vulkan;
+#ifdef HSF_SL_GAME
+  // The game's DLSS data, through NGX's Vulkan calls (ngx_vk.h).
+  char dlss_note[160];
+  if (!hsf::ngx::LoadedVk()) std::snprintf(dlss_note, sizeof(dlss_note), "NGX not loaded (no DLSS running in the game or its mod)");
+  else if (hsf::ngx::HookedCallsVk() < hsf::ngx::FoundCallsVk())
+    std::snprintf(dlss_note, sizeof(dlss_note), "%d of %d NGX calls hooked (another tool holds them, see HSF.log)", hsf::ngx::HookedCallsVk(), hsf::ngx::FoundCallsVk());
+  else std::snprintf(dlss_note, sizeof(dlss_note), "hooked, no DLSS call seen lately (menus send none)");
+  if (g_vk_dlss_live) {
+    AddStep(f, "MOTION", StepState::ok, "from the game's DLSS");
+  } else if (MotionFrom() == 2) {
+    AddStep(f, "MOTION", StepState::waiting, "MOTION is set to DLSS: %s. Turn on DLSS in the game, or set MOTION to AUTO", dlss_note);
+  } else
+#endif
+  if (NvofOn()) AddStep(f, "MOTION", StepState::ok, "from NVIDIA Optical Flow in the helper");
+  else if (g_seen.have_motion) AddStep(f, "MOTION", StepState::ok, "from flow (%s)", SOURCES[g_seen.source].key);
+  else if (g_seen.source >= 0) AddStep(f, "MOTION", StepState::waiting, "the flow effect (%s) is loaded but gives no texture yet. Is it turned on?", SOURCES[g_seen.source].key);
+  else AddStep(f, "MOTION", StepState::waiting, "no flow effect found (LaunchPad not loaded or off). HSF looks again every second");
+  if (g_depth_vk.handle != 0) AddStep(f, "DEPTH", StepState::ok, "the game's depth buffer");
+  else AddStep(f, "DEPTH", StepState::ok, "none bound, DLSS-G gets a constant depth (path-traced games have none)");
+  const bool running = hsf::dlssg::Running();
+  if (running) AddStep(f, "PRESENTER", StepState::ok, "HSF's helper runs DLSS-G");
+  else if (g_vk_presenter_error[0] != '\0') AddStep(f, "PRESENTER", StepState::failed, "could not start: %s. RESCAN tries again", g_vk_presenter_error);
+  else AddStep(f, "PRESENTER", StepState::waiting, "not started yet");
+  if (!running) return;
+  AddStep(f, "VULKAN BRIDGE", StepState::ok, "%s",
+          hsf::vk::SameFrame() ? "same frame, shared semaphores on the game's device" : "same frame after a short CPU wait (no shared semaphores on the game's device)");
+  const hsf::dlssg::Stats& d = g_dlssg_stats;
+  char words[200];
+  if (d.gpu_hang) {
+    AddStep(f, "DLSS-G STATUS", StepState::failed, "%s", d.note);
+  } else if (d.foreign_dxgi) {
+    AddStep(f, "DLSS-G STATUS", StepState::failed, "ReShade loaded into HSF's helper (Game Pass). Send hsf_dlssg.log to HSF's GitHub");
+  } else if (d.status != 0) {
+    DlssgStatusWords(static_cast<int>(d.status), words, sizeof(words));
+    AddStep(f, "DLSS-G STATUS", StepState::failed, "%s", words);
+  } else {
+    AddStep(f, "DLSS-G STATUS", StepState::ok, "fine");
+  }
+  static uint64_t s_handed = 0;
+  static ULONGLONG s_handed_at = 0;
+  const ULONGLONG now = GetTickCount64();
+  if (g_vk_handed_total != s_handed) {
+    s_handed = g_vk_handed_total;
+    s_handed_at = now;
+  }
+  if (g_vk_handed_total != 0 && now - s_handed_at < 2000) AddStep(f, "FRAMES TO DLSS-G", StepState::ok, "handed over the bridge");
+  else AddStep(f, "FRAMES TO DLSS-G", StepState::waiting, "none handed over lately (HSF.log's \"Vulkan bridge\" line says why)");
+  if (d.generating) AddStep(f, "GENERATING", StepState::ok, "yes");
+  else AddStep(f, "GENERATING", StepState::waiting, "%s", d.note[0] != '\0' ? d.note : "DLSS-G is not generating yet");
+}
+
+#ifdef HSF_SL_GAME
+// Motion: the game's DLSS through NGX, or flow from LaunchPad and HSF.fx. Shared by both routes.
+void AddMotionStep(Finder& f, bool game_flowing, const char* game_note) {
+  const int from = MotionFrom();
+  if (from != 1 && game_flowing) return AddStep(f, "MOTION", StepState::ok, "from the game's DLSS");
+  if (from != 2 && g_flow_state == 1) return AddStep(f, "MOTION", StepState::ok, "from flow (LaunchPad)");
+  const char* const flow = g_flow_state == 2 ? "no flow effect (LaunchPad not loaded or off)"
+                           : g_flow_state == 3 ? "no depth copy (HSF.fx not loaded)"
+                           : g_flow_state == 4 ? "flow found, its direction not known yet"
+                                               : "flow not looked for yet";
+  if (from == 2) return AddStep(f, "MOTION", StepState::waiting, "MOTION is set to DLSS: %s. Turn on DLSS (any mode) in the game, or set MOTION to AUTO", game_note);
+  if (from == 1) return AddStep(f, "MOTION", StepState::waiting, "MOTION is set to FLOW: %s", flow);
+  AddStep(f, "MOTION", StepState::waiting, "game's DLSS: %s // flow: %s", game_note, flow);
+}
+
+void ReadFinderD3d12(Finder& f) {
+  char words[200];
+  if (g_sl_bring) {
+    const hsf::slbring::Stats s = hsf::slbring::GetStats();
+    f.route = FinderRoute::hsf_streamline;
+    if (s.streamline_up) AddStep(f, "STREAMLINE", StepState::ok, "HSF's own, started");
+    else AddStep(f, "STREAMLINE", StepState::failed, "HSF's Streamline did not start (HSF_sl_bring.log says why). Restart the game once");
+    if (s.swap_chains > 0) AddStep(f, "SWAP CHAIN", StepState::ok, "%u made through Streamline", s.swap_chains);
+    else if (s.failed > 0) AddStep(f, "SWAP CHAIN", StepState::failed, "Streamline could not make the game's swap chain (%u tries); the game runs on a plain one", s.failed);
+    else AddStep(f, "SWAP CHAIN", StepState::waiting, "the game has made none through Streamline yet. Switch the game's display mode once, or restart it");
+    if (s.supported == 0) AddStep(f, "DLSS-G ON THIS CARD", StepState::ok, "supported");
+    else if (s.supported < 0) AddStep(f, "DLSS-G ON THIS CARD", StepState::waiting, "not asked yet (Streamline asks once it has the device)");
+    else AddStep(f, "DLSS-G ON THIS CARD", StepState::failed, "Streamline says not supported (result %d). RTX 40 and newer; RTX 30 and 20 need MFG-Unlocker", s.supported);
+    if (s.plugin_loaded == 1) AddStep(f, "DLSS-G PLUGIN", StepState::ok, "loaded");
+    else if (s.plugin_loaded == 0) AddStep(f, "DLSS-G PLUGIN", StepState::failed, "did not load (sl.dlss_g.dll missing or refused, see HSF_sl_bring.log)");
+    else AddStep(f, "DLSS-G PLUGIN", StepState::waiting, "not known yet");
+    if (s.fp16) {
+      AddStep(f, "PICTURE FORMAT", StepState::failed, "the swap chain is FP16 (scRGB), which DLSS-G does not take. Set the game, or RenoDX's swap chain format, to HDR10");
+    } else if (s.status > 0) {
+      DlssgStatusWords(s.status, words, sizeof(words));
+      AddStep(f, "DLSS-G STATUS", StepState::failed, "%s", words);
+    } else if (s.status < 0) {
+      AddStep(f, "DLSS-G STATUS", StepState::waiting, "not reported yet");
+    } else {
+      AddStep(f, "DLSS-G STATUS", StepState::ok, "fine");
+    }
+    char ngx_note[120];
+    if (!g_ngx_input) std::snprintf(ngx_note, sizeof(ngx_note), "off in HSF.ini (NgxInput=0)");
+    else if (!hsf::ngx::Loaded()) std::snprintf(ngx_note, sizeof(ngx_note), "not loaded (DLSS off in the game, or a game without DLSS)");
+    else if (hsf::ngx::HookedCalls() < hsf::ngx::FoundCalls())
+      std::snprintf(ngx_note, sizeof(ngx_note), "%d of %d calls hooked (another tool holds them, see HSF_sl_bring.log)", hsf::ngx::HookedCalls(), hsf::ngx::FoundCalls());
+    else std::snprintf(ngx_note, sizeof(ngx_note), "hooked, no DLSS call seen lately (menus send none)");
+    AddMotionStep(f, g_bring_using_game, ngx_note);
+    static uint64_t s_fed = 0;
+    static ULONGLONG s_fed_at = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (s.fed_total != s_fed) {
+      s_fed = s.fed_total;
+      s_fed_at = now;
+    }
+    if (s.fed_total != 0 && now - s_fed_at < 2000) AddStep(f, "FRAMES TO DLSS-G", StepState::ok, "with motion and depth");
+    else AddStep(f, "FRAMES TO DLSS-G", StepState::waiting, "%s", s.presented_total == 0 ? "no frame presented through Streamline yet" : "frames present, but none carry motion and depth now");
+    if (s.generating && s.shown_per_real > 1) AddStep(f, "GENERATING", StepState::ok, "%u shown per real frame", s.shown_per_real);
+    else AddStep(f, "GENERATING", StepState::waiting, "%s", s.generating ? "DLSS-G is on and shows 1 per real frame so far" : "DLSS-G is not on yet");
+    return;
+  }
+  if (g_sl_drive) {
+    const hsf::slgame::Stats s = hsf::slgame::GetStats();
+    if (s.old_streamline) AddStep(f, "GAME'S STREAMLINE", StepState::failed, "version 1.x, which HSF leaves alone. Use the game's own frame generation");
+    else if (s.interposer_found) AddStep(f, "GAME'S STREAMLINE", StepState::ok, "found");
+    else if (g_drive_left) AddStep(f, "GAME'S STREAMLINE", StepState::failed, "this game never starts its own. HSF brings its own from the next start: restart the game once");
+    else if (s.only_hsf_streamline) AddStep(f, "GAME'S STREAMLINE", StepState::failed, "only HSF's own is loaded; the game never started its own");
+    else AddStep(f, "GAME'S STREAMLINE", StepState::waiting, "not loaded yet (some games load it when DLSS is turned on)");
+    if (s.interposer_found && !s.old_streamline) {
+      if (s.hooks_installed > 0) AddStep(f, "HOOKS", StepState::ok, "%u in", s.hooks_installed);
+      else AddStep(f, "HOOKS", StepState::failed, "none went in: another tool holds the calls (HSF_sl_probe.log names them). RESCAN tries again");
+    }
+    if (s.have_options) AddStep(f, "GAME'S DLSS-G", StepState::ok, "found");
+    else AddStep(f, "GAME'S DLSS-G", StepState::waiting, "not found yet. Turn on DLSS (any mode) in the game; HSF looks again every 10 seconds");
+    if (s.plugin_loaded == 1) AddStep(f, "DLSS-G PLUGIN", StepState::ok, "loaded");
+    else if (s.plugin_loaded == 0) AddStep(f, "DLSS-G PLUGIN", StepState::failed, "the game did not load it (frame generation off in the game, or its sl.dlss_g.dll missing)");
+    else AddStep(f, "DLSS-G PLUGIN", StepState::waiting, "not known yet");
+    if (s.status != 0) {
+      DlssgStatusWords(static_cast<int>(s.status), words, sizeof(words));
+      AddStep(f, "DLSS-G STATUS", StepState::failed, "%s", words);
+    } else {
+      AddStep(f, "DLSS-G STATUS", StepState::ok, "fine");
+    }
+    if (s.game_frames > 0) AddStep(f, "GAME FRAMES", StepState::ok, "%llu", static_cast<unsigned long long>(s.game_frames));
+    else AddStep(f, "GAME FRAMES", StepState::waiting, "the game has not started a frame through Streamline yet");
+    AddMotionStep(f, s.data_flowing, "no vectors from the game now (menus send none)");
+    static uint64_t s_failures = 0;
+    static ULONGLONG s_failed_at = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (s.tag_failures != s_failures) {
+      s_failures = s.tag_failures;
+      s_failed_at = now;
+    }
+    if (!g_using_dlss) {
+      if (s_failed_at != 0 && now - s_failed_at < 3000)
+        AddStep(f, "TAGS ACCEPTED", StepState::failed, "Streamline refuses HSF's flow tags (%llu so far, HSF_sl_probe.log has the code)", static_cast<unsigned long long>(s.tag_failures));
+      else if (s.tagged > 0) AddStep(f, "TAGS ACCEPTED", StepState::ok, "yes");
+      else AddStep(f, "TAGS ACCEPTED", StepState::waiting, "no flow tagged yet");
+    }
+    if (s.generating && s.presented > 1) AddStep(f, "GENERATING", StepState::ok, "%u shown per real frame", s.presented);
+    else AddStep(f, "GENERATING", StepState::waiting, "%s", s.generating ? "DLSS-G is on and shows 1 per real frame so far" : "DLSS-G is not on yet");
+  }
+}
+#endif
+
+Finder ReadFinder() {
+  Finder f;
+#ifdef HSF_SL_GAME
+  if (D3d12Run()) {
+    ReadFinderD3d12(f);
+    return f;
+  }
+#endif
+  if (g_seen.api == device_api::vulkan) ReadFinderVk(f);
+  return f;
+}
+
+void LogFinder(const Finder& f, const char* why) {
+  const auto line = [&f](const char* text) {
+#ifdef HSF_SL_GAME
+    if (f.route == FinderRoute::hsf_streamline) return hsf::slbring::LogLine(text);
+    if (f.route == FinderRoute::game_streamline) return hsf::slgame::LogLine(text);
+#endif
+    Log(text);
+  };
+  char text[320];
+  std::snprintf(text, sizeof(text), "DLSS finder (%s):", why);
+  line(text);
+  for (int i = 0; i < f.count; ++i) {
+    const FinderStep& step = f.steps[i];
+    std::snprintf(text, sizeof(text), "  %s %s: %s", step.state == StepState::ok ? "[ok]  " : step.state == StepState::failed ? "[FAIL]" : "[wait]", step.name, step.detail);
+    line(text);
+  }
+}
+
+void Rescan(bool manual) {
+  g_rescan_at = GetTickCount64();
+  if (!manual) ++g_auto_rescans;
+#ifdef HSF_SL_GAME
+  if (g_sl_bring && g_ngx_input) hsf::ngx::Rescan();
+  if (g_sl_game) hsf::slgame::Rescan();
+#endif
+  if (g_seen.api == device_api::vulkan) {
+    g_vk_rescan = true;           // the presenter tries again on a window and size it refused
+    g_next_source_search = 0;     // and the flow effect is looked for at once
+#ifdef HSF_SL_GAME
+    hsf::ngx::RescanVk();         // and NGX's Vulkan calls are hooked again if some did not go in
+#endif
+  }
+  const Finder f = ReadFinder();
+  if (f.count != 0) LogFinder(f, manual ? "RESCAN pressed" : "rescan, frame generation stuck");
+}
+
+// Once a second: a rescan of its own after 5 seconds on WAITING, then every 20 seconds, 6 at most; the log gets the finder whenever the first open step changes.
+void FinderTick() {
+  static ULONGLONG s_next = 0;
+  const ULONGLONG now = GetTickCount64();
+  if (now < s_next) return;
+  s_next = now + 1000;
+  const Finder f = ReadFinder();
+  if (f.count == 0) return;
+  static int s_logged_open = -2;
+  static const char* s_logged_name = nullptr;
+  const char* const open_name = f.first_open >= 0 ? f.steps[f.first_open].name : nullptr;
+  if (f.first_open != s_logged_open || open_name != s_logged_name) {
+    s_logged_open = f.first_open;
+    s_logged_name = open_name;
+    LogFinder(f, f.first_open < 0 ? "all steps ticked" : "a step changed");
+  }
+  if (!g_extra_enabled || f.first_open < 0) {
+    g_stuck_since = 0;
+    return;
+  }
+  if (g_stuck_since == 0) g_stuck_since = now;
+  const ULONGLONG wait = g_auto_rescans == 0 ? 5000 : 20000;
+  if (g_auto_rescans < 6 && now - g_stuck_since >= 5000 && now - g_rescan_at >= wait) Rescan(false);
+}
+
+// The finder in the menu, under the status box, while frame generation is on and not generating: each step with a tick or a cross, the first open one
+// in full, and RESCAN.
+void DrawFinder() {
+  namespace ui = hsf::ui;
+  namespace c = hsf::ui::colour;
+  const Finder f = ReadFinder();
+  if (f.count == 0 || f.first_open < 0 || !g_extra_enabled) return;
+  ui::RowLabel("DLSS FINDER", c::AMBER);
+  for (int i = 0; i < f.count; ++i) {
+    const FinderStep& step = f.steps[i];
+    const ImU32 colour = step.state == StepState::ok ? c::GREEN : step.state == StepState::failed ? c::RED : i == f.first_open ? c::AMBER : c::FAINT;
+    char text[96];
+    std::snprintf(text, sizeof(text), "%s %s", step.state == StepState::ok ? "+" : step.state == StepState::failed ? "X" : i == f.first_open ? ">" : "-", step.name);
+    ImGui::SetCursorScreenPos(ImVec2(ui::ControlX(), ImGui::GetCursorScreenPos().y));
+    ui::Caps(text, colour, 0.72f);
+    if (i == f.first_open) ui::Note(step.detail, colour);
+  }
+#ifdef HSF_SL_GAME
+  // Manual pick: with more than one Streamline loaded, any of them can be the one HSF hooks.
+  if (f.route == FinderRoute::game_streamline) {
+    hsf::slgame::Interposer copies[4];
+    const int count = hsf::slgame::ListInterposers(copies, 4);
+    for (int i = 0; count > 1 && i < count; ++i) {
+      char text[200];
+      std::snprintf(text, sizeof(text), "%s%ls%s", copies[i].in_use ? "IN USE: " : "", copies[i].path, copies[i].hsf_own ? " (HSF'S OWN)" : "");
+      ImGui::SetCursorScreenPos(ImVec2(ui::ControlX(), ImGui::GetCursorScreenPos().y));
+      ui::Small(text, copies[i].in_use ? c::GREEN : c::DIM);
+      if (!copies[i].in_use) {
+        char id[24];
+        std::snprintf(id, sizeof(id), "##pick%d", i);
+        ImGui::SetCursorScreenPos(ImVec2(ui::ControlX(), ImGui::GetCursorScreenPos().y));
+        if (ui::Button(id, "USE THIS ONE", c::TEXT)) {
+          hsf::slgame::PickInterposer(copies[i].module);
+          Rescan(true);
+        }
+      }
+    }
+  }
+#endif
+  ImGui::SetCursorScreenPos(ImVec2(ui::ControlX(), ImGui::GetCursorScreenPos().y));
+  if (ui::Button("##rescan", "RESCAN", c::AMBER)) Rescan(true);
+  if (g_rescan_at != 0) {
+    char note[64];
+    std::snprintf(note, sizeof(note), "> LAST RESCAN %llu S AGO", static_cast<unsigned long long>((GetTickCount64() - g_rescan_at) / 1000));
+    ui::RightNote(note, c::FAINT);
+  }
+}
+
+// The first step that stops frame generation, as the WAITING line: never WAITING with no reason.
+const char* FinderReason() {
+  static char text[260];
+  const Finder f = ReadFinder();
+  if (f.first_open < 0) return nullptr;
+  const FinderStep& step = f.steps[f.first_open];
+  std::snprintf(text, sizeof(text), "%s: %s.", step.name, step.detail);
+  return text;
+}
+
 void OnMenuFrame(effect_runtime*) {
+  FinderTick();
   static LONGLONG last = 0, window_start = 0;
   static uint32_t window_frames = 0;
   const LONGLONG now = Now();
@@ -5817,6 +6458,7 @@ void DrawPanel(effect_runtime* runtime) {
   }
   ui::StatusBox(route, verdict, verdict_colour);
   if (reason != nullptr) ui::Note(reason, verdict_colour);
+  if (verdict_colour != c::GREEN) DrawFinder();
   {
     float frames[MENU_HISTORY];
     const size_t count = std::min(g_menu_write, MENU_HISTORY);
@@ -6639,6 +7281,7 @@ void RegisterEvents() {
   }
 #ifdef HSF_SL_GAME
   if (g_sl_bring) reshade::register_event<reshade::addon_event::reshade_present>(OnSlBringPresent);
+  reshade::register_event<reshade::addon_event::execute_command_list>(OnVkSubmit);
   if (g_sl_game) {
     reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
     if (g_sl_drive) {
@@ -6775,6 +7418,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
       if (g_sl_game) hsf::slgame::Stop(reserved != nullptr);
       if (g_sl_bring && g_ngx_input) hsf::ngx::Stop(reserved != nullptr);
       hsf::ngx::Stop11(reserved != nullptr);
+      if (reserved == nullptr && hsf::ngx::LoadedVk()) {
+        hsf::slgame::UnhookFunctions();  // NGX's Vulkan calls: no hook into a freed HSF
+        hsf::ngx::StopVk(false);
+      }
       if (g_sl_bring) hsf::slbring::Stop(reserved != nullptr);
       if (g_sl_game && reserved == nullptr) DropSlChecks();  // at process exit the game's device and this code's order are not ours to rely on
 #else

@@ -185,6 +185,8 @@ State g_s;
 bool g_failed_device = false;
 ID3D11Device* g_failed_on = nullptr;  // only compared, never used
 uint32_t g_period_ms = 250;
+uint32_t g_flat_hold = 0;  // SetFlatHold
+uint32_t g_reads = 0;      // Reads
 int g_upside_down_setting = -1;
 bool g_fit_picture = false;
 // Shapes closer than this are the same shape: a depth buffer a few rows taller than the picture (1088 for 1080) is stretched, not fitted.
@@ -462,6 +464,7 @@ void ReadBack() {
   s.highest = values.back();
   s.median = values[values.size() / 2];
   s.flat = s.highest - s.lowest < FLAT_RANGE;
+  ++g_reads;
   if (s.flat) {
     ++g_s.flat_reads;
   } else {
@@ -577,16 +580,22 @@ ID3D11Texture2D* Frame(ID3D11Device* device, ID3D11ShaderResourceView* game_dept
     if (g_upside_down_setting < 0) MeasureEdges(picture);
     g_s.reading = true;
   }
-  return g_s.status.measured && !g_s.status.flat ? g_s.copy.Get() : nullptr;
+  // A depth seen before stays through up to g_flat_hold flat read-backs in a row: one flat read is often a passing frame (a load, a fade,
+  // a copy read too early), and dropping to a constant depth for a whole read period shows as depth coming and going.
+  const bool held = g_s.status.flat && g_s.seen_depth && g_s.flat_reads <= g_flat_hold;
+  return g_s.status.measured && (!g_s.status.flat || held) ? g_s.copy.Get() : nullptr;
 }
 
 Status Current() { return g_s.status; }
+
+uint32_t Reads() { return g_reads; }
 
 ID3D11ShaderResourceView* View() { return g_s.status.measured ? g_s.view_srv.Get() : nullptr; }
 
 const char* Problem() { return g_problem; }
 
 void SetPeriod(uint32_t ms) { g_period_ms = ms; }
+void SetFlatHold(uint32_t reads) { g_flat_hold = reads; }
 
 void SetUpsideDown(int setting) { g_upside_down_setting = setting; }
 

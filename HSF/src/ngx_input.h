@@ -58,6 +58,11 @@ struct Parameter {
 void Capture(ID3D12GraphicsCommandList* list, const Parameter* parameters);
 // How many of the D3D12 calls got hooked; what the bench test checks against the real DLL.
 int HookedCalls();
+// How many of those calls the driver's _nvngx.dll has (two on newer drivers), and whether _nvngx.dll has been found yet.
+int FoundCalls();
+bool Loaded();
+// Try the hooks that did not go in again on the next Poll (RESCAN). Hooks already in stay.
+void Rescan();
 
 // Direct3D 11: a mod that adds DLSS to a D3D11 game (Luma) calls NGX's D3D11 functions. HSF hooks them the same way, always calls through, and
 // copies the vectors and depth on the same context just after each call.
