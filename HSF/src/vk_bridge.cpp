@@ -37,6 +37,12 @@ struct Functions {
   PFN_vkImportSemaphoreWin32HandleKHR ImportSemaphoreWin32HandleKHR = nullptr;
   PFN_vkQueueSubmit QueueSubmit = nullptr;
   PFN_vkSignalSemaphore SignalSemaphore = nullptr;  // the safety net (Vulkan 1.2, or VK_KHR_timeline_semaphore's)
+  // Plain fences only (ReShade could not make its timeline fence on the device):
+  PFN_vkCreateFence CreateFence = nullptr;
+  PFN_vkDestroyFence DestroyFence = nullptr;
+  PFN_vkResetFences ResetFences = nullptr;
+  PFN_vkWaitForFences WaitForFences = nullptr;
+  PFN_vkGetFenceStatus GetFenceStatus = nullptr;
 };
 
 // How long D3D11 may wait for a set the game's GPU never signals before the safety net lets it go.
@@ -61,6 +67,7 @@ struct Set {
   uint64_t vk_id = 0;     // ReShade's fence reaches this once the game's GPU finished this set's copies (0 = never written)
   bool handed = false;    // given to D3D11 (or dropped for a newer one)
   uint64_t d3d_id = 0;    // HSF's D3D11 fence reaches this once D3D11 finished copying it to the helper (0 = nothing pending)
+  VkFence done = VK_NULL_HANDLE;  // plain fences only: signalled once the game's GPU finished this set's copies
 };
 
 struct State {
@@ -72,6 +79,9 @@ struct State {
   ComPtr<ID3D11Fence> d3d_done;
   uint64_t d3d_next = 1;
   api::fence fence = {0};  // ReShade's, on the game's device (a timeline semaphore)
+  // ReShade makes its fence as a timeline semaphore. A device made without that feature (Quake II RTX while RTSS keeps HSF's
+  // vkCreateDevice hook out) cannot have one, so each set gets a plain VkFence instead, signalled by an empty submit after its copies.
+  bool plain_fences = false;
   // Same frame: one fence, D3D11's side and Vulkan's side. The game's queue signals it with a set's vk_id after the set's copies.
   bool same_frame = false;
   ComPtr<ID3D11Fence> shared_fence;
@@ -228,6 +238,43 @@ VkImage ImageOf(api::resource resource) { return (VkImage)(resource.handle); }
 
 // D3D11 finished with the set (nothing pending, or its fence passed).
 bool FreeOnD3d(const Set& set) { return set.d3d_id == 0 || g->d3d_done->GetCompletedValue() >= set.d3d_id; }
+
+// One frame behind route: the game's queue marks `set` (number `id`) done once everything sent so far has run.
+bool SignalSet(api::command_queue* queue, Set& set, uint64_t id) {
+  if (!g->plain_fences) return queue->signal(g->fence, id);
+  // The set is free, so its fence from the last use has passed (or never went out) and may be reset.
+  if (g->vk.ResetFences(g->vk_device, 1, &set.done) != VK_SUCCESS) return false;
+  const VkQueue native = reinterpret_cast<VkQueue>(static_cast<uintptr_t>(queue->get_native()));
+  return g->vk.QueueSubmit(native, 0, nullptr, set.done) == VK_SUCCESS;
+}
+
+// Waits on the CPU up to `ns` for `set` (number `id`) to be done on the game's GPU. True if it was in time.
+bool WaitSet(const Set& set, uint64_t id, uint64_t ns) {
+  if (!g->plain_fences) return g->device->wait(g->fence, id, ns);
+  return g->vk.WaitForFences(g->vk_device, 1, &set.done, VK_TRUE, ns) == VK_SUCCESS;
+}
+
+// The game's GPU finished `set`'s copies.
+bool DoneOnVk(const Set& set) {
+  if (!g->plain_fences) return g->device->get_completed_fence_value(g->fence) >= set.vk_id;
+  return g->vk.GetFenceStatus(g->vk_device, set.done) == VK_SUCCESS;
+}
+
+// The plain fences, one per set. False (and nothing kept) if any step fails.
+bool MakePlainFences() {
+  if (g->vk.CreateFence == nullptr || g->vk.DestroyFence == nullptr || g->vk.ResetFences == nullptr || g->vk.WaitForFences == nullptr ||
+      g->vk.GetFenceStatus == nullptr || g->vk.QueueSubmit == nullptr)
+    return false;
+  const VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  for (Set& set : g->sets)
+    if (g->vk.CreateFence(g->vk_device, &info, nullptr, &set.done) != VK_SUCCESS) {
+      for (Set& made : g->sets)
+        if (made.done != VK_NULL_HANDLE) g->vk.DestroyFence(g->vk_device, made.done, nullptr), made.done = VK_NULL_HANDLE;
+      return false;
+    }
+  g->plain_fences = true;
+  return true;
+}
 
 // Records the copies of `back_buffer`, `motion` and `depth` into `set` on the queue's immediate command list and sends them to the GPU.
 bool Record(api::command_queue* queue, Set& set, api::resource back_buffer, api::resource_usage back_buffer_state, api::resource motion,
@@ -421,6 +468,7 @@ bool Start(api::device* device, char* error, size_t error_size) {
   LOAD(CreateImage) LOAD(DestroyImage) LOAD(GetImageMemoryRequirements) LOAD(AllocateMemory) LOAD(FreeMemory) LOAD(BindImageMemory)
   LOAD(GetMemoryWin32HandlePropertiesKHR) LOAD(CmdPipelineBarrier) LOAD(CmdCopyImage)
   LOAD(CreateSemaphore) LOAD(DestroySemaphore) LOAD(ImportSemaphoreWin32HandleKHR) LOAD(QueueSubmit)
+  LOAD(CreateFence) LOAD(DestroyFence) LOAD(ResetFences) LOAD(WaitForFences) LOAD(GetFenceStatus)
 #undef LOAD
   g->vk.SignalSemaphore = reinterpret_cast<PFN_vkSignalSemaphore>(get(g->vk_device, "vkSignalSemaphore"));
   if (g->vk.SignalSemaphore == nullptr) g->vk.SignalSemaphore = reinterpret_cast<PFN_vkSignalSemaphore>(get(g->vk_device, "vkSignalSemaphoreKHR"));
@@ -448,7 +496,10 @@ bool Start(api::device* device, char* error, size_t error_size) {
       FAILED(device11.As(&g->device11)) || FAILED(context.As(&g->context11)))
     return fail("HSF's D3D11 device (11.1 with fences) could not be made");
   if (FAILED(g->device11->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&g->d3d_done)))) return fail("HSF's D3D11 fence could not be made");
-  if (!device->create_fence(0, api::fence_flags::none, &g->fence)) return fail("ReShade could not make a fence on the game's device");
+  if (!device->create_fence(0, api::fence_flags::none, &g->fence)) {
+    g->fence = {0};
+    if (!MakePlainFences()) return fail("neither ReShade's fence nor plain fences could be made on the game's device");
+  }
 
   TrySameFrame();
   return true;
@@ -460,6 +511,9 @@ void Stop(bool release_vulkan) {
     for (Set& set : g->sets)
       for (Input* input : {&set.color, &set.motion, &set.depth, &set.hudless}) Release(*input);
   if (release_vulkan && g->fence.handle != 0) g->device->destroy_fence(g->fence);
+  if (release_vulkan && g->vk.DestroyFence != nullptr)
+    for (Set& set : g->sets)
+      if (set.done != VK_NULL_HANDLE) g->vk.DestroyFence(g->vk_device, set.done, nullptr);
   if (release_vulkan && g->semaphore != VK_NULL_HANDLE) g->vk.DestroySemaphore(g->vk_device, g->semaphore, nullptr);
   delete g;
   g = nullptr;
@@ -521,8 +575,8 @@ Frame Bridge(api::command_queue* queue, api::resource back_buffer, api::resource
     if ((set.vk_id != 0 && !set.handed) || !FreeOnD3d(set)) {
       ++g->stats.busy;
     } else if (Record(queue, set, back_buffer, back_buffer_state, motion, depth)) {
-      if (!queue->signal(g->fence, id)) {
-        Problem("the game's queue could not signal ReShade's fence");
+      if (!SignalSet(queue, set, id)) {
+        Problem(g->plain_fences ? "the game's queue could not signal HSF's fence" : "the game's queue could not signal ReShade's fence");
       } else {
         set.vk_id = id;
         set.handed = false;
@@ -531,7 +585,7 @@ Frame Bridge(api::command_queue* queue, api::resource back_buffer, api::resource
         ++g->stats.frames;
         LARGE_INTEGER start, end, rate;
         QueryPerformanceCounter(&start);
-        const bool in_time = g->device->wait(g->fence, id, CPU_WAIT_NS);
+        const bool in_time = WaitSet(set, id, CPU_WAIT_NS);
         QueryPerformanceCounter(&end);
         QueryPerformanceFrequency(&rate);
         g->stats.wait_ms += static_cast<float>(static_cast<double>(end.QuadPart - start.QuadPart) * 1000.0 / static_cast<double>(rate.QuadPart));
@@ -542,13 +596,14 @@ Frame Bridge(api::command_queue* queue, api::resource back_buffer, api::resource
   }
 
   // 2. Hand over the newest set the game's GPU has finished (this frame's, if the wait made it); older finished ones are dropped.
-  const uint64_t done = g->device->get_completed_fence_value(g->fence);
+  bool done[SETS] = {};
+  for (uint32_t i = 0; i < SETS; ++i) done[i] = g->sets[i].vk_id != 0 && !g->sets[i].handed && DoneOnVk(g->sets[i]);
   Set* newest = nullptr;
-  for (Set& set : g->sets)
-    if (set.vk_id != 0 && !set.handed && set.vk_id <= done && (newest == nullptr || set.vk_id > newest->vk_id)) newest = &set;
+  for (uint32_t i = 0; i < SETS; ++i)
+    if (done[i] && (newest == nullptr || g->sets[i].vk_id > newest->vk_id)) newest = &g->sets[i];
   if (newest != nullptr) {
-    for (Set& set : g->sets)
-      if (&set != newest && set.vk_id != 0 && !set.handed && set.vk_id <= done) set.handed = true;
+    for (uint32_t i = 0; i < SETS; ++i)
+      if (&g->sets[i] != newest && done[i]) g->sets[i].handed = true;
     newest->handed = true;
     newest->d3d_id = g->d3d_next++;
     g->pending_hand = true;
