@@ -118,9 +118,18 @@ else()
   target_link_options(vk_scene PRIVATE "/ENTRY:wmainCRTStartup")
 
   # A stand-in D3D12 game, with or without Streamline, for tools\stack_sweep.ps1 (build\x64\d3d12_scene.exe). Holds no HSF code; not part of tools\test.cmd.
-  add_executable(d3d12_scene tests/d3d12_scene.cpp)
-  target_include_directories(d3d12_scene SYSTEM PRIVATE "${HSF_STREAMLINE}/include")
-  target_link_options(d3d12_scene PRIVATE "/ENTRY:wmainCRTStartup")
+  # --dlss ngx calls DLSS straight through NGX, as Unreal games do: NVIDIA's NGX SDK, taken from the Luma checkout next to HSF. Its library wants the DLL runtime.
+  # Without that checkout the stand-in game is skipped, and the rest of HSF builds as before.
+  set(HSF_NGX "${CMAKE_SOURCE_DIR}/../Luma-Framework/Source/External/NGX")
+  if(EXISTS "${HSF_NGX}/libs/nvsdk_ngx_d.lib")
+    add_executable(d3d12_scene tests/d3d12_scene.cpp)
+    target_include_directories(d3d12_scene SYSTEM PRIVATE "${HSF_STREAMLINE}/include" "${HSF_NGX}")
+    target_link_options(d3d12_scene PRIVATE "/ENTRY:wmainCRTStartup")
+    target_link_libraries(d3d12_scene PRIVATE "${HSF_NGX}/libs/nvsdk_ngx_d.lib")
+    set_property(TARGET d3d12_scene PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+  else()
+    message(STATUS "No NGX SDK at ${HSF_NGX}: d3d12_scene (the stack sweep's stand-in game) is skipped")
+  endif()
 
   # HSF's Vulkan layer: adds the shared-semaphore extension to a Vulkan game's device, so the bridge hands frames over in the same frame.
   # Its manifest (hsf_vk_layer64.json) goes next to it.

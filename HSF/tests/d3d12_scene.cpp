@@ -6,6 +6,9 @@
 //   --order reshade-first (default) loads dxgi.dll from its folder (ReShade) before the interposer; --order sl-first loads the interposer first.
 // The picture: still grey blocks behind, and bright boxes that move across, with depth and motion vectors that match. A box in a corner is the HUD: it is
 // on the screen and not in the hudless picture.
+// With --dlss sl or --dlss ngx it renders at two thirds of the window's size and DLSS upscales the picture, as most games do: through Streamline
+// (slDLSSSetOptions + slEvaluateFeature, as Shadows and Village do; needs --sl) or straight through NGX (as Unreal games such as Gothic do, with or
+// without --sl). That wakes what hooks NGX: RenoDX DLSS (SF's NR mod), GITC Uplift and HSF's NGX route. nvngx_dlss.dll goes next to the exe or Streamline.
 // Options: --size WxH (1280x720), --borderless, --hdr10, --fp16, --flags 0xNNN (swap chain flags, e.g. 0x842 as Resident Evil 7 asks), --fps N (60),
 // --frames-gen N (frames DLSS-G makes per real frame, default its most), --seconds N (20), --log <path> (d3d12_scene.log next to the exe).
 // Once a second it logs what DLSS-G says. Exit code 0 when it ran to the end, 3 when it could not start.
@@ -16,9 +19,13 @@
 
 #include <sl.h>
 #include <sl_consts.h>
+#include <sl_dlss.h>
 #include <sl_dlss_g.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
+
+#include <nvsdk_ngx.h>
+#include <nvsdk_ngx_helpers.h>
 
 #include <algorithm>
 #include <cmath>
@@ -61,6 +68,7 @@ struct Options {
   UINT frames_gen = 0;  // 0 = DLSS-G's most
   UINT seconds = 20;
   std::wstring log;
+  enum class Dlss { kNone, kSl, kNgx } dlss = Dlss::kNone;
 };
 
 bool ParseArgs(int argc, wchar_t** argv, Options& o) {
@@ -79,6 +87,12 @@ bool ParseArgs(int argc, wchar_t** argv, Options& o) {
     else if (a == L"--frames-gen" && more) o.frames_gen = static_cast<UINT>(_wtoi(argv[++i]));
     else if (a == L"--seconds" && more) o.seconds = std::max(1u, static_cast<UINT>(_wtoi(argv[++i])));
     else if (a == L"--log" && more) o.log = argv[++i];
+    else if (a == L"--dlss" && more) {
+      const std::wstring how = argv[++i];
+      if (how == L"sl") o.dlss = Options::Dlss::kSl;
+      else if (how == L"ngx") o.dlss = Options::Dlss::kNgx;
+      else return false;
+    }
     else return false;
   }
   return true;
@@ -100,6 +114,9 @@ struct Streamline {
   PFun_slReflexSetOptions* reflex_options = nullptr;
   PFun_slReflexSleep* reflex_sleep = nullptr;
   PFun_slPCLSetMarker* marker = nullptr;
+  PFun_slDLSSSetOptions* dlss_options = nullptr;
+  PFun_slEvaluateFeature* evaluate = nullptr;
+  PFun_slGetNativeInterface* native = nullptr;
   bool started = false;
 } g_sl;
 
@@ -109,6 +126,8 @@ bool Export(HMODULE module, T*& out, const char* name) {
   if (out == nullptr) Line("export missing: %s", name);
   return out != nullptr;
 }
+
+constexpr const char* PROJECT_ID = "0d7c3b1e-5a2f-4c8e-9b6d-3e1f7a9c2b54";  // made-up
 
 bool LoadStreamline(const std::wstring& path) {
   g_sl.module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
@@ -120,14 +139,15 @@ bool LoadStreamline(const std::wstring& path) {
   return Export(g_sl.module, g_sl.init, "slInit") && Export(g_sl.module, g_sl.set_device, "slSetD3DDevice") &&
          Export(g_sl.module, g_sl.is_loaded, "slIsFeatureLoaded") && Export(g_sl.module, g_sl.get_function, "slGetFeatureFunction") &&
          Export(g_sl.module, g_sl.new_token, "slGetNewFrameToken") && Export(g_sl.module, g_sl.tag, "slSetTagForFrame") &&
-         Export(g_sl.module, g_sl.constants, "slSetConstants");
+         Export(g_sl.module, g_sl.constants, "slSetConstants") && Export(g_sl.module, g_sl.evaluate, "slEvaluateFeature") &&
+         Export(g_sl.module, g_sl.native, "slGetNativeInterface");
 }
 
-bool StartStreamline(const std::wstring& path) {
+bool StartStreamline(const std::wstring& path, bool dlss) {
   static std::wstring folder;
   folder = path.substr(0, path.find_last_of(L"\\/"));
   const wchar_t* paths[] = {folder.c_str()};
-  const sl::Feature features[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
+  const sl::Feature features[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL, sl::kFeatureDLSS};
   sl::Preferences pref{};
   pref.showConsole = false;
   pref.logLevel = sl::LogLevel::eOff;
@@ -135,10 +155,10 @@ bool StartStreamline(const std::wstring& path) {
   pref.numPathsToPlugins = 1;
   pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eUseFrameBasedResourceTagging;
   pref.featuresToLoad = features;
-  pref.numFeaturesToLoad = static_cast<uint32_t>(std::size(features));
+  pref.numFeaturesToLoad = static_cast<uint32_t>(std::size(features)) - (dlss ? 0 : 1);
   pref.engine = sl::EngineType::eCustom;
   pref.engineVersion = "1.0";
-  pref.projectId = "0d7c3b1e-5a2f-4c8e-9b6d-3e1f7a9c2b54";  // made-up
+  pref.projectId = PROJECT_ID;
   pref.renderAPI = sl::RenderAPI::eD3D12;
   const sl::Result result = g_sl.init(pref, sl::kSDKVersion);
   Line("slInit: %d", static_cast<int>(result));
@@ -226,9 +246,9 @@ ComPtr<ID3D12Resource> MakeTexture(ID3D12Device* device, UINT width, UINT height
   return texture;
 }
 
+// Streamline's float4x4 starts filled with its "not set" value (3.4e38), so every element is written.
 void Identity(sl::float4x4& m) {
-  m = {};
-  m.row[0].x = m.row[1].y = m.row[2].z = m.row[3].w = 1.0f;
+  for (int r = 0; r < 4; ++r) m.row[r] = sl::float4(r == 0 ? 1.0f : 0.0f, r == 1 ? 1.0f : 0.0f, r == 2 ? 1.0f : 0.0f, r == 3 ? 1.0f : 0.0f);
 }
 
 }  // namespace
@@ -237,7 +257,7 @@ int wmain(int argc, wchar_t** argv) {
   Options o;
   if (!ParseArgs(argc, argv, o)) {
     std::printf("usage: d3d12_scene [--sl <sl.interposer.dll>] [--order reshade-first|sl-first] [--size WxH] [--borderless] [--hdr10|--fp16] [--flags 0xNNN] [--fps N] "
-                "[--frames-gen N] [--seconds N] [--log <path>]\n");
+                "[--frames-gen N] [--seconds N] [--log <path>] [--dlss sl|ngx]\n");
     return 3;
   }
   if (o.log.empty()) {
@@ -246,9 +266,14 @@ int wmain(int argc, wchar_t** argv) {
     o.log = exe;
     o.log = o.log.substr(0, o.log.find_last_of(L"\\/")) + L"\\d3d12_scene.log";
   }
+  if (o.dlss == Options::Dlss::kSl && o.sl.empty()) {
+    std::printf("--dlss sl needs --sl\n");
+    return 3;
+  }
   _wfopen_s(&g_log, o.log.c_str(), L"w");
   Line("start: streamline %ls, order %s, %ux%u %s, %s, swap chain flags 0x%x, %u fps, %u s", o.sl.empty() ? L"none" : o.sl.c_str(), o.sl_first ? "sl-first" : "reshade-first",
        o.width, o.height, o.borderless ? "borderless" : "windowed", o.hdr10 ? "HDR10" : o.fp16 ? "FP16" : "SDR", o.flags, o.fps, o.seconds);
+  Line("upscaling: %s", o.dlss == Options::Dlss::kSl ? "DLSS through Streamline" : o.dlss == Options::Dlss::kNgx ? "DLSS through NGX" : "none");
 
   // Load order: which of ReShade (dxgi.dll in this folder) and Streamline comes first.
   const bool with_sl = !o.sl.empty();
@@ -264,7 +289,7 @@ int wmain(int argc, wchar_t** argv) {
   wchar_t dxgi_path[MAX_PATH] = {};
   GetModuleFileNameW(dxgi, dxgi_path, MAX_PATH);
   Line("dxgi.dll is %ls", dxgi_path);
-  if (with_sl) g_sl.started = StartStreamline(o.sl);
+  if (with_sl) g_sl.started = StartStreamline(o.sl, o.dlss == Options::Dlss::kSl);
 
   // A Streamline game makes its device and factory through the interposer's exports.
   using CreateDeviceFn = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
@@ -301,6 +326,10 @@ int wmain(int argc, wchar_t** argv) {
   RECT client{};
   GetClientRect(window, &client);
   const UINT width = static_cast<UINT>(client.right - client.left), height = static_cast<UINT>(client.bottom - client.top);
+  // With DLSS the game renders smaller (DLSS Quality: two thirds a side) and DLSS fills the window's size.
+  const bool dlss = o.dlss != Options::Dlss::kNone;
+  const UINT rw = dlss ? std::max(1u, width * 2 / 3) : width, rh = dlss ? std::max(1u, height * 2 / 3) : height;
+  if (dlss) Line("render size %ux%u, DLSS output %ux%u", rw, rh, width, height);
 
   const DXGI_FORMAT format = o.hdr10 ? DXGI_FORMAT_R10G10B10A2_UNORM : o.fp16 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
   DXGI_SWAP_CHAIN_DESC1 sc{};
@@ -354,7 +383,49 @@ int wmain(int argc, wchar_t** argv) {
       gen_max = state.numFramesToGenerateMax;
       Line("DLSS-G most frames per real frame: %u", gen_max);
     }
+    if (o.dlss == Options::Dlss::kSl) {
+      bool dlss_loaded = false;
+      g_sl.is_loaded(sl::kFeatureDLSS, dlss_loaded);
+      Line("DLSS loaded: %d", dlss_loaded ? 1 : 0);
+      FeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", g_sl.dlss_options);
+      if (g_sl.dlss_options != nullptr) {
+        sl::DLSSOptions d{};
+        d.mode = sl::DLSSMode::eMaxQuality;
+        d.outputWidth = width;
+        d.outputHeight = height;
+        d.colorBuffersHDR = o.hdr10 || o.fp16 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        d.useAutoExposure = sl::Boolean::eTrue;
+        Line("slDLSSSetOptions: %d", static_cast<int>(g_sl.dlss_options(viewport, d)));
+      }
+    }
   }
+
+  // DLSS straight through NGX, as Unreal's DLSS plugin calls it. Behind Streamline's proxies NGX gets the real device and command list.
+  NVSDK_NGX_Parameter* ngx_params = nullptr;
+  NVSDK_NGX_Handle* ngx_handle = nullptr;
+  bool ngx_ready = false;
+  ID3D12Device* ngx_device = device.Get();
+  if (o.dlss == Options::Dlss::kNgx) {
+    if (g_sl.started) {
+      void* real = nullptr;
+      if (g_sl.native(device.Get(), &real) == sl::Result::eOk && real != nullptr) ngx_device = static_cast<ID3D12Device*>(real);
+      Line("NGX gets the %s device", ngx_device == device.Get() ? "same" : "real (not Streamline's proxy)");
+    }
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring folder = exe;
+    folder = folder.substr(0, folder.find_last_of(L"\\/"));
+    const NVSDK_NGX_Result init = NVSDK_NGX_D3D12_Init_with_ProjectID(PROJECT_ID, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", folder.c_str(), ngx_device);
+    Line("NVSDK_NGX_D3D12_Init_with_ProjectID: 0x%08x", static_cast<unsigned>(init));
+    if (!NVSDK_NGX_FAILED(init)) {
+      const NVSDK_NGX_Result caps = NVSDK_NGX_D3D12_GetCapabilityParameters(&ngx_params);
+      int available = 0;
+      if (!NVSDK_NGX_FAILED(caps)) NVSDK_NGX_Parameter_GetI(ngx_params, NVSDK_NGX_Parameter_SuperSampling_Available, &available);
+      Line("NGX parameters: 0x%08x, DLSS available %d", static_cast<unsigned>(caps), available);
+      ngx_ready = !NVSDK_NGX_FAILED(caps) && available != 0;
+    }
+  }
+  UINT64 dlss_ok = 0, dlss_failed = 0;
 
   // Render targets: the scene (hudless), depth, motion.
   D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{};
@@ -378,13 +449,18 @@ int wmain(int argc, wchar_t** argv) {
     device->CreateRenderTargetView(back[i].Get(), nullptr, rtv(i));
   }
   const D3D12_RESOURCE_STATES READ = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-  ComPtr<ID3D12Resource> scene = MakeTexture(device.Get(), width, height, format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, READ, nullptr);
-  ComPtr<ID3D12Resource> motion = MakeTexture(device.Get(), width, height, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, READ, nullptr);
+  // The scene, depth and motion are at the render size; with DLSS, DLSS writes the window-size picture into "upscaled".
+  ComPtr<ID3D12Resource> scene = MakeTexture(device.Get(), rw, rh, format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, READ, nullptr);
+  ComPtr<ID3D12Resource> motion = MakeTexture(device.Get(), rw, rh, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, READ, nullptr);
   D3D12_CLEAR_VALUE depth_clear{};
   depth_clear.Format = DXGI_FORMAT_D32_FLOAT;
   depth_clear.DepthStencil.Depth = 1.0f;
-  ComPtr<ID3D12Resource> depth = MakeTexture(device.Get(), width, height, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, READ, &depth_clear);
-  if (!scene || !motion || !depth) return 3;
+  ComPtr<ID3D12Resource> depth = MakeTexture(device.Get(), rw, rh, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, READ, &depth_clear);
+  ComPtr<ID3D12Resource> upscaled;
+  if (dlss) upscaled = MakeTexture(device.Get(), width, height, format, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, READ, nullptr);
+  if (!scene || !motion || !depth || (dlss && !upscaled)) return 3;
+  // What reaches the back buffer, and the hudless picture DLSS-G gets.
+  ID3D12Resource* const final_picture = dlss ? upscaled.Get() : scene.Get();
   device->CreateRenderTargetView(scene.Get(), nullptr, rtv(BUFFERS));
   device->CreateRenderTargetView(motion.Get(), nullptr, rtv(BUFFERS + 1));
   D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
@@ -398,6 +474,12 @@ int wmain(int argc, wchar_t** argv) {
   ComPtr<ID3D12GraphicsCommandList> list;
   if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frames[0].allocator.Get(), nullptr, IID_PPV_ARGS(&list)))) return 3;
   list->Close();
+  // NGX records on the real command list, as it gets the real device.
+  ID3D12GraphicsCommandList* ngx_list = list.Get();
+  if (o.dlss == Options::Dlss::kNgx && g_sl.started) {
+    void* real = nullptr;
+    if (g_sl.native(list.Get(), &real) == sl::Result::eOk && real != nullptr) ngx_list = static_cast<ID3D12GraphicsCommandList*>(real);
+  }
   ComPtr<ID3D12Fence> fence;
   if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) return 3;
   HANDLE fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -405,8 +487,10 @@ int wmain(int argc, wchar_t** argv) {
 
   // HDR10 and FP16 want brighter numbers for the same look; the picture only has to move, not look right.
   const float bright = o.fp16 ? 2.0f : 1.0f;
-  const LONG box = static_cast<LONG>(height / 6);
-  const float speed = static_cast<float>(width) / (4.0f * static_cast<float>(o.fps));  // a box crosses the screen in 4 s
+  // The scene is drawn at the render size; the HUD at the window's size.
+  const LONG box = static_cast<LONG>(rh / 6);
+  const LONG hud_box = static_cast<LONG>(height / 6);
+  const float speed = static_cast<float>(rw) / (4.0f * static_cast<float>(o.fps));  // a box crosses the screen in 4 s
   bool options_sent = false;
   UINT64 count = 0;
   UINT presented_seen = 0;
@@ -481,8 +565,8 @@ int wmain(int argc, wchar_t** argv) {
     list->ClearRenderTargetView(rtv(BUFFERS + 1), still_motion, 0, nullptr);
     list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
     // Still blocks behind, at middle depth.
-    for (LONG y = box / 2; y + box / 2 < static_cast<LONG>(height); y += box * 2) {
-      for (LONG x = box / 2; x + box / 2 < static_cast<LONG>(width); x += box * 2) {
+    for (LONG y = box / 2; y + box / 2 < static_cast<LONG>(rh); y += box * 2) {
+      for (LONG x = box / 2; x + box / 2 < static_cast<LONG>(rw); x += box * 2) {
         const D3D12_RECT r{x, y, x + box / 2, y + box / 2};
         const float grey[4] = {0.3f * bright, 0.3f * bright, 0.3f * bright, 1.0f};
         list->ClearRenderTargetView(rtv(BUFFERS), grey, 1, &r);
@@ -491,10 +575,10 @@ int wmain(int argc, wchar_t** argv) {
     }
     // Moving boxes in front: motion points back to where each pixel was last frame, in pixels.
     for (UINT b = 0; b < BOXES; ++b) {
-      const float travel = std::fmod(static_cast<float>(count) * speed * (1.0f + 0.5f * b), static_cast<float>(width + box));
+      const float travel = std::fmod(static_cast<float>(count) * speed * (1.0f + 0.5f * b), static_cast<float>(rw + box));
       const LONG x = static_cast<LONG>(travel) - box;
-      const LONG y = static_cast<LONG>(height) * static_cast<LONG>(b + 1) / (BOXES + 1) - box / 2;
-      const D3D12_RECT r{std::max(0L, x), y, std::min(static_cast<LONG>(width), x + box), y + box};
+      const LONG y = static_cast<LONG>(rh) * static_cast<LONG>(b + 1) / (BOXES + 1) - box / 2;
+      const D3D12_RECT r{std::max(0L, x), y, std::min(static_cast<LONG>(rw), x + box), y + box};
       if (r.right <= r.left) continue;
       const float colour[4] = {(b == 0 ? 1.0f : 0.2f) * bright, (b == 1 ? 1.0f : 0.3f) * bright, (b >= 2 ? 1.0f : 0.2f) * bright, 1.0f};
       const float back_motion[4] = {-speed * (1.0f + 0.5f * b), 0, 0, 0};
@@ -502,28 +586,25 @@ int wmain(int argc, wchar_t** argv) {
       list->ClearRenderTargetView(rtv(BUFFERS + 1), back_motion, 1, &r);
       list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 0.3f, 0, 1, &r);
     }
-    D3D12_RESOURCE_BARRIER to_read[] = {Transition(scene.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+    D3D12_RESOURCE_BARRIER to_read[] = {Transition(scene.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, READ),
                                         Transition(motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, READ),
-                                        Transition(depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, READ),
-                                        Transition(back[i].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)};
-    list->ResourceBarrier(4, to_read);
-    list->CopyResource(back[i].Get(), scene.Get());
-    D3D12_RESOURCE_BARRIER after_copy[] = {Transition(scene.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, READ),
-                                           Transition(back[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET)};
-    list->ResourceBarrier(2, after_copy);
-    // The HUD: on the screen only.
-    const D3D12_RECT hud{16, 16, 16 + box, 16 + box / 3};
-    const float hud_colour[4] = {0.9f * bright, 0.9f * bright, 0.2f * bright, 1.0f};
-    list->ClearRenderTargetView(rtv(i), hud_colour, 1, &hud);
+                                        Transition(depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, READ)};
+    list->ResourceBarrier(3, to_read);
 
     if (g_sl.started && token != nullptr) {
       sl::Resource depth_res(sl::ResourceType::eTex2d, depth.Get(), static_cast<uint32_t>(READ));
       sl::Resource motion_res(sl::ResourceType::eTex2d, motion.Get(), static_cast<uint32_t>(READ));
-      sl::Resource hudless_res(sl::ResourceType::eTex2d, scene.Get(), static_cast<uint32_t>(READ));
+      sl::Resource hudless_res(sl::ResourceType::eTex2d, final_picture, static_cast<uint32_t>(READ));
+      // DLSS through Streamline also gets its input (the render-size scene) and output (written as a UAV during the evaluate).
+      sl::Resource input_res(sl::ResourceType::eTex2d, scene.Get(), static_cast<uint32_t>(READ));
+      sl::Resource output_res(sl::ResourceType::eTex2d, upscaled.Get(), static_cast<uint32_t>(D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
       const sl::ResourceTag tags[] = {sl::ResourceTag(&depth_res, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent),
                                       sl::ResourceTag(&motion_res, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent),
-                                      sl::ResourceTag(&hudless_res, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent)};
-      const sl::Result tagged = g_sl.tag(*token, viewport, tags, static_cast<uint32_t>(std::size(tags)), reinterpret_cast<sl::CommandBuffer*>(list.Get()));
+                                      sl::ResourceTag(&hudless_res, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent),
+                                      sl::ResourceTag(&input_res, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilPresent),
+                                      sl::ResourceTag(&output_res, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilPresent)};
+      const uint32_t tag_count = o.dlss == Options::Dlss::kSl ? 5u : 3u;
+      const sl::Result tagged = g_sl.tag(*token, viewport, tags, tag_count, reinterpret_cast<sl::CommandBuffer*>(list.Get()));
       if (count < 3) Line("slSetTagForFrame: %d", static_cast<int>(tagged));
       sl::Constants c{};
       Identity(c.cameraViewToClip);
@@ -532,7 +613,7 @@ int wmain(int argc, wchar_t** argv) {
       Identity(c.clipToPrevClip);
       Identity(c.prevClipToClip);
       c.jitterOffset = {0, 0};
-      c.mvecScale = {1.0f / static_cast<float>(width), 1.0f / static_cast<float>(height)};
+      c.mvecScale = {1.0f / static_cast<float>(rw), 1.0f / static_cast<float>(rh)};
       c.cameraPinholeOffset = {0, 0};
       c.cameraPos = {0, 0, 0};
       c.cameraUp = {0, 1, 0};
@@ -554,8 +635,8 @@ int wmain(int argc, wchar_t** argv) {
         dlssg.mode = sl::DLSSGMode::eOn;
         dlssg.numFramesToGenerate = std::max(1u, o.frames_gen != 0 ? std::min(o.frames_gen, std::max(gen_max, 1u)) : gen_max);
         dlssg.numBackBuffers = BUFFERS;
-        dlssg.mvecDepthWidth = width;
-        dlssg.mvecDepthHeight = height;
+        dlssg.mvecDepthWidth = rw;
+        dlssg.mvecDepthHeight = rh;
         dlssg.colorWidth = width;
         dlssg.colorHeight = height;
         dlssg.colorBufferFormat = format;
@@ -566,6 +647,66 @@ int wmain(int argc, wchar_t** argv) {
         options_sent = true;
       }
     }
+
+    // DLSS: the render-size scene in, the window-size picture out.
+    if (dlss) {
+      const D3D12_RESOURCE_BARRIER to_uav = Transition(upscaled.Get(), READ, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      list->ResourceBarrier(1, &to_uav);
+      bool done = false;
+      if (o.dlss == Options::Dlss::kSl && g_sl.started && token != nullptr) {
+        const sl::BaseStructure* inputs[] = {&viewport};
+        const sl::Result r = g_sl.evaluate(sl::kFeatureDLSS, *token, inputs, 1, reinterpret_cast<sl::CommandBuffer*>(list.Get()));
+        if (count < 3 || (r != sl::Result::eOk && dlss_failed < 3)) Line("slEvaluateFeature(DLSS): %d", static_cast<int>(r));
+        done = r == sl::Result::eOk;
+      } else if (o.dlss == Options::Dlss::kNgx && ngx_ready) {
+        if (ngx_handle == nullptr) {
+          NVSDK_NGX_DLSS_Create_Params create{};
+          create.Feature.InWidth = rw;
+          create.Feature.InHeight = rh;
+          create.Feature.InTargetWidth = width;
+          create.Feature.InTargetHeight = height;
+          create.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_MaxQuality;
+          create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure |
+                                        (o.hdr10 || o.fp16 ? NVSDK_NGX_DLSS_Feature_Flags_IsHDR : 0);
+          const NVSDK_NGX_Result r = NGX_D3D12_CREATE_DLSS_EXT(ngx_list, 1, 1, &ngx_handle, ngx_params, &create);
+          Line("NGX CreateFeature(DLSS): 0x%08x", static_cast<unsigned>(r));
+          if (NVSDK_NGX_FAILED(r)) {
+            ngx_handle = nullptr;
+            ngx_ready = false;
+          }
+        }
+        if (ngx_handle != nullptr) {
+          NVSDK_NGX_D3D12_DLSS_Eval_Params eval{};
+          eval.Feature.pInColor = scene.Get();
+          eval.Feature.pInOutput = upscaled.Get();
+          eval.pInDepth = depth.Get();
+          eval.pInMotionVectors = motion.Get();
+          eval.InRenderSubrectDimensions = {rw, rh};
+          eval.InReset = count == 0 ? 1 : 0;
+          eval.InMVScaleX = 1.0f;
+          eval.InMVScaleY = 1.0f;
+          const NVSDK_NGX_Result r = NGX_D3D12_EVALUATE_DLSS_EXT(ngx_list, ngx_handle, ngx_params, &eval);
+          if (count < 3 || (NVSDK_NGX_FAILED(r) && dlss_failed < 3)) Line("NGX EvaluateFeature(DLSS): 0x%08x", static_cast<unsigned>(r));
+          done = !NVSDK_NGX_FAILED(r);
+        }
+      }
+      ++(done ? dlss_ok : dlss_failed);
+      const D3D12_RESOURCE_BARRIER to_copy = Transition(upscaled.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      list->ResourceBarrier(1, &to_copy);
+    } else {
+      const D3D12_RESOURCE_BARRIER to_copy = Transition(scene.Get(), READ, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      list->ResourceBarrier(1, &to_copy);
+    }
+    const D3D12_RESOURCE_BARRIER to_dest = Transition(back[i].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->ResourceBarrier(1, &to_dest);
+    list->CopyResource(back[i].Get(), final_picture);
+    D3D12_RESOURCE_BARRIER after_copy[] = {Transition(final_picture, D3D12_RESOURCE_STATE_COPY_SOURCE, READ),
+                                           Transition(back[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET)};
+    list->ResourceBarrier(2, after_copy);
+    // The HUD: on the screen only.
+    const D3D12_RECT hud{16, 16, 16 + hud_box, 16 + hud_box / 3};
+    const float hud_colour[4] = {0.9f * bright, 0.9f * bright, 0.2f * bright, 1.0f};
+    list->ClearRenderTargetView(rtv(i), hud_colour, 1, &hud);
 
     const D3D12_RESOURCE_BARRIER to_present = Transition(back[i].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     list->ResourceBarrier(1, &to_present);
@@ -594,6 +735,11 @@ int wmain(int argc, wchar_t** argv) {
   fence->SetEventOnCompletion(fence_next, fence_event);
   WaitForSingleObject(fence_event, 5000);
   Line("end: %s, %llu real frames, most DLSS-G presented per frame %u", ok ? "ran to the end" : "stopped on an error", count, presented_seen);
+  if (dlss) Line("DLSS evaluated %llu ok, %llu failed", dlss_ok, dlss_failed);
+  // A game lets go of NGX before it quits.
+  if (ngx_handle != nullptr) Line("NGX ReleaseFeature: 0x%08x", static_cast<unsigned>(NVSDK_NGX_D3D12_ReleaseFeature(ngx_handle)));
+  if (ngx_params != nullptr) NVSDK_NGX_D3D12_DestroyParameters(ngx_params);
+  if (o.dlss == Options::Dlss::kNgx) Line("NGX Shutdown1: 0x%08x", static_cast<unsigned>(NVSDK_NGX_D3D12_Shutdown1(ngx_device)));
   // A game shuts Streamline down before it quits; without it Streamline's own teardown fails fast (0xC0000409) as the process ends.
   if (g_sl.started) {
     const auto shutdown = reinterpret_cast<PFun_slShutdown*>(GetProcAddress(g_sl.module, "slShutdown"));
