@@ -22,6 +22,16 @@ void Tick(uint64_t now_ms = 0);
 // A normal unload or exit: this launch's marks are cleared.
 void ClearAll();
 
+// SafeTry=0 in HSF.ini: every way is allowed whatever the file says, and nothing is marked or turned off (for the developer, to try a way again and again).
+void SetEnabled(bool on);
+bool Enabled();
+// The ways turned off for this game, read from the file: up to `max` names, each under 32 chars. Returns how many.
+int ListOff(char (*names)[32], int max);
+// Turns a way back on for this game (its off and trying keys go). Ways read at start-up take it at the next launch.
+void TurnBackOn(const char* path);
+// A short plain name for the panel ("NGX MOTION (GAME'S STREAMLINE)"); the path itself when unknown.
+const char* Describe(const char* path);
+
 // For the test: as Init, with the process id the marks carry, and the clock Begin uses.
 void InitForTest(const wchar_t* file, LogFunction log, uint32_t process_id, uint64_t now_ms);
 

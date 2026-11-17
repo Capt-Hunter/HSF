@@ -6295,6 +6295,41 @@ void CopyLog(const MenuView& view) {
 
 // A setting read only when the game starts, as a toggle that writes HSF.ini straight away.
 // Each key is read from the file once and kept here after that, so a menu frame reads no file.
+void StartupToggle(const char* label, const wchar_t* key, int fallback);
+
+// Safe try (safe_try.h): its switch and the ways it turned off for this game after a crash, each with a button that turns it back on. Both apply at the next launch.
+void DrawSafeTry() {
+  namespace ui = hsf::ui;
+  namespace c = hsf::ui::colour;
+  ui::Rule();
+  ui::Caps("SAFE TRY // APPLIES AFTER A GAME RESTART", c::DIM, 0.8f);
+  StartupToggle("SAFE TRY", L"SafeTry", 1);
+  if (!hsf::safetry::Enabled()) ui::RightNote("OFF NOW: NOTHING IS TURNED OFF", c::AMBER);
+  // The file is read a few times a second at most.
+  static char s_names[8][32];
+  static int s_count = 0;
+  static ULONGLONG s_read = 0;
+  const ULONGLONG now_ms = GetTickCount64();
+  if (s_read == 0 || now_ms - s_read > 500) {
+    s_count = hsf::safetry::ListOff(s_names, 8);
+    s_read = now_ms;
+  }
+  if (s_count == 0) {
+    ui::Note("NOTHING TURNED OFF AFTER A CRASH", c::FAINT);
+    return;
+  }
+  ui::Note("TURNED OFF AFTER A CRASH:", c::AMBER);
+  for (int i = 0; i < s_count; ++i) {
+    ui::SettingLabel(hsf::safetry::Describe(s_names[i]));
+    char id[48];
+    std::snprintf(id, sizeof(id), "##safeon%d", i);
+    if (ui::Button(id, "TURN BACK ON", c::GREEN)) {
+      hsf::safetry::TurnBackOn(s_names[i]);
+      s_read = 0;
+    }
+  }
+}
+
 void StartupToggle(const char* label, const wchar_t* key, int fallback) {
   namespace ui = hsf::ui;
   struct Kept {
@@ -6976,7 +7011,13 @@ void DrawPanel(effect_runtime* runtime) {
       StartupToggle("SL EARLY LOAD", L"SlEarlyLoad", 1);
       StartupToggle("NGX INPUT", L"NgxInput", 1);
     }
+    if (now.drive && !now.bring) {
+      ui::Rule();
+      ui::Caps("GAME'S STREAMLINE // APPLIES AFTER A GAME RESTART", c::DIM, 0.8f);
+      StartupToggle("NGX INPUT", L"NgxInput", 1);
+    }
 #endif
+    DrawSafeTry();
     ui::Rule();
     static ULONGLONG copied = 0;
     if (ui::Button("##copylog", "COPY LOG TO CLIPBOARD", c::TEXT)) {
@@ -7678,6 +7719,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         const size_t slash = safe_try.rfind(L'\\');
         safe_try = (slash == std::wstring::npos ? std::wstring() : safe_try.substr(0, slash + 1)) + L"HSF_safe_try.ini";
         if (g_ini_path[0] != 0) hsf::safetry::Init(safe_try.c_str(), &Log);
+        // SafeTry=0 (the panel's SAFE TRY switch, for the developer): nothing is turned off after a crash and ways turned off before are used again.
+        hsf::safetry::SetEnabled(GetPrivateProfileIntW(L"HSF", L"SafeTry", 1, g_ini_path) != 0);
+        if (!hsf::safetry::Enabled()) Log("safe try is OFF (SafeTry=0): new ways are used even after a crash, and nothing is turned off");
       }
       // Vulkan games: same-frame hand-off needs shared semaphores on the game's device, added at its vkCreateDevice (vk_hook.h).
       if (GetPrivateProfileIntW(L"HSF", L"VkDeviceHook", 1, g_ini_path) != 0)

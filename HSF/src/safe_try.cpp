@@ -4,8 +4,10 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <iterator>
 
 namespace hsf::safetry {
 namespace {
@@ -16,6 +18,7 @@ wchar_t g_section[MAX_PATH] = L"";  // the game's exe name
 LogFunction g_log = nullptr;
 uint32_t g_pid = 0;
 uint64_t g_test_now = 0;  // the test's clock for Begin, 0 = the real one
+bool g_enabled = true;
 
 struct Path {
   char name[32];
@@ -93,9 +96,64 @@ void InitForTest(const wchar_t* file, LogFunction log, uint32_t process_id, uint
   g_test_now = now_ms;
 }
 
+void SetEnabled(bool on) {
+  Lock lock;
+  g_enabled = on;
+}
+
+bool Enabled() {
+  Lock lock;
+  return g_enabled;
+}
+
+int ListOff(char (*names)[32], int max) {
+  Lock lock;
+  if (g_file[0] == 0 || max <= 0) return 0;
+  static wchar_t s_section[4096];
+  const DWORD length = GetPrivateProfileSectionW(g_section, s_section, static_cast<DWORD>(std::size(s_section)), g_file);
+  int count = 0;
+  for (const wchar_t* line = s_section; *line != 0 && line < s_section + length && count < max; line += std::wcslen(line) + 1) {
+    const wchar_t* const equals = std::wcschr(line, L'=');
+    if (equals == nullptr || equals - line < 5 || std::wcsncmp(equals - 4, L"_off", 4) != 0 || _wtoi(equals + 1) == 0) continue;
+    const size_t name_length = static_cast<size_t>(equals - 4 - line);
+    if (name_length >= 32) continue;
+    for (size_t i = 0; i < name_length; ++i) names[count][i] = static_cast<char>(line[i]);
+    names[count][name_length] = 0;
+    ++count;
+  }
+  return count;
+}
+
+void TurnBackOn(const char* name) {
+  Lock lock;
+  if (g_file[0] == 0) return;
+  wchar_t key[64];
+  Key(name, L"off", key, 64);
+  WritePrivateProfileStringW(g_section, key, nullptr, g_file);
+  Key(name, L"trying", key, 64);
+  WritePrivateProfileStringW(g_section, key, nullptr, g_file);
+  Say("safe try: %s turned back on for this game from the panel", name);
+}
+
+const char* Describe(const char* name) {
+  struct Known {
+    const char* path;
+    const char* text;
+  };
+  static const Known KNOWN[] = {
+      {"T2_ngx_game_streamline", "NGX MOTION (GAME'S STREAMLINE)"},
+      {"H1_plugin", "STREAMLINE PLUGIN HOOK"},
+      {"H2_load_notify", "STREAMLINE LOAD WATCH"},
+      {"H3_decoder", "HOOK DECODER"},
+  };
+  for (const Known& k : KNOWN)
+    if (std::strcmp(k.path, name) == 0) return k.text;
+  return name;
+}
+
 bool Allowed(const char* name) {
   Lock lock;
-  if (g_file[0] == 0) return true;
+  if (g_file[0] == 0 || !g_enabled) return true;
   Path* const p = Find(name, true);
   if (p == nullptr) return true;
   if (p->read) return p->allowed;
@@ -121,7 +179,7 @@ bool Allowed(const char* name) {
 
 void Begin(const char* name) {
   Lock lock;
-  if (g_file[0] == 0) return;
+  if (g_file[0] == 0 || !g_enabled) return;
   Path* const p = Find(name, true);
   if (p == nullptr || p->marked || p->since != 0) return;
   wchar_t key[64], value[16];

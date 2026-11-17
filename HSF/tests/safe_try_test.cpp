@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace {
@@ -52,6 +53,29 @@ int main() {
   st::Begin("D");
   st::InitForTest(file.c_str(), nullptr, GONE_PID, 1000);
   Check(st::Allowed("D"), "a mark from a running process does not turn a way off");
+
+  // The panel's list and its TURN BACK ON button.
+  st::InitForTest(file.c_str(), nullptr, GetCurrentProcessId(), 1000);
+  char names[8][32];
+  const int count = st::ListOff(names, 8);
+  Check(count == 1 && std::strcmp(names[0], "B") == 0, "list: only B is off");
+  st::TurnBackOn("B");
+  Check(st::ListOff(names, 8) == 0, "list: empty after B is turned back on");
+  st::InitForTest(file.c_str(), nullptr, GetCurrentProcessId(), 1000);
+  Check(st::Allowed("B"), "next launch: B allowed again");
+  Check(std::strcmp(st::Describe("T2_ngx_game_streamline"), "NGX MOTION (GAME'S STREAMLINE)") == 0 && std::strcmp(st::Describe("Z"), "Z") == 0, "plain names");
+
+  // SafeTry=0: a way left marked by a dead launch is not turned off, and nothing is marked.
+  st::InitForTest(file.c_str(), nullptr, GONE_PID, 1000);
+  st::Begin("E");
+  st::InitForTest(file.c_str(), nullptr, GetCurrentProcessId(), 1000);
+  st::SetEnabled(false);
+  Check(st::Allowed("E"), "safe try off: E allowed although its launch died");
+  st::Begin("F");
+  st::SetEnabled(true);
+  st::InitForTest(file.c_str(), nullptr, GetCurrentProcessId(), 1000);
+  Check(st::Allowed("F"), "safe try off: F was never marked");
+  Check(!st::Allowed("E"), "safe try back on: E's old mark now turns it off");
 
   DeleteFileW(file.c_str());
   std::printf(g_failures == 0 ? "all passed\n" : "%d FAILED\n", g_failures);
