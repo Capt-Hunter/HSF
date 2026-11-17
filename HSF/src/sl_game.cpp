@@ -391,6 +391,8 @@ SetDlssgOptionsFn g_real_dlssg_options = nullptr;
 SetReflexOptionsFn g_real_reflex_options = nullptr;
 SetFeatureLoadedFn g_real_set_loaded = nullptr;
 IsFeatureLoadedFn g_is_loaded = nullptr;
+using IsSupportedFn = sl::Result (*)(sl::Feature, const sl::AdapterInfo&);
+IsSupportedFn g_is_supported = nullptr;
 
 // ---- Driving DLSS-G ----
 
@@ -432,6 +434,9 @@ std::atomic<uint32_t> g_presented_period{0}, g_status{0}, g_max_frames{0}, g_pre
 std::atomic<bool> g_generating{false};
 std::atomic<uint32_t> g_frames_sent{0};
 std::atomic<bool> g_have_options{false};
+// Asks in a row where the game's Streamline answered that DLSS-G is not loaded at all (eErrorFeatureMissing: no feature context, so DLSS-G was not among the
+// features the game's slInit loaded, and it stays so for this run). Tyr loads only Reflex and PCL into its Streamline 2.7.30.
+std::atomic<uint32_t> g_dlssg_missing_asks{0};
 std::atomic<bool> g_tag_without_frame{false};
 std::atomic<int> g_feature_loaded{-1};  // is DLSS-G's plugin loaded: -1 not known yet
 // The latest frame an evaluate came with, which is the one the HUD is about to go on. A game that tags DLSS-G itself and runs no evaluates gives it with its tags and constants.
@@ -1273,6 +1278,7 @@ void HookInterposer(HMODULE module) {
     return;
   }
   g_is_loaded = reinterpret_cast<IsFeatureLoadedFn>(GetProcAddress(module, "slIsFeatureLoaded"));
+  g_is_supported = reinterpret_cast<IsSupportedFn>(GetProcAddress(module, "slIsFeatureSupported"));
   for (Hook& hook : g_hooks) {
     void* const function = reinterpret_cast<void*>(GetProcAddress(module, hook.name));
     if (function == nullptr) {
@@ -1682,6 +1688,7 @@ void Start(const wchar_t* log_path, bool drive, bool dynamic_resolution_known) {
   g_asked_features = false;
   g_generating.store(false);
   g_have_options.store(false);
+  g_dlssg_missing_asks.store(0);
   g_evaluate_streak.store(0);
   g_last_evaluate.store(0);
   g_last_game_vectors.store(0);
@@ -1736,12 +1743,33 @@ void Start(const wchar_t* log_path, bool drive, bool dynamic_resolution_known) {
   WatchLoads();
 }
 
+// Under g_lock, after slGetFeatureFunction answered eErrorFeatureMissing for DLSS-G (its feature context is gone). That comes both when the game left DLSS-G
+// out of its features and when Streamline dropped DLSS-G's plugin as unsupported on this PC (no hardware scheduling, an old driver, a card without DLSS-G).
+// Only the first is the game's doing; for the second HSF's own Streamline would get the same answer. slIsFeatureSupported tells them apart: Streamline reads
+// every plugin file it finds and keeps its config before it drops the ones the game did not ask for, so a left-out DLSS-G answers eOk on a PC that can run
+// it, and eErrorFeatureMissing when there is no DLSS-G file at all. Any other answer is this PC. No export: false. The lock comes off around the call, as in
+// AskFor.
+static bool DlssgLeftOutByGame() {
+  if (g_is_supported == nullptr) return false;
+  // Room to spare: an older Streamline reads its own version of the struct, which is no larger than this SDK's.
+  alignas(sl::AdapterInfo) unsigned char room[sizeof(sl::AdapterInfo) + 256] = {};
+  const sl::AdapterInfo* const adapter = new (room) sl::AdapterInfo{};
+  ReleaseSRWLockExclusive(&g_lock);
+  const sl::Result result = g_is_supported(sl::kFeatureDLSS_G, *adapter);
+  AcquireSRWLockExclusive(&g_lock);
+  const bool left_out = result == sl::Result::eOk || result == sl::Result::eErrorFeatureMissing;
+  Line("asked Streamline whether this PC supports DLSS-G: result %d (%s)", static_cast<int>(result),
+       left_out ? "the game left DLSS-G out of its Streamline" : "this PC can't run DLSS-G now, so the route stays");
+  return left_out;
+}
+
 // The lock is not reentrant, so it comes off around the call into Streamline. Call with it held.
-static void* AskFor(sl::Feature feature, const char* name) {
+static void* AskFor(sl::Feature feature, const char* name, sl::Result* out = nullptr) {
   void* function = nullptr;
   ReleaseSRWLockExclusive(&g_lock);
   const sl::Result result = g_real_get_function(feature, name, function);
   AcquireSRWLockExclusive(&g_lock);
+  if (out != nullptr) *out = result;
   if (result != sl::Result::eOk) function = nullptr;
   if (function != nullptr && function == g_options_stub) {
     Line("asked Streamline for %s: HSF's own through the plugin hook, DLSS-G's is %p", name, reinterpret_cast<void*>(g_real_dlssg_options));
@@ -1966,6 +1994,8 @@ bool AllCopiesTried() {
   return true;
 }
 
+uint32_t DlssgMissingAsks() { return g_dlssg_missing_asks.load(); }
+
 bool AnyCopyStarted() {
   HMODULE copies[8];
   const int count = GameCopies(copies, 8);
@@ -2024,6 +2054,7 @@ void Poll() {
       g_interposer = module;
       g_asked_features = false;
       g_have_options.store(false);
+      g_dlssg_missing_asks.store(0);
       {
         OptionsLock options_lock;
         g_direct_dlssg_options = nullptr;
@@ -2034,7 +2065,11 @@ void Poll() {
     // HSF may have arrived after the game asked for these, so ask too. Only reads a pointer. Waits until frames run, as Streamline must be up, and tries again now and then until DLSS-G answers.
     if (!g_asked_features && g_frames > 30 && g_real_get_function != nullptr && now >= g_next_ask) {
       g_next_ask = now + 10000;
-      void* const options = AskFor(sl::kFeatureDLSS_G, "slDLSSGSetOptions");
+      sl::Result options_result = sl::Result::eOk;
+      void* const options = AskFor(sl::kFeatureDLSS_G, "slDLSSGSetOptions", &options_result);
+      if (options != nullptr || options_result != sl::Result::eErrorFeatureMissing) g_dlssg_missing_asks.store(0);
+      else if (DlssgLeftOutByGame()) g_dlssg_missing_asks.fetch_add(1);
+      else g_dlssg_missing_asks.store(0);
       void* const state = AskFor(sl::kFeatureDLSS_G, "slDLSSGGetState");
       AskFor(sl::kFeatureDLSS, "slDLSSSetOptions");
       AskFor(sl::kFeatureReflex, "slReflexSetOptions");

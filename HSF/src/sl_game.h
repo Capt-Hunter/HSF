@@ -47,6 +47,8 @@ bool AllCopiesTried();
 // reads: before slInit it answers eErrorNotInitialized or eErrorInitNotCalled. A copy without that export counts as started. False when none is loaded.
 // Every copy, not the first: a stray copy another mod loads first is never started, and asking only it sent Gothic Remake to the bring route on every launch.
 bool AnyCopyStarted();
+// How many times in a row the game's started Streamline answered that DLSS-G is not loaded at all while this PC can run it (asked every 10 s). 0 once it is found.
+uint32_t DlssgMissingAsks();
 // What HSF wants, with drive on. allowed false holds generation off. frames is generated per real frame (1 = 2x).
 void SetGeneration(bool allowed, uint32_t frames);
 // True holds generation off while the game's window is not in front and for a moment after it comes back. Crimson Desert drops its device (DXGI_ERROR_ACCESS_DENIED)

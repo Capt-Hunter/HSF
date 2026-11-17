@@ -2635,6 +2635,20 @@ bool RouteOn(Route route) { return route == Route::on || route == Route::by_hsf;
 // Writes HSF's own value (2), or removes the key for Route::unset. Only these two are ever written.
 void WriteRoute(const wchar_t* key, Route route) { WritePrivateProfileStringW(L"HSF", key, route == Route::by_hsf ? L"2" : nullptr, g_ini_path); }
 
+#ifdef HSF_SL_GAME
+// A game that runs DLSS itself, through NGX, about to get HSF's own Streamline: Streamline must be told where its nvngx_dlss.dll is, or the game loses DLSS
+// (see sl_bring's FindGameDlssFolder).
+void KeepGameDlssForBring() {
+  const HMODULE dlss = GetModuleHandleW(L"nvngx_dlss.dll");
+  if (dlss == nullptr) return;
+  wchar_t path[MAX_PATH] = L"";
+  if (GetModuleFileNameW(dlss, path, MAX_PATH) == 0) return;
+  if (wchar_t* const slash = wcsrchr(path, L'\\')) *slash = L'\0';
+  WritePrivateProfileStringW(L"HSF", L"SlNgxPath", path, g_ini_path);
+  Log("route: this game runs DLSS through NGX itself; SlNgxPath written so it keeps its DLSS with HSF's Streamline");
+}
+#endif
+
 // A D3D12 game with neither D3D12 route on in HSF.ini. Both routes must start when HSF loads, before the game makes its device, so HSF picks one now, writes it
 // to HSF.ini and asks for one restart (without it, FF7R in DX12 showed "only Direct3D 11 and DX9" with no way on). A game with its own Streamline gets
 // InGameDlssg=2, one without gets SlBringIn=2 (as 1, but written by HSF: LeaveAutoD3d12Route takes either back if the game later runs D3D11).
@@ -2658,15 +2672,7 @@ void PickD3d12Route() {
       Log("route: sl.interposer.dll is loaded but the game never started it (a stray copy in the game folder?), so HSF brings its own Streamline");
     WriteRoute(L"SlBringIn", Route::by_hsf);
     Log("route: a D3D12 game with no Streamline: SlBringIn=2 written (HSF brings Streamline), it starts at the next launch");
-    // A game that runs DLSS itself, through NGX: Streamline must be told where its nvngx_dlss.dll is, or the game loses DLSS (see sl_bring's FindGameDlssFolder)
-    if (const HMODULE dlss = GetModuleHandleW(L"nvngx_dlss.dll")) {
-      wchar_t path[MAX_PATH] = L"";
-      if (GetModuleFileNameW(dlss, path, MAX_PATH) != 0) {
-        if (wchar_t* const slash = wcsrchr(path, L'\\')) *slash = L'\0';
-        WritePrivateProfileStringW(L"HSF", L"SlNgxPath", path, g_ini_path);
-        Log("route: this game runs DLSS through NGX itself; SlNgxPath written so it keeps its DLSS with HSF's Streamline");
-      }
-    }
+    KeepGameDlssForBring();
   }
   Note("D3D12: HSF HAS SET UP ITS D3D12 ROUTE. RESTART THE GAME ONCE");
 #else
@@ -2690,6 +2696,22 @@ void LeaveUnstartedStreamline() {
   if (ReadRoute(L"SlBringIn") != Route::off) WriteRoute(L"SlBringIn", Route::by_hsf);
   Log("route: the game never started its sl.interposer.dll (a stray copy in the game folder?), so the in-game route can do nothing; SlBringIn=2 written, HSF brings its own Streamline from the next launch");
   g_drive_left = true;
+}
+
+// The in-game route in a game whose own Streamline is started but has no DLSS-G: the game loaded only other features (Tyr: Reflex and PCL into Streamline
+// 2.7.30), so every ask for DLSS-G's functions answers eErrorFeatureMissing. In Streamline that means DLSS-G has no feature context, which stays so for the
+// whole run, and the menu would wait forever for "the game's DLSS-G". Asks count only when Streamline also says this PC can run DLSS-G (sl_game's
+// DlssgLeftOutByGame): a plugin dropped for no hardware scheduling or an old driver gives the same answer, and there nothing is said. After
+// DLSSG_MISSING_ASKS answers like that in a row, HSF logs it and the menu tells the player to try USE HSF'S STREAMLINE (DrawUseOwnStreamline). HSF changes
+// no route by itself here: Hunter's call (2026-11-18), as a wrong guess would move a good game off its own Streamline.
+constexpr uint32_t DLSSG_MISSING_ASKS = 3;  // asked every 10 s
+bool g_no_dlssg_seen = false;  // this run: the game's own Streamline has no DLSS-G (the menu's warning)
+bool g_use_own_changed = false;  // USE HSF'S STREAMLINE (DrawUseOwnStreamline) changed this run: the next launch takes the other route
+void NoteStreamlineWithoutDlssg() {
+  if (g_no_dlssg_seen || g_drive_left || !D3d12Run()) return;
+  if (hsf::slgame::DlssgMissingAsks() < DLSSG_MISSING_ASKS || hsf::slgame::GetStats().have_options) return;
+  g_no_dlssg_seen = true;
+  Log("route: the game's own Streamline runs without DLSS-G (it answers that DLSS-G is not loaded, and this PC can run it). The menu suggests ADVANCED > GAME'S STREAMLINE > USE HSF'S STREAMLINE");
 }
 #endif
 
@@ -4839,6 +4861,7 @@ void OnFinishEffects(effect_runtime* runtime, command_list*, resource_view rtv, 
   }
   if (g_sl_drive && dev->get_api() == device_api::d3d12) {
     LeaveUnstartedStreamline();
+    NoteStreamlineWithoutDlssg();
     SlOpticalFrame(runtime, dev, target);
     return;
   }
@@ -5792,8 +5815,10 @@ MenuView ReadMenuView() {
     v.generating = s.generating && s.presented > 1;
     if (v.generating) v.out_fps = v.base_fps * static_cast<float>(s.presented);
     if (g_drive_left) v.waiting = "This game never starts its own Streamline. HSF will bring its own: restart the game once.";
+    else if (g_use_own_changed) v.waiting = "USE HSF'S STREAMLINE changed: restart the game.";
+    else if (g_no_dlssg_seen) v.problem = "This game's own Streamline has no DLSS-G. Try ADVANCED > GAME'S STREAMLINE > USE HSF'S STREAMLINE, then restart the game.";
     else if (s.old_streamline) v.waiting = "This game's Streamline is too old for HSF (1.x). Use the game's own frame generation.";
-    else if (!s.have_options) v.waiting = "The game's DLSS-G is not found yet. Turn on DLSS upscaling (any mode) or the game's own frame generation.";
+    else if (!s.have_options) v.waiting = "The game's DLSS-G is not found yet. Turn on DLSS upscaling (any mode) or the game's own frame generation. If it never comes, try ADVANCED > USE HSF'S STREAMLINE.";
     else if (s.plugin_loaded == 0) v.problem = "DLSS-G's plugin did not load (see HSF.log).";
     else if (s.status != 0) v.problem = "DLSS-G reports a problem (see HSF.log).";
     else if (!s.data_flowing && MotionFrom() == 2 && !g_dlss_seen) v.waiting = "Waiting for the game's motion vectors (menus send none).";
@@ -6006,6 +6031,7 @@ void ReadFinderD3d12(Finder& f) {
   if (g_sl_drive) {
     const hsf::slgame::Stats s = hsf::slgame::GetStats();
     if (s.old_streamline) AddStep(f, "GAME'S STREAMLINE", StepState::failed, "version 1.x, which HSF leaves alone. Use the game's own frame generation");
+    else if (g_no_dlssg_seen) AddStep(f, "GAME'S STREAMLINE", StepState::failed, "found, but the game runs it without DLSS-G. Try ADVANCED > GAME'S STREAMLINE > USE HSF'S STREAMLINE, then restart the game");
     else if (s.interposer_found) AddStep(f, "GAME'S STREAMLINE", StepState::ok, "found");
     else if (g_drive_left) AddStep(f, "GAME'S STREAMLINE", StepState::failed, "this game never starts its own. HSF brings its own from the next start: restart the game once");
     else if (s.only_hsf_streamline) AddStep(f, "GAME'S STREAMLINE", StepState::failed, "only HSF's own is loaded; the game never started its own");
@@ -7198,6 +7224,50 @@ void StartupToggle(const char* label, const wchar_t* key, int fallback, const ch
 
 bool DrawOverlaySettings();
 
+#ifdef HSF_SL_GAME
+// USE HSF'S STREAMLINE (HSF.ini SlUseOwn=1 while on): the player moves a game with its own Streamline to HSF's own, for a game that never brings DLSS-G
+// (NoteStreamlineWithoutDlssg says when to try it). ON: SlBringIn=2 and InGameDlssg gone, and SlNgxPath for a game that runs DLSS through NGX, from the
+// next launch. OFF takes it back: InGameDlssg=2 and SlBringIn gone. Shown on the game-Streamline route, and on HSF's own route only where this switch put
+// the game (SlUseOwn=1); a route set by hand (SlBringIn=1, or 0) is left alone.
+void DrawUseOwnStreamline() {
+  namespace ui = hsf::ui;
+  namespace c = hsf::ui::colour;
+  static bool s_read = false, s_on = false;
+  if (!s_read) {
+    s_on = GetPrivateProfileIntW(L"HSF", L"SlUseOwn", 0, g_ini_path) != 0;
+    s_read = true;
+  }
+  if (g_sl_bring && !s_on && !g_use_own_changed) return;
+  if (ReadRoute(L"SlBringIn") == Route::off || ReadRoute(L"SlBringIn") == Route::on) return;  // set by hand
+  static const char* const TIP =
+      "Games with their own Streamline that never bring DLSS-G (the menu says\n"
+      "\"not found\" however long you play, with DLSS on). Some games load\n"
+      "Streamline for Reflex only.\n\n"
+      "ON: HSF brings its own Streamline, with DLSS-G, from the next launch.\n"
+      "The game keeps its own DLSS upscaling.\n\n"
+      "OFF: HSF uses the game's own Streamline (the normal way).\n\n"
+      "Applies after a game restart.";
+  if (ui::SettingLabel("USE HSF'S STREAMLINE")) ImGui::SetTooltip("%s", TIP);
+  if (ui::Toggle("##useown", &s_on, TIP)) {
+    g_use_own_changed = !g_use_own_changed;
+    if (s_on) {
+      WriteRoute(L"InGameDlssg", Route::unset);
+      WriteRoute(L"SlBringIn", Route::by_hsf);
+      KeepGameDlssForBring();
+      WritePrivateProfileStringW(L"HSF", L"SlUseOwn", L"1", g_ini_path);
+      Log("route: USE HSF'S STREAMLINE turned on from the menu: SlBringIn=2 written, HSF brings its own Streamline from the next launch");
+    } else {
+      WriteRoute(L"SlBringIn", Route::unset);
+      WriteRoute(L"InGameDlssg", Route::by_hsf);
+      WritePrivateProfileStringW(L"HSF", L"SlUseOwn", nullptr, g_ini_path);
+      Log("route: USE HSF'S STREAMLINE turned off from the menu: back to the game's own Streamline (InGameDlssg=2) from the next launch");
+    }
+  }
+  if (g_use_own_changed) ui::RightNote("> RESTART THE GAME", c::AMBER);
+  else if (!s_on && g_no_dlssg_seen) ui::RightNote("> TRY THIS: GAME HAS NO DLSS-G", ui::Pulsing(c::AMBER));
+}
+#endif
+
 // The menu is its own window, "HSF", and it belongs as a tab next to ReShade's Home, Add-ons and Settings. ReShade opens add-on windows with a plain Begin and never
 // docks them, so in a new game it came up tiny at the top left. Once a run, while the window is not docked, this docks it where ReShade's Add-ons window is. ReShade
 // begins its own windows earlier in the same frame, so a second Begin("###addons") only appends to that window (no rename, no new window) and reads its dock node.
@@ -7900,11 +7970,13 @@ void DrawPanel(effect_runtime* runtime) {
       StartupToggle("SL MANUAL HOOKING", L"SlManualHooking", 0);
       StartupToggle("SL EARLY LOAD", L"SlEarlyLoad", 1);
       StartupToggle("NGX INPUT", L"NgxInput", 1);
+      DrawUseOwnStreamline();  // only where that switch brought HSF's Streamline in
     }
     if (now.drive && !now.bring) {
       ui::Rule();
       ui::Caps("GAME'S STREAMLINE // APPLIES AFTER A GAME RESTART", c::DIM, 0.8f);
       StartupToggle("NGX INPUT", L"NgxInput", 1);
+      DrawUseOwnStreamline();
     }
 #endif
     ui::Rule();
