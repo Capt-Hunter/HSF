@@ -87,6 +87,19 @@ These were tested alongside HSF:
 
 Heavily modded games (OptiScaler, REFramework and others) can clash. When a game crashes, move the other mods into a `_mods_off` folder and try HSF alone first.
 
+### 4.5 A game's Streamline is too old for MFG
+
+Some DirectX 12 games ship their own copy of NVIDIA Streamline. Streamline older than 2.7.2 (from before DLSS 4, January 2025) only allows 2x frame generation, so DLSS-G cannot do more there, even on an RTX 50 card. Streamline 2.7.2 to 2.10 allows up to 4x; 5x and 6x need 2.11 or newer. HSF's own copy is 2.14.
+
+When this is the case, the menu says so under MULTIPLIER: GAME'S STREAMLINE 2.0.0 IS TOO OLD FOR MFG // 2X ONLY, and 3X to 6X are crossed out. Hover over the line to see the folder that holds the game's copy. HSF does not change game files, so the update is a manual step:
+
+1. Close the game.
+2. Open the folder the menu names (for example `<game>\Engine\Plugins\NVidiaDLSS\Streamline\Binaries\ThirdParty\Win64` in Unreal games). Copy the whole folder somewhere safe as a backup.
+3. From HSF's `HSF_streamline` folder, copy every `sl.*.dll` file and `nvngx_dlssg.dll` into that folder, replacing the old ones. Copy only these files.
+4. Start the game. The line is gone, and 3X to 6X are open.
+
+If the game no longer starts, put the backup back. A game update or a file check in Steam or another launcher can bring the old files back; then the line shows again.
+
 ## 5. The menu
 
 Open ReShade's overlay (Home key by default). HSF has its own tab, **HSF**, next to ReShade's Home, Add-ons and Settings. It docks itself there the first time. If you drag it out, it comes back at the next launch.
