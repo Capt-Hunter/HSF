@@ -183,8 +183,8 @@ function Run-Case($case) {
     if ($case.Sl -ne 'none' -and $shown -lt 2) { $why += "DLSS-G showed $shown per real frame" }
   } elseif ($case.Mods -ne 'bare') {
     if ($reshadeLog -notmatch 'HSF \d[\d.]* \(64-bit\) loaded') { $why += 'HSF did not load' }
-    $probe = if (Test-Path "$dir\HSF_sl_probe.log") { Get-Content -Raw "$dir\HSF_sl_probe.log" } else { '' }
-    $bring = if (Test-Path "$dir\HSF_sl_bring.log") { Get-Content -Raw "$dir\HSF_sl_bring.log" } else { '' }
+    $probe = if (Test-Path "$dir\HSF.log") { Get-Content -Raw "$dir\HSF.log" } else { '' }
+    $bring = $probe  # both routes write [STREAMLINE] lines to HSF.log
     $hsfShown = 0
     foreach ($m in [regex]::Matches($probe, 'DLSS-G now shows (\d+) per real frame')) { $hsfShown = [math]::Max($hsfShown, [int]$m.Groups[1].Value) }
     foreach ($m in [regex]::Matches($bring, 'showing (\d+) per real frame')) { $hsfShown = [math]::Max($hsfShown, [int]$m.Groups[1].Value) }

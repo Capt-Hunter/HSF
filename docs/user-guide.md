@@ -212,7 +212,7 @@ The menu's and the overlay's colours. PANEL is the panel behind the text (its bo
 | CAMERA MOTION, CAMERA FIT, CAMERA RECORD | DirectX 11. Exact motion for the still world from the game's camera matrices. CAMERA FIT can shake. CAMERA RECORD (F6) records 30 s for offline study. |
 | REBUILD CAMERA, CUT CHECK, QUICK OFF, SCORE GUARD | In-game route only. See [settings.md](settings.md). |
 | STREAMLINE switches | Bring-in route only: SL LOG, SL FACTORY PROXY, SL MANUAL HOOKING, SL EARLY LOAD, NGX INPUT. They apply after a game restart. |
-| COPY LOG TO CLIPBOARD | Copies HSF's lines from `ReShade.log`, plus the route's own log. Paste it when you report a problem. |
+| COPY LOG TO CLIPBOARD | Copies `HSF.log`. Paste it when you report a problem. |
 | ALL DETAILS | Every number HSF knows. |
 
 ## 6. Overlays
@@ -242,11 +242,9 @@ Frame generation and the overlay have no key until you set one, because the free
 | File | Where | What |
 |---|---|---|
 | `HSF.ini` | next to the add-on | all settings. The menu writes it, and HSF reads it again when it changes. |
-| `ReShade.log` | next to ReShade | HSF's own lines |
-| `HSF_sl_bring.log` | `<game>` | bring-in route |
-| `HSF_sl_probe.log` | `<game>` | in-game route |
-| `HSF_streamline\hsf_dlssg.log`, `hsf_dlssg_game.log` | `HSF_streamline` | helper route, the helper side and the game side |
+| `HSF.log` | next to the add-on | HSF's one log, started fresh at each game start. Send this file when you report a problem. |
+| `HSF.previous.log` | next to the add-on | the log of the run before |
 
 ## 9. Uninstall
 
-Delete `hsf.addon64` or `hsf.addon32`, `HSF.ini`, the `HSF_streamline` folder and `reshade-shaders\Shaders\HSF.fx`. HSF changes nothing else in the game folder. There is one exception: on DirectX 9 games that ran out of memory, the 4 GB flag may have been set by hand in the exe, and the original was kept next to it.
+Delete `hsf.addon64` or `hsf.addon32`, `HSF.ini`, `HSF.log`, `HSF.previous.log`, the `HSF_streamline` folder and `reshade-shaders\Shaders\HSF.fx`. HSF changes nothing else in the game folder. There is one exception: on DirectX 9 games that ran out of memory, the 4 GB flag may have been set by hand in the exe, and the original was kept next to it.

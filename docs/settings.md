@@ -64,7 +64,7 @@ Older files may still have `Presenter`, `Generated` and `Pacing`. They belonged 
 |---|---|---|---|---|---|
 | `InGameDlssg` | not set | 0, 1, 2 | Start; HSF writes 2 | D3D12-G | Runs DLSS-G inside a game that ships Streamline 2.x. Once D3D12 has shown more frames than D3D11 (at least 300), HSF writes 2 if the game's `sl.interposer.dll` is loaded. A run that is mostly D3D11 takes 1 or 2 out again. 0 by hand keeps it off for good. |
 | `SlBringIn` | not set | 0, 1, 2 | Start; HSF writes 2 | D3D12-B | Starts HSF's own Streamline 2.14 (from `HSF_streamline`) in a D3D12 game without one. 2 means HSF wrote it (once D3D12 has shown more frames than D3D11), and a later run that is mostly D3D11 takes it out again. 1 is set by hand and stays. 0 keeps it off for good. |
-| `StreamlineProbe` | `0` | 0, 1 | Start | D3D12-G | Hooks the game's Streamline and logs what it sends (`HSF_sl_probe.log`), changing nothing. |
+| `StreamlineProbe` | `0` | 0, 1 | Start | D3D12-G | Hooks the game's Streamline and logs what it sends (`HSF.log`), changing nothing. |
 | `NgxInput` | `1` | 0, 1 | Start | D3D12-B | Takes the game's own DLSS data (motion, depth, jitter, reset) from its NGX calls, in games with DLSS but no Streamline. |
 | `SlLog` | `0` | 0, 1 | Start | D3D12-B | Streamline's own logging. It crashed Jusant, so it is off by default. |
 | `SlFactoryProxy` | `1` | 0, 1 | Start | D3D12-B | Makes the swap chain through Streamline's factory proxy. Needed with ShortFuse's NR mod. |

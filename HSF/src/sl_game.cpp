@@ -1,6 +1,7 @@
 // See sl_game.h. Hooks are written here, in HSF's own code: a 5-byte jump at the start of each function goes to a relay in a page HSF allocates near the module, which
 // jumps to the hook; the hook calls a trampoline holding the moved prologue, which jumps back. Anything unexpected at a function's start means no hook there, only a log line.
 #include "sl_game.h"
+#include "hsf_log.h"
 #include "version.h"
 #include "motion_timing.h"
 
@@ -71,21 +72,18 @@ uint32_t SafeViewport(const sl::ViewportHandle* viewport) {
 
 // ---- The log ----
 
-constexpr long MAX_LOG_BYTES = 32 * 1024 * 1024;
-
 SRWLOCK g_lock = SRWLOCK_INIT;  // guards the log and all the counters below
-FILE* g_file = nullptr;
+bool g_log_on = false;  // between Start and Stop
 
+// A line in HSF.log (hsf_log.h caps it), with the thread id that tells the game's threads apart.
 void Line(const char* format, ...) {
-  if (g_file == nullptr) return;
-  if (std::ftell(g_file) > MAX_LOG_BYTES) return;
+  if (!g_log_on) return;
   char text[2048];
   va_list args;
   va_start(args, format);
   std::vsnprintf(text, sizeof(text), format, args);
   va_end(args);
-  std::fprintf(g_file, "%10.2f [%5lu] %s\r\n", static_cast<double>(GetTickCount64() % 100000000) / 1000.0, GetCurrentThreadId(), text);
-  std::fflush(g_file);
+  hsflog::Writef(hsflog::STREAMLINE, "[%5lu] %s", GetCurrentThreadId(), text);
 }
 
 const char* BufferName(uint32_t type) {
@@ -1724,9 +1722,9 @@ void Start(const wchar_t* log_path, bool drive, bool dynamic_resolution_known) {
     g_direct_dlssg_options = nullptr;
     g_get_dlssg_state = nullptr;
   }
-  // Appends: ReShade reloads add-ons during startup, and each load must not wipe the one before.
-  _wfopen_s(&g_file, log_path, L"ab");
-  if (g_file != nullptr) std::setvbuf(g_file, nullptr, _IOFBF, 8192);
+  // HSF.log: the add-on has it open already; a test opens its own. ReShade reloads add-ons during startup, and HSF.log appends for each.
+  hsflog::Open(log_path);
+  g_log_on = true;
   wchar_t exe[MAX_PATH] = L"?";
   GetModuleFileNameW(nullptr, exe, MAX_PATH);
   Line("=== HSF %s started in %ls. %s ===", HSF_VERSION, exe, drive ? "Driving DLSS-G inside the game." : "Only logging: every call goes on unchanged.");
@@ -2382,10 +2380,7 @@ void Stop(bool process_exiting) {
     for (int i = 0; i < 200 && g_in_flight.load(std::memory_order_acquire) != 0; ++i) Sleep(1);
   }
   Lock lock;
-  if (g_file != nullptr) {
-    std::fclose(g_file);
-    g_file = nullptr;
-  }
+  g_log_on = false;
 }
 
 }  // namespace hsf::slgame

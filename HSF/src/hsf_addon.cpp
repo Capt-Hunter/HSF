@@ -28,6 +28,7 @@
 #include "ui.h"
 #include "dxgi_guard.h"
 #include "safe_try.h"
+#include "hsf_log.h"
 #include "ngx_vk.h"  // FrameVk only in the 32-bit build, which has no NGX hooks
 #ifdef HSF_SL_GAME
 #include <d3d12.h>
@@ -628,7 +629,7 @@ void PollIni() {
                 "fps cap %u, gpu reserve %s, reflex boost %s, game queue 1 %s, reflex sleep %s, score %s",
                 g_extra_enabled ? "on" : "off", MOTION_NAMES[g_motion_convention], SOURCE_NAMES[g_source_setting], OVERLAY_NAMES[g_overlay_mode],
                 g_dlssg_frames, g_fps_cap, g_gpu_reserve ? "on" : "off", g_reflex_boost ? "on" : "off", g_queue_one ? "on" : "off", g_reflex_sleep ? "on" : "off", g_score_enabled ? "on" : "off");
-  reshade::log_message(reshade::log_level::info, text);
+  Log(text);
 }
 
 const char* ApiName(device_api api) {
@@ -643,7 +644,9 @@ const char* ApiName(device_api api) {
   return "unknown";
 }
 
+// HSF.log (hsf_log.h), and ReShade.log as before.
 void Log(const char* text) {
+  hsf::hsflog::Write(hsf::hsflog::HSF, text);
   char line[400];
   std::snprintf(line, sizeof(line), "HSF: %s", text);
   reshade::log_message(reshade::log_level::info, line);
@@ -913,7 +916,7 @@ void UpdateStats() {
                   d.report_total_ms, d.report_frames, d.note[0] != '\0' ? "; " : "", d.note);
     Log(text);
   }
-  // D3D11 and DX9 only: the D3D12 routes log to HSF_sl_probe.log and HSF_sl_bring.log.
+  // D3D11 and DX9 only: the D3D12 routes write their own [STREAMLINE] lines.
   if (Seconds(now - last_log) >= 10.0 && g_seen.api != device_api::d3d12) {
     last_log = now;
     char text[320];
@@ -1236,7 +1239,7 @@ void UpdatePresenter(device* dev) {
     p.running_source = g_seen.source;
     std::snprintf(text, sizeof(text), "DLSS-G presenter started: %ux%u format %u%s%s", desc.Width, desc.Height, static_cast<unsigned>(desc.Format),
                   error[0] != '\0' ? "; " : "", error);
-    Note("presenter on: DLSS Frame Generation (log: HSF_streamline\\hsf_dlssg.log)");
+    Note("presenter on: DLSS Frame Generation (log: HSF.log)");
   } else {
     p.refused_size[0] = desc.Width;
     p.refused_size[1] = desc.Height;
@@ -3481,7 +3484,7 @@ void UpdatePresenter9() {
     p.running_size[1] = desc.Height;
     std::snprintf(text, sizeof(text), "DLSS-G presenter started for Direct3D 9: %ux%u D3D9 format %u, bridge %s%s%s", desc.Width, desc.Height,
                   static_cast<unsigned>(desc.Format), hsf::dx9::ROUTE_NAMES[static_cast<int>(hsf::dx9::CurrentRoute())], error[0] != '\0' ? "; " : "", error);
-    Note("presenter on: DLSS Frame Generation (log: HSF_streamline\\hsf_dlssg.log)");
+    Note("presenter on: DLSS Frame Generation (log: HSF.log)");
   } else {
     p.refused_window = window;
     p.refused_size[0] = desc.Width;
@@ -3759,7 +3762,7 @@ void UpdatePresenterVk(effect_runtime* runtime, device* dev) {
     std::snprintf(text, sizeof(text), "DLSS-G presenter started for Vulkan: %ux%u format %u, %s", width, height, static_cast<unsigned>(desc.texture.format),
                   hsf::vk::SameFrame() ? "frames handed over in the same frame (shared semaphores on the game's device)"
                                        : "frames handed over in the same frame after a CPU wait for the copies (no shared semaphores on the game's device)");
-    Note("presenter on: DLSS Frame Generation (log: HSF_streamline\\hsf_dlssg.log)");
+    Note("presenter on: DLSS Frame Generation (log: HSF.log)");
     const char* const hook = hsf::vk::HookReport();
     Log(hook[0] != '\0' ? hook : "Vulkan device hook: did not see the game's device (HSF's Vulkan layer may still have added the extensions)");
   } else {
@@ -5445,7 +5448,8 @@ const OlderCardMod& OlderCardModNow() {
 
 // A game whose own Streamline is too old for MFG: before 2.7.2 DLSS-G takes 2x only, so 3X-6X are crossed out. The menu says why and where the game's copy is,
 // so the player can update it (docs/user-guide.md, "A game's Streamline is too old for MFG"). HSF changes no game files. Shown only on the Direct3D 12 routes,
-// only when this card can do MFG (RTX 50, or RTX 40 with MFG-Unlocker), and only once DLSS-G has said 2x only. Read once a second; logged once.
+// only when this card can do MFG (RTX 50, or RTX 40 with MFG-Unlocker), and only once DLSS-G has said 2x only. Read once a second, by the menu and by OnMenuFrame (so HSF.log has the line with the menu never
+// opened); logged once.
 const char* GpuName();
 
 struct OldStreamline {
@@ -5487,7 +5491,7 @@ const OldStreamline& OldStreamlineNow(uint32_t max_frames, const OlderCardMod& o
   if (!s_logged) {
     s_logged = true;
     char line[512];
-    std::snprintf(line, sizeof(line), "menu: the game's Streamline %u.%u.%u is too old for MFG (needs 2.7.2 or newer), so DLSS-G does 2x only; the game's copy is in %ls",
+    std::snprintf(line, sizeof(line), "WARNING: the game's Streamline %u.%u.%u is too old for MFG (needs 2.7.2 or newer), so DLSS-G does 2x only; the game's copy is in %ls",
                   copy.version[0], copy.version[1], copy.version[2], folder);
     Log(line);
   }
@@ -5760,8 +5764,8 @@ MenuView ReadMenuView() {
     if (v.generating) v.out_fps = v.base_fps * static_cast<float>(s.shown_per_real);
     if (!s.streamline_up) v.waiting = "Streamline has not started yet.";
     else if (s.swap_chains == 0) v.waiting = "No swap chain through Streamline yet.";
-    else if (s.plugin_loaded == 0) v.problem = "DLSS-G's plugin did not load (see HSF_sl_bring.log).";
-    else if (s.status > 0) v.problem = "DLSS-G reports a problem (see HSF_sl_bring.log).";
+    else if (s.plugin_loaded == 0) v.problem = "DLSS-G's plugin did not load (see HSF.log).";
+    else if (s.status > 0) v.problem = "DLSS-G reports a problem (see HSF.log).";
     else if (s.fp16 && g_extra_enabled) v.problem = "The game's swap chain is FP16 (scRGB), which DLSS-G does not take. Set the game, or RenoDX's swap chain format, to HDR10.";
     if (!v.generating && v.problem == nullptr && v.waiting == nullptr) v.waiting = FinderReason();
     return v;
@@ -5777,8 +5781,8 @@ MenuView ReadMenuView() {
     if (g_drive_left) v.waiting = "This game never starts its own Streamline. HSF will bring its own: restart the game once.";
     else if (s.old_streamline) v.waiting = "This game's Streamline is too old for HSF (1.x). Use the game's own frame generation.";
     else if (!s.have_options) v.waiting = "The game's DLSS-G is not found yet. Turn on DLSS upscaling (any mode) or the game's own frame generation.";
-    else if (s.plugin_loaded == 0) v.problem = "DLSS-G's plugin did not load (see HSF_sl_probe.log).";
-    else if (s.status != 0) v.problem = "DLSS-G reports a problem (see HSF_sl_probe.log).";
+    else if (s.plugin_loaded == 0) v.problem = "DLSS-G's plugin did not load (see HSF.log).";
+    else if (s.status != 0) v.problem = "DLSS-G reports a problem (see HSF.log).";
     else if (!s.data_flowing && MotionFrom() == 2 && !g_dlss_seen) v.waiting = "Waiting for the game's motion vectors (menus send none).";
     if (!v.generating && v.problem == nullptr && v.waiting == nullptr) v.waiting = FinderReason();
     return v;
@@ -5797,8 +5801,8 @@ MenuView ReadMenuView() {
     if (d.real_fps > 0.f) v.base_fps = d.real_fps;
     v.out_fps = d.shown_fps > 0.f ? d.shown_fps : v.base_fps;
     if (d.gpu_hang) v.problem = d.note;
-    else if (d.foreign_dxgi) v.problem = "ReShade loaded into HSF's helper (Game Pass): its effects and add-ons run twice and cost frames. Send hsf_dlssg.log to HSF's GitHub.";
-    else if (d.status != 0) v.problem = d.note[0] != '\0' ? d.note : "DLSS-G reports a problem (see HSF_streamline\\hsf_dlssg.log).";
+    else if (d.foreign_dxgi) v.problem = "ReShade loaded into HSF's helper (Game Pass): its effects and add-ons run twice and cost frames. Send HSF.log to HSF's GitHub.";
+    else if (d.status != 0) v.problem = d.note[0] != '\0' ? d.note : "DLSS-G reports a problem (see HSF.log).";
     else if (!d.generating && d.note[0] != '\0') v.waiting = d.note;
   } else if (!g_seen.have_api) {
     v.waiting = "Waiting for the first frame.";
@@ -5900,7 +5904,7 @@ void ReadFinderVk(Finder& f) {
   if (d.gpu_hang) {
     AddStep(f, "DLSS-G STATUS", StepState::failed, "%s", d.note);
   } else if (d.foreign_dxgi) {
-    AddStep(f, "DLSS-G STATUS", StepState::failed, "ReShade loaded into HSF's helper (Game Pass). Send hsf_dlssg.log to HSF's GitHub");
+    AddStep(f, "DLSS-G STATUS", StepState::failed, "ReShade loaded into HSF's helper (Game Pass). Send HSF.log to HSF's GitHub");
   } else if (d.status != 0) {
     DlssgStatusWords(static_cast<int>(d.status), words, sizeof(words));
     AddStep(f, "DLSS-G STATUS", StepState::failed, "%s", words);
@@ -5950,7 +5954,7 @@ void ReadFinderD3d12(Finder& f) {
     const hsf::slbring::Stats s = hsf::slbring::GetStats();
     f.route = FinderRoute::hsf_streamline;
     if (s.streamline_up) AddStep(f, "STREAMLINE", StepState::ok, "HSF's own, started");
-    else AddStep(f, "STREAMLINE", StepState::failed, "HSF's Streamline did not start (HSF_sl_bring.log says why). Restart the game once");
+    else AddStep(f, "STREAMLINE", StepState::failed, "HSF's Streamline did not start (HSF.log says why). Restart the game once");
     if (s.swap_chains > 0) AddStep(f, "SWAP CHAIN", StepState::ok, "%u made through Streamline", s.swap_chains);
     else if (s.failed > 0) AddStep(f, "SWAP CHAIN", StepState::failed, "Streamline could not make the game's swap chain (%u tries); the game runs on a plain one", s.failed);
     else AddStep(f, "SWAP CHAIN", StepState::waiting, "the game has made none through Streamline yet. Switch the game's display mode once, or restart it");
@@ -5958,7 +5962,7 @@ void ReadFinderD3d12(Finder& f) {
     else if (s.supported < 0) AddStep(f, "DLSS-G ON THIS CARD", StepState::waiting, "not asked yet (Streamline asks once it has the device)");
     else AddStep(f, "DLSS-G ON THIS CARD", StepState::failed, "Streamline says not supported (result %d). RTX 40 and newer; RTX 30 and 20 need MFG-Unlocker", s.supported);
     if (s.plugin_loaded == 1) AddStep(f, "DLSS-G PLUGIN", StepState::ok, "loaded");
-    else if (s.plugin_loaded == 0) AddStep(f, "DLSS-G PLUGIN", StepState::failed, "did not load (sl.dlss_g.dll missing or refused, see HSF_sl_bring.log)");
+    else if (s.plugin_loaded == 0) AddStep(f, "DLSS-G PLUGIN", StepState::failed, "did not load (sl.dlss_g.dll missing or refused, see HSF.log)");
     else AddStep(f, "DLSS-G PLUGIN", StepState::waiting, "not known yet");
     if (s.fp16) {
       AddStep(f, "PICTURE FORMAT", StepState::failed, "the swap chain is FP16 (scRGB), which DLSS-G does not take. Set the game, or RenoDX's swap chain format, to HDR10");
@@ -5971,7 +5975,7 @@ void ReadFinderD3d12(Finder& f) {
       AddStep(f, "DLSS-G STATUS", StepState::ok, "fine");
     }
     char ngx_note[120];
-    NgxNote(ngx_note, sizeof(ngx_note), "HSF_sl_bring.log");
+    NgxNote(ngx_note, sizeof(ngx_note), "HSF.log");
     AddMotionStep(f, g_bring_using_game, ngx_note, "the game's DLSS, read through NGX", "DLSS upscaling (any mode)");
     static uint64_t s_fed = 0;
     static ULONGLONG s_fed_at = 0;
@@ -5995,7 +5999,7 @@ void ReadFinderD3d12(Finder& f) {
     else AddStep(f, "GAME'S STREAMLINE", StepState::waiting, "not loaded yet (some games load it when DLSS is turned on)");
     if (s.interposer_found && !s.old_streamline) {
       if (s.hooks_installed > 0) AddStep(f, "HOOKS", StepState::ok, "%u in", s.hooks_installed);
-      else AddStep(f, "HOOKS", StepState::failed, "none went in: another tool holds the calls (HSF_sl_probe.log names them). RESCAN tries again");
+      else AddStep(f, "HOOKS", StepState::failed, "none went in: another tool holds the calls (HSF.log names them). RESCAN tries again");
     }
     if (s.have_options) AddStep(f, "GAME'S DLSS-G", StepState::ok, "found");
     else AddStep(f, "GAME'S DLSS-G", StepState::waiting, "not found yet. Turn on DLSS upscaling (any mode) or the game's own frame generation; HSF looks again every 10 seconds");
@@ -6013,7 +6017,7 @@ void ReadFinderD3d12(Finder& f) {
     char game_note[220];
     if (g_sl_ngx) {
       char ngx_note[120];
-      NgxNote(ngx_note, sizeof(ngx_note), "ReShade.log");
+      NgxNote(ngx_note, sizeof(ngx_note), "HSF.log");
       std::snprintf(game_note, sizeof(game_note), "no vectors from the game's Streamline now (menus send none); NGX %s", ngx_note);
     } else {
       std::snprintf(game_note, sizeof(game_note), "no vectors from the game now (menus send none)");
@@ -6029,7 +6033,7 @@ void ReadFinderD3d12(Finder& f) {
     }
     if (!g_sl_game_data) {
       if (s_failed_at != 0 && now - s_failed_at < 3000)
-        AddStep(f, "TAGS ACCEPTED", StepState::failed, "Streamline refuses HSF's tags (%llu so far, HSF_sl_probe.log has the code)", static_cast<unsigned long long>(s.tag_failures));
+        AddStep(f, "TAGS ACCEPTED", StepState::failed, "Streamline refuses HSF's tags (%llu so far, HSF.log has the code)", static_cast<unsigned long long>(s.tag_failures));
       else if (s.tagged > 0) AddStep(f, "TAGS ACCEPTED", StepState::ok, "yes");
       else AddStep(f, "TAGS ACCEPTED", StepState::waiting, "nothing tagged by HSF yet");
     }
@@ -6675,6 +6679,14 @@ const char* FinderReason() {
 void OnMenuFrame(effect_runtime*) {
   ++g_finder_frame;
   FinderTick();
+  {
+    // The old-Streamline check, also with the menu closed: its one log line is what tells a report that the game's Streamline caps DLSS-G at 2x.
+    static ULONGLONG s_old_sl_at = 0;
+    if (GetTickCount64() - s_old_sl_at >= 1000) {
+      s_old_sl_at = GetTickCount64();
+      OldStreamlineNow(ReadMenuView().max_frames, OlderCardModNow());
+    }
+  }
   static LONGLONG last = 0, window_start = 0;
   static uint32_t window_frames = 0;
   const LONGLONG now = Now();
@@ -6783,6 +6795,69 @@ const char* GpuName() {
   for (; start[i] != '\0' && i + 1 < sizeof(name); ++i) name[i] = static_cast<char>(std::toupper(static_cast<unsigned char>(start[i])));
   name[i] = '\0';
   return name;
+}
+
+// The display driver's version as Windows numbers it (32.0.15.9186), with NVIDIA's own number from its last five digits (591.86).
+const char* GpuDriver() {
+  static char text[64] = "";
+  static bool done = false;
+  if (done) return text;
+  done = true;
+  IDXGIFactory1* factory = nullptr;
+  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return text;
+  IDXGIAdapter1* adapter = nullptr;
+  for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+    DXGI_ADAPTER_DESC1 desc{};
+    adapter->GetDesc1(&desc);
+    LARGE_INTEGER umd{};
+    const bool have = !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd));
+    adapter->Release();
+    if (!have) continue;
+    const unsigned a = HIWORD(umd.HighPart), b = LOWORD(umd.HighPart), c = HIWORD(umd.LowPart), d = LOWORD(umd.LowPart);
+    if (desc.VendorId == 0x10DE) {
+      const unsigned nvidia = (c % 10) * 10000 + d;
+      std::snprintf(text, sizeof(text), "%u.%02u (%u.%u.%u.%u)", nvidia / 100, nvidia % 100, a, b, c, d);
+      break;
+    }
+    if (text[0] == '\0') std::snprintf(text, sizeof(text), "%u.%u.%u.%u", a, b, c, d);
+  }
+  factory->Release();
+  return text;
+}
+
+// The summary near the top of HSF.log, once per game run at the first frame: what a report needs first. The route, HSF.ini and each mod
+// found get lines of their own.
+void OnSummaryFrame(effect_runtime* runtime) {
+  static bool done = false;
+  if (done || g_in_helper) return;
+  done = true;
+  uint32_t width = 0, height = 0;
+  runtime->get_screenshot_width_and_height(&width, &height);
+  wchar_t exe[MAX_PATH] = L"?";
+  GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  const wchar_t* const slash = wcsrchr(exe, L'\\');
+  using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+  OSVERSIONINFOW os{sizeof(os)};
+  if (const auto get = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"))) get(&os);
+  hsf::hsflog::Writef(hsf::hsflog::HSF, "SUMMARY: game %ls, %s, %ux%u // GPU %s, driver %s // Windows %lu.%lu.%lu", slash != nullptr ? slash + 1 : exe,
+                      ApiName(runtime->get_device()->get_api()), width, height, GpuName(), GpuDriver(), os.dwMajorVersion, os.dwMinorVersion,
+                      os.dwBuildNumber);
+  const StackScan& scan = StackNow();
+  std::string mods;
+  const auto add = [&mods](const wchar_t* name, const char* label, const StackModule& m) {
+    char text[200], version[48];
+    StackVersionText(m, version, sizeof(version));
+    if (label != nullptr) std::snprintf(text, sizeof(text), "%s%s%s", label, version[0] != '\0' ? " " : "", version);
+    else std::snprintf(text, sizeof(text), "%ls%s%s", name, version[0] != '\0' ? " " : "", version);
+    if (!mods.empty()) mods += ", ";
+    mods += text;
+  };
+  for (int i = 0; i < scan.uplift_count; ++i) add(scan.uplift[i].name, nullptr, scan.uplift[i]);
+  for (int i = 0; i < scan.renodx_count; ++i) add(scan.renodx[i].name, nullptr, scan.renodx[i]);
+  for (int i = 0; i < scan.other_count; ++i) add(scan.others[i].name, nullptr, scan.others[i]);
+  for (int i = 0; i < scan.mod_count; ++i) add(nullptr, scan.mods[i].label, scan.mods[i].module);
+  if (GetModuleHandleW(L"RTSSHooks64.dll") != nullptr || GetModuleHandleW(L"RTSSHooks.dll") != nullptr) mods += mods.empty() ? "RTSS" : ", RTSS";
+  hsf::hsflog::Writef(hsf::hsflog::HSF, "SUMMARY: mods and add-ons next to HSF: %s", mods.empty() ? "none found" : mods.c_str());
 }
 
 // A virtual-key code as its key name: F1-F24, else the name Windows gives the key on this keyboard layout, else its number.
@@ -6938,46 +7013,19 @@ std::string LogTail(const std::wstring& path, size_t bytes) {
   return text;
 }
 
-// HSF's lines from ReShade.log and the end of this route's own log, on the clipboard, for a tester to paste.
+// HSF.log on the clipboard, for a tester to paste: one line on what runs now, then the log (its last 2 MB when it is longer).
 void CopyLog(const MenuView& view) {
-  std::wstring folder = g_ini_path;
-  folder.resize(folder.find_last_of(L'\\'));
-  std::string out = "HSF log: ";
+  std::string out = "HSF " HSF_VERSION " // ";
   out += view.api;
   out += " // ";
   out += view.route;
   out += " // ";
   out += GpuName();
-  out += "\r\n\r\n--- ReShade.log (HSF lines) ---\r\n";
-  const std::string reshade_log = LogTail(folder + L"\\ReShade.log", 512 * 1024);
-  size_t from = 0;
-  std::string hsf_lines;
-  while (from < reshade_log.size()) {
-    size_t end = reshade_log.find('\n', from);
-    if (end == std::string::npos) end = reshade_log.size();
-    const std::string line = reshade_log.substr(from, end - from);
-    if (line.find("HSF") != std::string::npos) hsf_lines += line + "\n";
-    from = end + 1;
-  }
-  if (hsf_lines.size() > 48 * 1024) hsf_lines.erase(0, hsf_lines.size() - 48 * 1024);
-  out += hsf_lines.empty() ? "(none found next to HSF)\r\n" : hsf_lines;
-  std::vector<std::wstring> logs;
-  if (view.bring) logs.push_back(folder + L"\\HSF_sl_bring.log");
-  else if (view.drive) logs.push_back(folder + L"\\HSF_sl_probe.log");
-  else {
-    logs.push_back(std::wstring(g_sl_folder) + L"\\hsf_dlssg.log");
-    logs.push_back(std::wstring(g_sl_folder) + L"\\hsf_dlssg_game.log");
-  }
-  for (const std::wstring& path : logs) {
-    const std::string tail = LogTail(path, 48 * 1024);
-    if (tail.empty()) continue;
-    char name[MAX_PATH];
-    WideCharToMultiByte(CP_UTF8, 0, path.c_str() + path.find_last_of(L'\\') + 1, -1, name, sizeof(name), nullptr, nullptr);
-    out += "\r\n--- ";
-    out += name;
-    out += " (end) ---\r\n";
-    out += tail;
-  }
+  out += " // driver ";
+  out += GpuDriver();
+  out += "\r\n\r\n";
+  const std::string log = hsf::hsflog::Path()[0] != L'\0' ? LogTail(hsf::hsflog::Path(), 2 * 1024 * 1024) : std::string();
+  out += log.empty() ? "(HSF.log is missing or empty)\r\n" : log;
   ImGui::SetClipboardText(out.c_str());
   Log("menu: log copied to the clipboard");
 }
@@ -8486,6 +8534,7 @@ void RegisterEvents() {
   reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
   reshade::register_event<reshade::addon_event::reshade_present>(OnVkPresent);
   RegisterVkFinishPresent();
+  reshade::register_event<reshade::addon_event::reshade_present>(OnSummaryFrame);
   reshade::register_event<reshade::addon_event::reshade_present>(OnMenuFrame);
   reshade::register_event<reshade::addon_event::reshade_present>(OnReserveFrame);
   reshade::register_event<reshade::addon_event::reshade_present>(OnWindowFrame);
@@ -8514,13 +8563,14 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
     std::snprintf(text, sizeof(text), "HSF: ReShade was loaded again (%s address) but did not take HSF back; HSF stays off until the emulator is restarted",
                   moved ? "another" : "the same");
     OutputDebugStringA(text);
+    hsf::hsflog::Write(hsf::hsflog::HSF, text);
     if (reshade::internal::get_reshade_module_handle() == reshade_module) reshade::log_message(reshade::log_level::error, text);
     return false;
   }
   ResetRunState();
   RegisterEvents();
-  reshade::log_message(reshade::log_level::info, moved ? "HSF: ReShade was loaded again at another address (an emulator booting another game); HSF registered again"
-                                                       : "HSF: ReShade was loaded again (an emulator booting another game); HSF registered again");
+  Log(moved ? "ReShade was loaded again at another address (an emulator booting another game); HSF registered again"
+            : "ReShade was loaded again (an emulator booting another game); HSF registered again");
   return true;
 }
 
@@ -8544,6 +8594,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         break;
       }
       FindIni(module);
+      // HSF.log next to HSF.ini: fresh for this game run, the last one kept as HSF.previous.log (hsf_log.h).
+      if (g_ini_path[0] != L'\0') {
+        std::wstring log_path = g_ini_path;
+        log_path.resize(log_path.find_last_of(L'\\') + 1);
+        hsf::hsflog::Open((log_path + L"HSF.log").c_str());
+      }
       {
         // New ways of hooking are tried with the old kept as the backup (safe_try.h); HSF keeps its marks in HSF_safe_try.ini next to HSF.ini.
         std::wstring safe_try = g_ini_path;
@@ -8556,7 +8612,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
       }
       // Vulkan games: same-frame hand-off needs shared semaphores on the game's device, added at its vkCreateDevice (vk_hook.h).
       if (GetPrivateProfileIntW(L"HSF", L"VkDeviceHook", 1, g_ini_path) != 0)
-        if (const char* const hooked = hsf::vk::HookCreateDevice()) reshade::log_message(reshade::log_level::info, (std::string("HSF: ") + hooked).c_str());
+        if (const char* const hooked = hsf::vk::HookCreateDevice()) Log(hooked);
 #ifdef HSF_SL_GAME
       // A native D3D12 game with its own Streamline. StreamlineProbe=1 logs what it sends and changes nothing; InGameDlssg=1 also runs DLSS-G inside the game.
       g_sl_drive = RouteOn(ReadRoute(L"InGameDlssg"));
@@ -8567,7 +8623,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         wchar_t folder[MAX_PATH];
         wcscpy_s(folder, g_ini_path);
         if (wchar_t* const slash = wcsrchr(folder, L'\\')) *slash = L'\0';
-        const std::wstring bring_log = std::wstring(folder) + L"\\HSF_sl_bring.log";
+        const std::wstring bring_log = std::wstring(folder) + L"\\HSF.log";  // open already: the bring-in lines join HSF's
         // HSF's own Streamline if it is there, so that a game with an old copy, or none, gets the version HSF was tested with.
         const std::wstring own = std::wstring(folder) + L"\\HSF_streamline";
         const bool have_own = GetFileAttributesW((own + L"\\sl.interposer.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
@@ -8588,14 +8644,14 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
       if (g_sl_game) {
         wchar_t log_path[MAX_PATH];
         wcscpy_s(log_path, g_ini_path);
-        if (wchar_t* const slash = wcsrchr(log_path, L'\\')) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - log_path), L"HSF_sl_probe.log");
+        if (wchar_t* const slash = wcsrchr(log_path, L'\\')) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - log_path), L"HSF.log");  // open already
         g_sl_dynamic_saved = GetPrivateProfileIntW(L"HSF", L"DlssgDynamicRes", 0, g_ini_path) != 0;
         hsf::slgame::Start(log_path, g_sl_drive, g_sl_dynamic_saved);
         // The game's DLSS read through NGX, for a game that runs DLSS upscaling through NGX and has Streamline only for frame generation. The bring route starts its own.
         if (g_sl_drive && !g_sl_bring) {
           g_ngx_input = GetPrivateProfileIntW(L"HSF", L"NgxInput", 1, g_ini_path) != 0;
           g_sl_ngx = g_ngx_input && hsf::safetry::Allowed("T2_ngx_game_streamline");
-          // Its lines go to ReShade's log. The hook patcher hands them over with no lock held (hook_patch.h), so the HSF_sl_probe log would be safe too.
+          // Its lines go through Log. The hook patcher hands them over with no lock held (hook_patch.h).
           if (g_sl_ngx) hsf::ngx::Start(&Log);
         }
       }
@@ -8628,6 +8684,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
       ClearDx9Run();  // a normal exit (a crash never gets here): the 9Ex crash rule must not count it
       hsf::safetry::ClearAll();  // the same for the safe-try marks
       if (g_fault9_handler != nullptr) RemoveVectoredExceptionHandler(g_fault9_handler);
+      hsf::hsflog::Write(hsf::hsflog::HSF, reserved != nullptr ? "game is closing" : "HSF unloaded (the game goes on)");
+      hsf::hsflog::Close();
       reshade::unregister_addon(module);
       break;
   }

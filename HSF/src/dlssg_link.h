@@ -36,7 +36,7 @@ enum : int32_t { STATE_STARTING = 0, STATE_RUNNING = 1, STATE_FAILED = 2, STATE_
 // Why DLSS-G is not generating (helper -> add-on), as an index into NOTE_TEXT.
 enum : int32_t { NOTE_NONE = 0, NOTE_NO_MOTION = 1, NOTE_PAUSED = 2, NOTE_NO_SWAP = 3, NOTE_GPU_HANG = 4 };
 inline const char* const NOTE_TEXT[] = {"", "no motion vectors: real frames only", "DLSS-G paused (menu open or extra frames off)",
-                                        "the DLSS-G swap chain could not be made (see hsf_dlssg.log)",
+                                        "the DLSS-G swap chain could not be made (see HSF.log)",
                                         "Frame gen stopped: the GPU could not keep up. Pick a lower multiplier or cap the fps, then turn FRAME GEN off and on."};
 
 #pragma pack(push, 8)

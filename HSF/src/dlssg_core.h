@@ -31,8 +31,8 @@ using Microsoft::WRL::ComPtr;
 constexpr UINT RING = dlssg_link::RING;  // shared frame slots
 constexpr UINT BUFFERS = 3;              // swap chain buffers
 
-// ---- Log (Streamline's own warnings and errors go there too). Opened once; `mode` and `share` as _wfsopen. ----
-void OpenLog(const wchar_t* path, const wchar_t* mode, int share);
+// ---- Log: the game's HSF.log, tagged [HELPER] (hsf_log.h). Streamline's own warnings and errors go there too. Opened once. ----
+void OpenLog(const wchar_t* path);
 void Log(const char* format, ...);
 
 // ---- Process-wide: Streamline and the Direct3D 12 device (Streamline is initialised once and told about one device) ----

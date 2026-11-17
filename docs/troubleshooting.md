@@ -21,7 +21,7 @@ Start with the menu's status box. It names the route and gives the reason under 
 | Uneven frames | No FPS cap, or the game's base rate swings | Set an FPS CAP a few frames below your monitor's Hz. A cap at exactly the refresh rate waits on VSync. |
 | FRAME GEN turned itself off, red GPU guard line | DLSS-G's GPU waits kept timing out: the card could not keep up | Lower the multiplier, the game's settings or the FPS cap, then turn FRAME GEN on again. |
 | Fps far below the game's own with frame generation off | The helper still runs while OFF (for a quick ON) | Press CLOSE HELPER beside FRAME GEN. |
-| Red line "ReShade loaded into HSF's helper (Game Pass)" | A packaged game made ReShade load into `hsf-dlssg-helper64.exe`, so effects and add-ons run twice | Update HSF: the helper now loads Windows' graphics DLLs by their full path. If the line stays, send `HSF_streamline\hsf_dlssg.log`. |
+| Red line "ReShade loaded into HSF's helper (Game Pass)" | A packaged game made ReShade load into `hsf-dlssg-helper64.exe`, so effects and add-ons run twice | Update HSF: the helper now loads Windows' graphics DLLs by their full path. If the line stays, send `HSF.log`. |
 | Yellow box "NVOF IS A BACKUP ONLY" | No flow effect loaded for 10 s, so NVIDIA Optical Flow took over | Install LaunchPad or Lumenite, or press USE SHADER once one is loaded. |
 | Luma game: MOTION stays on FLOW | The game runs in DX12, or DLSS is off in Luma's settings | Start the game in DX11 and turn on DLSS in Luma. The menu offers SWITCH TO LUMA (DLSS). |
 | Emulator or game: "No depth found" | Depth of another shape than the picture (a 16:9 picture on a wider screen), which ReShade turns away | DEBUG > ALL DETAILS: press "Accept depth of another shape", then restart. HSF then saves the depth's exact size; restart once more when it says so. |
@@ -39,17 +39,18 @@ Start with the menu's status box. It names the route and gives the reason under 
 | D3D12 game crashes when RTSS is running (ReShade 6.8.0) | A ReShade 6.8.0 bug when RTSS makes a D3D11 device | Update HSF: it works around the bug. |
 | D3D12 game's own DLSS option is gone or greyed out with HSF | Streamline started DLSS before the game, without the game's `nvngx_dlss.dll` (HSF 0.9.8 and older) | Update HSF. HSF finds the game's copy once and saves it as `SlNgxPath`. If it picked the wrong one, remove that line from `HSF.ini`. |
 | HDR game looks washed out or SDR with frame generation on | An old HSF build (before HDR10 support on the helper) | Update HSF: install every file from the new zip together. |
-| Helper does not start after an update ("of another version" in `hsf_dlssg.log`) | The add-on and `hsf-dlssg-helper64.exe` come from different releases | Copy the whole zip again, `HSF_streamline` included. |
+| Helper does not start after an update ("of another version" in `HSF.log`) | The add-on and `hsf-dlssg-helper64.exe` come from different releases | Copy the whole zip again, `HSF_streamline` included. |
 
 ## 2. Logs
 
-| Log | Read it for |
+HSF writes one log, `HSF.log`, next to `HSF.ini`. It starts fresh at each game start, and the run before is kept as `HSF.previous.log`. COPY LOG TO CLIPBOARD in the menu copies it. Two `SUMMARY:` lines near the top name the game, API, GPU, driver and the mods found. Each line is tagged by the part that wrote it:
+
+| Tag | Read it for |
 |---|---|
-| `ReShade.log` | HSF's route, a line every 10 s with rates, flow and depth sizes, DX9 bridge timings, depth decisions, and route choices (`route: ...`) |
-| `HSF_sl_bring.log` | the bring-in route: Streamline start, swap-chain catch, NGX input |
-| `HSF_sl_probe.log` | the in-game route: what the game sends its Streamline, and what HSF changed |
-| `HSF_streamline\hsf_dlssg.log` | the helper: Streamline set-up, DLSS-G status, mod loading (`mod loaded`, `mod NOT loaded`) |
-| `HSF_streamline\hsf_dlssg_game.log` | the game side of the helper link |
+| `[HSF]` | HSF's route, a line every 10 s with rates, flow and depth sizes, DX9 bridge timings, depth decisions, and route choices (`route: ...`). Lines starting `helper link:` are the game side of the helper. |
+| `[STREAMLINE]` | the bring-in route (Streamline start, swap-chain catch, NGX input) and the in-game route (what the game sends its Streamline, and what HSF changed) |
+| `[HELPER]` | the helper: Streamline set-up, DLSS-G status, mod loading (`mod loaded`, `mod NOT loaded`) |
+| `[VULKAN]` | HSF's Vulkan layer |
 
 For a crash without a log line, Windows crash dumps (`%LOCALAPPDATA%\CrashDumps`, or the game's own crash folder) name the faulting module. That is how the Jusant crash was traced to Streamline's logging.
 

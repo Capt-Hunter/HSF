@@ -6,10 +6,11 @@
 //                     the game frame's markers
 //   window thread:    a disabled WS_CHILD of the game's window (another process's window), following its client size
 //   main thread:      waits for the add-on's stop flag or for the game process to end
-// No ReShade here, so the Direct3D 12 device is a plain one. Log: hsf_dlssg.log next to this exe.
+// No ReShade here, so the Direct3D 12 device is a plain one. Log: the game's HSF.log, lines tagged [HELPER].
 
 #include "dlssg_core.h"
 #include "dlssg_link.h"
+#include "hsf_log.h"
 #include "version.h"
 
 #include <windows.h>
@@ -361,8 +362,10 @@ int wmain(int argc, wchar_t** argv) {
   g_folder = exe;
   g_folder.resize(g_folder.find_last_of(L'\\'));
   g_record_folder = g_folder.substr(0, g_folder.find_last_of(L'\\')) + L"\\HSF_recordings";  // beside this exe's folder, in the game's
-  // Appended, shared: a stopping helper and the next one can overlap (the add-on starts the file fresh once per game run).
-  core::OpenLog((g_folder + L"\\hsf_dlssg.log").c_str(), L"a", _SH_DENYNO);
+  // The game's HSF.log, named by the add-on in the environment this process inherited (hsf_log.h). The game has it open, so the helper
+  // appends; a stopping helper and the next one can overlap. Without the name (an older add-on): HSF.log next to HSF_streamline.
+  const wchar_t* const game_log = hsf::hsflog::PathFromEnvironment(false);
+  core::OpenLog(game_log != nullptr ? game_log : (g_folder.substr(0, g_folder.find_last_of(L'\\')) + L"\\HSF.log").c_str());
   Log("HSF DLSS-G helper " HSF_VERSION " (64-bit), pid %lu", GetCurrentProcessId());
   const bool system_dxgi = LoadSystemGraphicsDlls();
   if (argc < 2) {

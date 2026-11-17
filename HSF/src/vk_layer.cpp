@@ -6,6 +6,7 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 
+#include "hsf_log.h"
 #include "vk_extend.h"
 
 #include <windows.h>
@@ -39,26 +40,24 @@ std::unordered_map<void*, DeviceData> g_devices;
 std::unordered_map<VkDevice, int> g_device_flags;  // by handle, for the add-on
 
 void Log(const std::string& text) {
-  // Same folder as the layer: hsf_vk_layer.log, rewritten by each process that loads the layer.
+  // HSF.log, tagged [VULKAN]: the one the add-on opened in this process, else the one next to the layer (the layer can load first, and
+  // the add-on then appends to it).
   static std::once_flag once;
-  static wchar_t path[MAX_PATH] = L"";
   std::call_once(once, [] {
+    if (const wchar_t* const opened = hsf::hsflog::PathFromEnvironment(true)) {
+      hsf::hsflog::Open(opened);
+      return;
+    }
+    wchar_t path[MAX_PATH] = L"";
     HMODULE self = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&Log), &self);
     if (GetModuleFileNameW(self, path, MAX_PATH) == 0) return;
     wchar_t* slash = wcsrchr(path, L'\\');
     if (slash == nullptr) return;
-    wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"hsf_vk_layer.log");
-    HANDLE f = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"HSF.log");
+    hsf::hsflog::Open(path);
   });
-  if (path[0] == L'\0') return;
-  HANDLE f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (f == INVALID_HANDLE_VALUE) return;
-  const std::string line = text + "\r\n";
-  DWORD written = 0;
-  WriteFile(f, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
-  CloseHandle(f);
+  hsf::hsflog::Write(hsf::hsflog::VULKAN, text.c_str());
 }
 
 template <typename Info, VkStructureType Type>

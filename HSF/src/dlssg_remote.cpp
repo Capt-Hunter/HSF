@@ -2,14 +2,15 @@
 // has no 32-bit build; 64-bit games use it because RTSS's overlay ends the game when DLSS-G runs in the same process as ReShade.
 // See dlssg_link.h. The game's Direct3D 11 device makes the frame and motion vector slots and both fences (shared, NT handles); their handles
 // are duplicated into the helper, which opens them on its Direct3D 12 device. Per game frame (game thread): CPU slot check on `consumed`
-// (never a GPU wait) -> copy back buffer and motion vectors -> signal `ready`. Logs: HSF_streamline\hsf_dlssg_game.log (this side) and
-// HSF_streamline\hsf_dlssg.log (the helper).
+// (never a GPU wait) -> copy back buffer and motion vectors -> signal `ready`. Both sides log to the game's
+// HSF.log: this side as [HSF] "helper link:", the helper as [HELPER].
 // Reflex on the game's frame: after the game's Present (FrameStart) the game thread asks the helper to sleep on Reflex and waits for its
 // answer; Submit sends the render submit markers and writes the frame's Streamline index into its slot (dlssg_link.h messages).
 
 #include "dlssg.h"
 #include "dlssg_link.h"
 #include "dlssg_slots.h"
+#include "hsf_log.h"
 
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
@@ -32,19 +33,16 @@ namespace {
 
 constexpr UINT RING = link::RING;
 
-FILE* g_log = nullptr;
+bool g_log_started = false;
 
+// The game side of the helper link, in HSF.log (the add-on's part, so tagged [HSF]).
 void Log(const char* format, ...) {
   char text[1024];
   va_list args;
   va_start(args, format);
   vsnprintf(text, sizeof(text), format, args);
   va_end(args);
-  if (g_log == nullptr) return;
-  SYSTEMTIME now;
-  GetLocalTime(&now);
-  std::fprintf(g_log, "%02u:%02u:%02u.%03u %s\n", now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, text);
-  std::fflush(g_log);
+  hsflog::Writef(hsflog::HSF, "helper link: %s", text);
 }
 
 struct Remote {
@@ -139,7 +137,7 @@ void CheckHelper() {
   if (g_r->b->state == link::STATE_FAILED)
     std::snprintf(g_failed, sizeof(g_failed), "DLSS-G helper: %s", g_r->b->error);
   else
-    std::snprintf(g_failed, sizeof(g_failed), "the 64-bit DLSS-G helper exited (code 0x%08lx, see HSF_streamline\\hsf_dlssg.log)",
+    std::snprintf(g_failed, sizeof(g_failed), "the 64-bit DLSS-G helper exited (code 0x%08lx, see HSF.log)",
                   static_cast<unsigned long>(code));
   Log("%s", g_failed);
   Finish();
@@ -321,12 +319,9 @@ bool Create(Remote& r, ID3D11Device* game_device, HWND window, UINT width, UINT 
 bool Start(ID3D11Device* game_device, HWND window, UINT width, UINT height, DXGI_FORMAT format, const wchar_t* sl_folder, char* error,
            size_t error_size) {
   error[0] = '\0';
-  if (g_log == nullptr) {
-    const std::wstring path = std::wstring(sl_folder) + L"\\hsf_dlssg_game.log";
-    g_log = _wfsopen(path.c_str(), L"w", _SH_DENYWR);
-    // The helpers append to one log (one helper may still be finishing while the next starts): start it fresh once per game run.
-    DeleteFileW((std::wstring(sl_folder) + L"\\hsf_dlssg.log").c_str());
-    Log("HSF DLSS-G, game side: DLSS-G runs in %ls", link::HELPER_EXE);
+  if (!g_log_started) {
+    g_log_started = true;
+    Log("DLSS-G runs in %ls in %ls", link::HELPER_EXE, sl_folder);
   }
   Stop();
   if (g_failed[0] != '\0') {

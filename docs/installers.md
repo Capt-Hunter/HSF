@@ -79,7 +79,7 @@ Delete these and nothing else:
 - `HSF.ini`
 - the `HSF_streamline` folder, with its logs and any `mods` folder in it
 - `reshade-shaders\Shaders\HSF.fx`
-- HSF's logs in the game folder: `HSF_sl_bring.log`, `HSF_sl_probe.log`
+- HSF's logs next to `HSF.ini`: `HSF.log`, `HSF.previous.log`
 
 HSF changes nothing else in the game folder. It may have changed LaunchPad's settings in ReShade's preset (AUTO), and the LAUNCHPAD row's UNDO puts them back.
 

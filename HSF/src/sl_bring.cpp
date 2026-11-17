@@ -1,5 +1,6 @@
 // See sl_bring.h. Streamline is loaded by hand and its calls looked up by name, so the add-on keeps loading in games and folders that have none.
 #include "sl_bring.h"
+#include "hsf_log.h"
 #include "version.h"
 
 #include <windows.h>
@@ -54,10 +55,7 @@ using CreateForHwndFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, H
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
 using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
 
-std::wstring g_log_path;
 std::wstring g_folder;
-SRWLOCK g_log_lock = SRWLOCK_INIT;
-FILE* g_log = nullptr;
 
 HMODULE g_interposer = nullptr;
 CreateFactory2Fn g_sl_create_factory = nullptr;
@@ -131,13 +129,8 @@ void Line(const char* format, ...) {
   va_start(args, format);
   vsnprintf(text, sizeof(text), format, args);
   va_end(args);
-  AcquireSRWLockExclusive(&g_log_lock);
-  if (g_log == nullptr && !g_log_path.empty()) g_log = _wfsopen(g_log_path.c_str(), L"a", _SH_DENYNO);  // readable while the game runs, or is hung
-  if (g_log != nullptr) {
-    fprintf(g_log, "%10.2f [%5lu] %s\n", static_cast<double>(GetTickCount64()) / 1000.0, GetCurrentThreadId(), text);
-    fflush(g_log);
-  }
-  ReleaseSRWLockExclusive(&g_log_lock);
+  // HSF.log, written at once (readable while the game runs, or is hung). The thread id tells the game's threads apart.
+  hsflog::Writef(hsflog::STREAMLINE, "[%5lu] %s", GetCurrentThreadId(), text);
 }
 
 void SlLogLine(sl::LogType type, const char* message) {
@@ -1313,7 +1306,7 @@ void SetConstants(const FrameFeed& in, bool dilated, bool reset, UINT width, UIN
 }  // namespace
 
 void Start(const wchar_t* log_path, const wchar_t* folder, const StartOptions& options) {
-  g_log_path = log_path;
+  hsflog::Open(log_path);  // the add-on has HSF.log open already; a test opens its own
   g_folder = folder;
   g_start_options = options;
   Line("HSF %s", HSF_VERSION);
@@ -1624,12 +1617,6 @@ void Stop(bool process_exiting) {
   }
   g_sl_dlssg_state = nullptr;
   Line("=== stopped catching swap chains ===");
-  AcquireSRWLockExclusive(&g_log_lock);
-  if (g_log != nullptr) {
-    fclose(g_log);
-    g_log = nullptr;
-  }
-  ReleaseSRWLockExclusive(&g_log_lock);
 }
 
 Stats GetStats() {

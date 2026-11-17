@@ -1,6 +1,7 @@
 // See dlssg_core.h.
 
 #include "dlssg_core.h"
+#include "hsf_log.h"
 
 #include <sl_consts.h>
 #include <sl_pcl.h>
@@ -21,8 +22,6 @@ namespace {
 const sl::ViewportHandle VIEWPORT{0};
 constexpr float CONSTANT_DEPTH = 0.5f;  // what DLSS-G gets for a frame with no real depth
 
-std::mutex g_log_lock;
-FILE* g_log = nullptr;
 
 // Streamline's "Wait on gpu fence timed out after 500ms": the GPU has fallen half a second behind. A few of those in a row end in a driver
 // reset (device removed) that can take the whole PC with it, so the presenter turns DLSS-G off when they come close together.
@@ -549,10 +548,7 @@ void RecordFrame(Presenter& p, const FrameInputs& in, bool motion, bool reset, b
 }  // namespace
 
 // ---- Log ----
-void OpenLog(const wchar_t* path, const wchar_t* mode, int share) {
-  std::lock_guard<std::mutex> hold(g_log_lock);
-  if (g_log == nullptr) g_log = _wfsopen(path, mode, share);
-}
+void OpenLog(const wchar_t* path) { hsflog::Open(path); }
 
 void Log(const char* format, ...) {
   char text[1024];
@@ -560,13 +556,7 @@ void Log(const char* format, ...) {
   va_start(args, format);
   vsnprintf(text, sizeof(text), format, args);
   va_end(args);
-  std::lock_guard<std::mutex> hold(g_log_lock);
-  if (g_log == nullptr) return;
-  SYSTEMTIME now;
-  GetLocalTime(&now);
-  std::fprintf(g_log, "%02u:%02u:%02u.%03u %s%s", now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, text,
-               text[0] != '\0' && text[std::strlen(text) - 1] == '\n' ? "" : "\n");
-  std::fflush(g_log);
+  hsflog::Write(hsflog::HELPER, text);
 }
 
 // ---- Streamline ----

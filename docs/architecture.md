@@ -208,12 +208,17 @@ Without LaunchPad installed, it draws one point into a 1x1 texture.
 
 ## 9. Logs
 
-| Log | Written by |
-|---|---|
-| `ReShade.log` | the add-on (every 10 s: route, rates, bridge timings, depth decisions) |
-| `HSF_sl_bring.log` | the bring-in route and NGX input |
-| `HSF_sl_probe.log` | the in-game route |
-| `HSF_streamline\hsf_dlssg_game.log` | the helper link, game side |
-| `HSF_streamline\hsf_dlssg.log` | the helper, including Streamline's own warnings and errors |
+Every part of HSF writes to one file, `HSF.log`, next to `HSF.ini` (`src/hsf_log.cpp`). Each line has the time and a tag for the part that wrote it:
 
-COPY LOG TO CLIPBOARD in the menu collects HSF's lines from `ReShade.log` plus the active route's log.
+| Tag | Written by |
+|---|---|
+| `[HSF]` | the add-on (every 10 s: route, rates, bridge timings, depth decisions), and the game side of the helper link (`helper link:`) |
+| `[STREAMLINE]` | the bring-in route, the in-game route and NGX input, with the thread id |
+| `[HELPER]` | the DLSS-G helper, including Streamline's own warnings and errors |
+| `[VULKAN]` | HSF's Vulkan layer |
+
+The first part of HSF to open the file in a game process starts it fresh, and the last run moves to `HSF.previous.log`. It appends when another process still has the file open: the game, for the helper it starts, or a launcher. A process marks itself in the `HSF_LOG` environment variable (`<pid>|<path>`), so a reload of the add-on in the same process appends too. The helper inherits the mark and takes the path from it. Every line is one `WriteFile` on a handle opened for appending, so lines never mix. Each part stops at 64 MB per process.
+
+At the first frame the add-on writes two `SUMMARY:` lines: the game, API, size, GPU, driver and Windows build, then the mods and add-ons found next to HSF. The add-on's own lines also still go to `ReShade.log`.
+
+COPY LOG TO CLIPBOARD in the menu copies `HSF.log` (its last 2 MB), under one line with the version, API, route, GPU and driver.
