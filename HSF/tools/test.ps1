@@ -54,7 +54,8 @@ foreach ($arch in $arches) {
       'sl_bring_test' { "`"$streamline`" `"$logs\${arch}_sl_bring.log`"" }
       default { '' }
     }
-    if ($exe.BaseName -match '^sl_' -and -not (Test-Path "$streamline\sl.interposer.dll")) { Report $name $false "no Streamline in $streamline"; continue }
+    if ($exe.BaseName -eq 'sl_copies_test') { $testArgs = "`"$logs\${arch}_sl_copies.log`"" }
+    if ($exe.BaseName -match '^sl_' -and $exe.BaseName -ne 'sl_copies_test' -and -not (Test-Path "$streamline\sl.interposer.dll")) { Report $name $false "no Streamline in $streamline"; continue }
     $result = RunTest $exe $testArgs $log
     # sl_bring_test's window must have focus, or DLSS-G generates nothing, which says nothing about HSF: one more try, then say so.
     $noFocus = { $exe.BaseName -eq 'sl_bring_test' -and $result.code -ne 0 -and

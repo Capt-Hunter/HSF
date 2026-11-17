@@ -1,5 +1,5 @@
 // The game's own DLSS data, for frame generation. A game that calls DLSS through NGX, with no Streamline, hands the driver's _nvngx.dll its motion vectors, depth, jitter and
-// reset every frame. HSF hooks that call, always calls through so the game's real DLSS still runs, and copies the vectors and depth on the game's command list just after it. Direct3D 12 only.
+// reset every frame. HSF hooks that call, always calls through so the game's real DLSS still runs, and copies the vectors and depth on the game's command list just before it goes on. Direct3D 12 only.
 #pragma once
 
 #include <d3d12.h>
@@ -29,6 +29,7 @@ struct Frame {
   bool full_res = false;  // the vectors are at the size of the output, already dilated
   bool depth_inverted = false;
   bool reset = false;
+  int flags = -1;         // DLSS's create flags, -1 not known
   uint64_t serial = 0;    // goes up with each call taken
 };
 // False until a call has been taken. The textures stay alive for at least 16 more calls.
@@ -54,7 +55,7 @@ struct Parameter {
   virtual int Get(const char* name, void** value) const = 0;
   virtual void Reset() = 0;
 };
-// What the hook does after a DLSS call that worked. Public for the bench test.
+// What the hook does with a DLSS call (the copy before it goes on, handed over at once). Public for the bench test.
 void Capture(ID3D12GraphicsCommandList* list, const Parameter* parameters);
 // How many of the D3D12 calls got hooked; what the bench test checks against the real DLL.
 int HookedCalls();
@@ -65,7 +66,7 @@ bool Loaded();
 void Rescan();
 
 // Direct3D 11: a mod that adds DLSS to a D3D11 game (Luma) calls NGX's D3D11 functions. HSF hooks them the same way, always calls through, and
-// copies the vectors and depth on the same context just after each call.
+// copies the vectors and depth on the same context just before each call goes on.
 void Start11(LogFunction log);
 void Poll11();  // often, from the thread that runs the effects
 void Stop11(bool process_exiting);
@@ -74,7 +75,9 @@ struct Frame11 {
   ID3D11ShaderResourceView* motion = nullptr;
   ID3D11ShaderResourceView* depth = nullptr;
   uint32_t x = 0, y = 0, width = 0, height = 0;  // the part of the vectors in use
-  float scale[2] = {};  // NGX's MV.Scale: a vector times this is in pixels of the part in use
+  float to_pixels[2] = {};  // NGX's MV.Scale: a vector times this is in pixels of the part in use
+  float jitter[2] = {};     // in pixels of the render size
+  bool jittered = false;    // the vectors include the jitter
   bool reset = false;
   uint64_t serial = 0;  // goes up with each call taken
 };

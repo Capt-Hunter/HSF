@@ -11,14 +11,16 @@
 #include <vector>
 
 #include "hook_patch.h"
+#include "ngx_call.h"
 
 using Microsoft::WRL::ComPtr;
 
 namespace hsf::ngx {
 namespace {
 
-constexpr int NGX_SUCCESS = 1;
-constexpr int FLAG_MV_LOW_RES = 1 << 1, FLAG_MV_JITTERED = 1 << 2, FLAG_DEPTH_INVERTED = 1 << 3;
+using call::NGX_SUCCESS;
+using call::ReadFloat;
+using call::ReadUint;
 constexpr D3D12_RESOURCE_STATES READABLE = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 // NGX's rule for what it reads, which is the state the game's textures are in around the call.
 constexpr D3D12_RESOURCE_STATES GAME_STATE = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -56,11 +58,8 @@ struct OldCopies {
   uint64_t serial;
 };
 std::vector<OldCopies> g_old;  // still used by frames on the GPU when replaced
-// From the last CreateFeature for DLSS, which is the only sure place for these. -1: not seen.
-int g_create_flags = -1;
-uint32_t g_create_width = 0, g_create_height = 0, g_create_out_width = 0, g_create_out_height = 0;
-// A game can call DLSS for something small too, such as a mirror: the largest recent call is the main one.
-uint64_t g_largest_area = 0, g_largest_serial = 0;
+call::Created g_created;  // from the last CreateFeature for DLSS
+call::MainCall g_main;
 uint32_t g_refused_format = 0;
 
 struct Lock {
@@ -146,40 +145,34 @@ void CopyOn(ID3D12GraphicsCommandList* list, ID3D12Resource* source, ID3D12Resou
   Barrier(list, source, D3D12_RESOURCE_STATE_COPY_SOURCE, GAME_STATE);
 }
 
-float ReadFloat(const Parameter* parameters, const char* name, float otherwise) {
-  float value = 0.f;
-  return parameters->Get(name, &value) == NGX_SUCCESS ? value : otherwise;
-}
-uint32_t ReadUint(const Parameter* parameters, const char* name) {
-  unsigned int value = 0;
-  return parameters->Get(name, &value) == NGX_SUCCESS ? value : 0;
-}
-
 int __cdecl HookCreate(ID3D12GraphicsCommandList* list, int feature, const Parameter* parameters, void** handle) {
   const int result = g_real_create(list, feature, parameters, handle);
-  constexpr int FEATURE_SUPER_SAMPLING = 1, FEATURE_RAY_RECONSTRUCTION = 13;
-  if (result == NGX_SUCCESS && parameters != nullptr && (feature == FEATURE_SUPER_SAMPLING || feature == FEATURE_RAY_RECONSTRUCTION)) {
-    int flags = 0;
-    const bool have_flags = parameters->Get("DLSS.Feature.Create.Flags", &flags) == NGX_SUCCESS;
+  if (result == NGX_SUCCESS) {
     Lock lock;
-    if (have_flags) g_create_flags = flags;
-    g_create_width = ReadUint(parameters, "Width");
-    g_create_height = ReadUint(parameters, "Height");
-    g_create_out_width = ReadUint(parameters, "OutWidth");
-    g_create_out_height = ReadUint(parameters, "OutHeight");
-    Line("NGX: DLSS made, feature %d, flags 0x%x, render %ux%u, output %ux%u", feature, have_flags ? flags : -1, g_create_width, g_create_height, g_create_out_width, g_create_out_height);
+    if (call::ReadCreate(parameters, feature, g_created))
+      Line("NGX: DLSS made, feature %d, flags 0x%x, render %ux%u, output %ux%u", feature, g_created.flags, g_created.width, g_created.height, g_created.out_width, g_created.out_height);
   }
   return result;
 }
 
+bool Record(ID3D12GraphicsCommandList* list, const Parameter* parameters, Frame& out);
+void Publish(const Frame& f);
+
+// The copies are recorded BEFORE the call goes on. Another mod's DLSS can sit under this hook (RenoDX's DLSS runs its own work inside the
+// call), and after it the game's vectors and depth are no longer sure to be in NGX's state, or to hold what the game gave. Before the call they
+// are, as NGX's rule says. The copy is handed over only if the call worked.
 int __cdecl HookEvaluate(ID3D12GraphicsCommandList* list, const void* handle, const Parameter* parameters, void* callback) {
+  Frame f;
+  const bool taken = Record(list, parameters, f);
   const int result = g_real_evaluate(list, handle, parameters, callback);
-  if (result == NGX_SUCCESS) Capture(list, parameters);
+  if (taken && result == NGX_SUCCESS) Publish(f);
   return result;
 }
 int __cdecl HookEvaluateC(ID3D12GraphicsCommandList* list, const void* handle, const Parameter* parameters, void* callback) {
+  Frame f;
+  const bool taken = Record(list, parameters, f);
   const int result = g_real_evaluate_c(list, handle, parameters, callback);
-  if (result == NGX_SUCCESS) Capture(list, parameters);
+  if (taken && result == NGX_SUCCESS) Publish(f);
   return result;
 }
 
@@ -188,60 +181,34 @@ int g_found = 0;  // of the three calls, how many this driver's _nvngx.dll has
 bool g_tried = false;
 hookpatch::HookSet g_hooks;  // NGX's D3D12 calls: removed by Stop only
 
-}  // namespace
-
-void Capture(ID3D12GraphicsCommandList* list, const Parameter* parameters) {
-  if (list == nullptr || parameters == nullptr) return;
+// The vectors and depth of one call copied on its list, and what HSF reads of the call in `out`. False when the call is not taken (not the
+// upscaler, not the main call, or a format HSF cannot copy): nothing is recorded then.
+bool Record(ID3D12GraphicsCommandList* list, const Parameter* parameters, Frame& out) {
+  if (list == nullptr || parameters == nullptr) return false;
   ID3D12Resource* motion = nullptr;
   ID3D12Resource* depth = nullptr;
   // Only the upscalers have these under these names, so DLSS's own frame generation or anything else on this call never gets here.
-  if (parameters->Get("MotionVectors", &motion) != NGX_SUCCESS || parameters->Get("Depth", &depth) != NGX_SUCCESS || motion == nullptr || depth == nullptr) return;
+  if (parameters->Get("MotionVectors", &motion) != NGX_SUCCESS || parameters->Get("Depth", &depth) != NGX_SUCCESS || motion == nullptr || depth == nullptr) return false;
   const D3D12_RESOURCE_DESC motion_desc = motion->GetDesc();
   const D3D12_RESOURCE_DESC depth_desc = depth->GetDesc();
-  if (motion_desc.SampleDesc.Count > 1 || depth_desc.SampleDesc.Count > 1) return;
+  if (motion_desc.SampleDesc.Count > 1 || depth_desc.SampleDesc.Count > 1) return false;
 
   Lock lock;
   if (!DepthCopies(depth_desc.Format)) {
     if (g_refused_format != static_cast<uint32_t>(depth_desc.Format)) Line("NGX: depth format %u cannot be copied, so this game stays on flow", static_cast<unsigned>(depth_desc.Format));
     g_refused_format = static_cast<uint32_t>(depth_desc.Format);
-    return;
+    return false;
   }
 
-  int flags = g_create_flags;
-  if (flags < 0 && parameters->Get("DLSS.Feature.Create.Flags", &flags) != NGX_SUCCESS) flags = -1;
-  const bool flags_known = flags >= 0;
-  const bool low_res = !flags_known || (flags & FLAG_MV_LOW_RES) != 0;
-  // The part in use: the render size for low-resolution vectors, otherwise the output.
-  uint32_t width = ReadUint(parameters, "DLSS.Render.Subrect.Dimensions.Width");
-  uint32_t height = ReadUint(parameters, "DLSS.Render.Subrect.Dimensions.Height");
-  if (width == 0 || height == 0) {
-    width = g_create_width;
-    height = g_create_height;
-  }
-  if (!low_res && g_create_out_width != 0 && g_create_out_height != 0) {
-    width = g_create_out_width;
-    height = g_create_out_height;
-  }
-  if (width == 0 || height == 0 || width > motion_desc.Width || height > motion_desc.Height) {
-    width = static_cast<uint32_t>(motion_desc.Width);
-    height = motion_desc.Height;
-  }
-
-  // The main call: not less than half the largest of the last 240 calls.
-  const uint64_t area = static_cast<uint64_t>(width) * height;
-  if (g_serial - g_largest_serial > 240) g_largest_area = 0;
-  if (area * 2 < g_largest_area) return;
-  if (area >= g_largest_area) {
-    g_largest_area = area;
-    g_largest_serial = g_serial;
-  }
+  const call::DlssCall c = call::Read(parameters, g_created, static_cast<uint32_t>(motion_desc.Width), motion_desc.Height);
+  if (!g_main.Take(c.Area(), g_serial)) return false;
 
   if (g_copies.motion == nullptr || g_copies.width != motion_desc.Width || g_copies.height != motion_desc.Height || g_copies.motion_format != motion_desc.Format ||
       g_copies.depth->GetDesc().Width != depth_desc.Width || g_copies.depth->GetDesc().Height != depth_desc.Height) {
     ComPtr<ID3D12Device> device;
-    if (FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return;
+    if (FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return false;
     Copies made;
-    if (!MakeCopies(device.Get(), motion_desc, depth_desc, made)) return;
+    if (!MakeCopies(device.Get(), motion_desc, depth_desc, made)) return false;
     if (g_copies.motion != nullptr) g_old.push_back({std::move(g_copies), g_serial});
     g_copies = std::move(made);
   }
@@ -253,27 +220,43 @@ void Capture(ID3D12GraphicsCommandList* list, const Parameter* parameters) {
   Frame f;
   f.motion = g_copies.motion.Get();
   f.depth = g_copies.depth.Get();
-  f.x = ReadUint(parameters, "DLSS.Input.MV.Subrect.Base.X");
-  f.y = ReadUint(parameters, "DLSS.Input.MV.Subrect.Base.Y");
-  if (f.x + width > motion_desc.Width || f.y + height > motion_desc.Height) f.x = f.y = 0;
-  f.width = width;
-  f.height = height;
-  // NGX: multiply by its scale for pixels of the render size. DLSS-G: multiply by its scale for the fraction of the picture.
-  f.scale[0] = ReadFloat(parameters, "MV.Scale.X", 1.f) / static_cast<float>(width);
-  f.scale[1] = ReadFloat(parameters, "MV.Scale.Y", 1.f) / static_cast<float>(height);
-  f.jitter[0] = ReadFloat(parameters, "Jitter.Offset.X", 0.f);
-  f.jitter[1] = ReadFloat(parameters, "Jitter.Offset.Y", 0.f);
-  f.jittered = flags_known && (flags & FLAG_MV_JITTERED) != 0;
-  f.full_res = !low_res;
-  f.depth_inverted = !flags_known || (flags & FLAG_DEPTH_INVERTED) != 0;
-  int reset = 0;
-  f.reset = parameters->Get("Reset", &reset) == NGX_SUCCESS && reset != 0;
+  f.x = c.x;
+  f.y = c.y;
+  f.width = c.width;
+  f.height = c.height;
+  // NGX: multiply by its scale for pixels of the part in use. DLSS-G: multiply by its scale for the fraction of the picture.
+  f.scale[0] = c.to_pixels[0] / static_cast<float>(c.width);
+  f.scale[1] = c.to_pixels[1] / static_cast<float>(c.height);
+  f.jitter[0] = c.jitter[0];
+  f.jitter[1] = c.jitter[1];
+  f.jittered = c.jittered;
+  f.full_res = !c.low_res;
+  f.depth_inverted = c.depth_inverted != 0;  // not known: reversed, as most games with DLSS have it
+  f.reset = c.reset;
+  f.flags = c.flags;
   f.serial = ++g_serial;
+  out = f;
+  return true;
+}
+
+void Publish(const Frame& f) {
+  Lock lock;
+  if (g_have_frame && f.serial < g_frame.serial) return;  // a newer call on another thread was handed over first
   g_frame = f;
   if (!g_have_frame) {
     g_have_frame = true;
-    Line("NGX: first DLSS call taken: in use %ux%u at %u,%u of %llux%u, scale %.6f %.6f, jitter %.3f %.3f, flags %s0x%x", width, height, f.x, f.y, motion_desc.Width, motion_desc.Height, f.scale[0], f.scale[1], f.jitter[0], f.jitter[1], flags_known ? "" : "not known, taken as low resolution and reversed depth ", flags_known ? flags : 0);
+    const D3D12_RESOURCE_DESC motion_desc = f.motion->GetDesc();
+    Line("NGX: first DLSS call taken: in use %ux%u at %u,%u of %llux%u, scale %.6f %.6f, jitter %.3f %.3f, flags %s0x%x, copied before the call goes on", f.width, f.height, f.x, f.y,
+         motion_desc.Width, motion_desc.Height, f.scale[0], f.scale[1], f.jitter[0], f.jitter[1], f.flags >= 0 ? "" : "not known, taken as low resolution and reversed depth ",
+         f.flags >= 0 ? f.flags : 0);
   }
+}
+
+}  // namespace
+
+void Capture(ID3D12GraphicsCommandList* list, const Parameter* parameters) {
+  Frame f;
+  if (Record(list, parameters, f)) Publish(f);
 }
 
 bool Latest(Frame* out) {
@@ -331,12 +314,8 @@ bool g_tried11 = false;
 hookpatch::HookSet g_hooks11;  // NGX's D3D11 calls: removed by Stop11 only
 LONG g_calls11 = 0;
 char g_last_shape11[400] = "";
-// From the last feature made: its flags (-1 = not known) and output size, for calls that do not repeat them.
-int g_create_flags11 = -1;
-uint32_t g_create_out_width11 = 0, g_create_out_height11 = 0;
-// The main call: the largest in use area of the last 240 calls, and the call that set it. A smaller second DLSS in the same frame is left out.
-uint64_t g_largest_area11 = 0;
-LONG g_largest_call11 = 0;
+call::Created g_created11;  // from the last CreateFeature for DLSS
+call::MainCall g_main11;     // counted in calls, taken or not
 
 struct Copies11 {
   ComPtr<ID3D11Texture2D> motion, depth;
@@ -434,70 +413,65 @@ bool MakeCopies11(ID3D11DeviceContext* context, const D3D11_TEXTURE2D_DESC& moti
 
 bool SameTexture(const D3D11_TEXTURE2D_DESC& a, const D3D11_TEXTURE2D_DESC& b) { return a.Width == b.Width && a.Height == b.Height && a.Format == b.Format; }
 
-// After a call that worked: the vectors and depth copied on the caller's context. Logs the first calls, every change of the textures handed over and every
-// 1000th call.
-void Take11(ID3D11DeviceContext* context, const Parameter* parameters, int result) {
-  const LONG call = InterlockedIncrement(&g_calls11);
-  if (parameters == nullptr || context == nullptr) return;
+// What one call gave, read before it goes on, for the log line after it.
+struct Call11 {
+  LONG call = 0;
+  char shape[300] = "";
+  call::DlssCall read;
+};
+
+// Before the call goes on (see HookEvaluate): the vectors and depth copied on the caller's context into `out`. False when the call is not taken.
+bool Copy11(ID3D11DeviceContext* context, const Parameter* parameters, Call11& c, Frame11& out) {
+  c.call = InterlockedIncrement(&g_calls11);
+  if (parameters == nullptr || context == nullptr) return false;
   D3D11_TEXTURE2D_DESC motion_desc{}, depth_desc{}, color_desc{};
   ID3D11Texture2D* const motion = Texture11(parameters, "MotionVectors", motion_desc);
   ID3D11Texture2D* const depth = Texture11(parameters, "Depth", depth_desc);
   Texture11(parameters, "Color", color_desc);
-  char shape[300];
-  snprintf(shape, sizeof(shape), "vectors %ux%u fmt %u, depth %ux%u fmt %u, color %ux%u fmt %u", motion_desc.Width, motion_desc.Height,
+  snprintf(c.shape, sizeof(c.shape), "vectors %ux%u fmt %u, depth %ux%u fmt %u, color %ux%u fmt %u", motion_desc.Width, motion_desc.Height,
            static_cast<unsigned>(motion_desc.Format), depth_desc.Width, depth_desc.Height, static_cast<unsigned>(depth_desc.Format), color_desc.Width,
            color_desc.Height, static_cast<unsigned>(color_desc.Format));
-  int flags = -1, reset = 0;
-  if (parameters->Get("DLSS.Feature.Create.Flags", &flags) != NGX_SUCCESS) flags = g_create_flags11;
-  parameters->Get("Reset", &reset);
-  uint32_t width = ReadUint(parameters, "DLSS.Render.Subrect.Dimensions.Width"), height = ReadUint(parameters, "DLSS.Render.Subrect.Dimensions.Height");
-  // Vectors at the output's size (no low resolution flag): the part in use is the output, not the render subrect. Flags not known: low resolution, as before.
-  if (flags >= 0 && (flags & FLAG_MV_LOW_RES) == 0 && g_create_out_width11 != 0 && g_create_out_height11 != 0) {
-    width = g_create_out_width11;
-    height = g_create_out_height11;
-  }
-  if (width == 0 || height == 0 || width > motion_desc.Width || height > motion_desc.Height) {
-    width = motion_desc.Width;
-    height = motion_desc.Height;
-  }
-  uint32_t x = ReadUint(parameters, "DLSS.Input.MV.Subrect.Base.X"), y = ReadUint(parameters, "DLSS.Input.MV.Subrect.Base.Y");
-  if (x + width > motion_desc.Width || y + height > motion_desc.Height) x = y = 0;
-  const float scale_x = ReadFloat(parameters, "MV.Scale.X", 1.f), scale_y = ReadFloat(parameters, "MV.Scale.Y", 1.f);
-  if (strcmp(shape, g_last_shape11) != 0 || call <= 3 || call % 1000 == 0) {
-    strncpy_s(g_last_shape11, shape, _TRUNCATE);
-    Line11("D3D11 DLSS: call %ld on thread %lu, result %d: %s; in use %ux%u at %u,%u, MV scale %.3f %.3f, jitter %.3f %.3f, flags %d, reset %d", call,
-           GetCurrentThreadId(), result, shape, width, height, x, y, scale_x, scale_y, ReadFloat(parameters, "Jitter.Offset.X", 0.f),
-           ReadFloat(parameters, "Jitter.Offset.Y", 0.f), flags, reset);
-  }
-  if (result != NGX_SUCCESS || motion == nullptr || depth == nullptr || motion_desc.SampleDesc.Count > 1 || depth_desc.SampleDesc.Count > 1) return;
   Lock lock;
-  const uint64_t area = static_cast<uint64_t>(width) * height;
-  if (call - g_largest_call11 > 240) g_largest_area11 = 0;
-  if (area * 2 < g_largest_area11) return;
-  if (area >= g_largest_area11) {
-    g_largest_area11 = area;
-    g_largest_call11 = call;
-  }
+  c.read = call::Read(parameters, g_created11, motion_desc.Width, motion_desc.Height);
+  if (motion == nullptr || depth == nullptr || motion_desc.SampleDesc.Count > 1 || depth_desc.SampleDesc.Count > 1) return false;
+  if (!g_main11.Take(c.read.Area(), static_cast<uint64_t>(c.call))) return false;
   if (g_copies11.motion == nullptr || !SameTexture(g_copies11.motion_desc, motion_desc) || !SameTexture(g_copies11.depth_desc, depth_desc)) {
     if (!MakeCopies11(context, motion_desc, depth_desc)) {
       if (g_refused_format != static_cast<uint32_t>(depth_desc.Format)) Line11("D3D11 DLSS: depth format %u is not read, so this game stays on flow", static_cast<unsigned>(depth_desc.Format));
       g_refused_format = static_cast<uint32_t>(depth_desc.Format);
-      return;
+      return false;
     }
-    Line11("D3D11 DLSS: copying vectors %ux%u and depth %ux%u after each call", motion_desc.Width, motion_desc.Height, depth_desc.Width, depth_desc.Height);
+    Line11("D3D11 DLSS: copying vectors %ux%u and depth %ux%u before each call goes on", motion_desc.Width, motion_desc.Height, depth_desc.Width, depth_desc.Height);
   }
   context->CopyResource(g_copies11.motion.Get(), motion);
   context->CopyResource(g_copies11.depth.Get(), depth);
   Frame11 f;
   f.motion = g_copies11.motion_srv.Get();
   f.depth = g_copies11.depth_srv.Get();
-  f.x = x;
-  f.y = y;
-  f.width = width;
-  f.height = height;
-  f.scale[0] = scale_x;
-  f.scale[1] = scale_y;
-  f.reset = reset != 0;
+  f.x = c.read.x;
+  f.y = c.read.y;
+  f.width = c.read.width;
+  f.height = c.read.height;
+  f.to_pixels[0] = c.read.to_pixels[0];
+  f.to_pixels[1] = c.read.to_pixels[1];
+  f.jitter[0] = c.read.jitter[0];
+  f.jitter[1] = c.read.jitter[1];
+  f.jittered = c.read.jittered;
+  f.reset = c.read.reset;
+  out = f;
+  return true;
+}
+
+// After the call: logs the first calls, every change of the textures handed over and every 1000th call, and hands the copy over if the call worked.
+void After11(const Call11& c, int result, bool taken, Frame11& f) {
+  if (c.shape[0] != 0 && (strcmp(c.shape, g_last_shape11) != 0 || c.call <= 3 || c.call % 1000 == 0)) {
+    strncpy_s(g_last_shape11, c.shape, _TRUNCATE);
+    Line11("D3D11 DLSS: call %ld on thread %lu, result %d: %s; in use %ux%u at %u,%u, MV scale %.3f %.3f, jitter %.3f %.3f, flags %d, reset %d", c.call,
+           GetCurrentThreadId(), result, c.shape, c.read.width, c.read.height, c.read.x, c.read.y, c.read.to_pixels[0], c.read.to_pixels[1], c.read.jitter[0],
+           c.read.jitter[1], c.read.flags, c.read.reset ? 1 : 0);
+  }
+  if (!taken || result != NGX_SUCCESS) return;
+  Lock lock;
   f.serial = g_frame11.serial + 1;
   g_frame11 = f;
   g_have_frame11 = true;
@@ -509,9 +483,8 @@ int __cdecl HookCreate11(ID3D11DeviceContext* context, int feature, const Parame
     int flags = -1;
     if (parameters->Get("DLSS.Feature.Create.Flags", &flags) != NGX_SUCCESS) flags = -1;
     if (result == NGX_SUCCESS) {
-      g_create_flags11 = flags;
-      g_create_out_width11 = ReadUint(parameters, "OutWidth");
-      g_create_out_height11 = ReadUint(parameters, "OutHeight");
+      Lock lock;
+      call::ReadCreate(parameters, feature, g_created11);
     }
     Line11("D3D11 DLSS: feature %d made, result %d, flags 0x%x, render %ux%u, output %ux%u, quality %u", feature, result, flags, ReadUint(parameters, "Width"),
            ReadUint(parameters, "Height"), ReadUint(parameters, "OutWidth"), ReadUint(parameters, "OutHeight"), ReadUint(parameters, "PerfQualityValue"));
@@ -519,13 +492,19 @@ int __cdecl HookCreate11(ID3D11DeviceContext* context, int feature, const Parame
   return result;
 }
 int __cdecl HookEvaluate11(ID3D11DeviceContext* context, const void* handle, const Parameter* parameters, void* callback) {
+  Call11 c;
+  Frame11 f;
+  const bool taken = Copy11(context, parameters, c, f);
   const int result = g_real_evaluate11(context, handle, parameters, callback);
-  Take11(context, parameters, result);
+  After11(c, result, taken, f);
   return result;
 }
 int __cdecl HookEvaluate11C(ID3D11DeviceContext* context, const void* handle, const Parameter* parameters, void* callback) {
+  Call11 c;
+  Frame11 f;
+  const bool taken = Copy11(context, parameters, c, f);
   const int result = g_real_evaluate11_c(context, handle, parameters, callback);
-  Take11(context, parameters, result);
+  After11(c, result, taken, f);
   return result;
 }
 

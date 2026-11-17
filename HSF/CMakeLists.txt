@@ -63,6 +63,14 @@ else()
   target_include_directories(sl_game_test SYSTEM PRIVATE "${HSF_STREAMLINE}/include")
   target_link_libraries(sl_game_test PRIVATE d3d12 dxgi hsf_minhook)
   target_link_options(sl_game_test PRIVATE "/ENTRY:wmainCRTStartup")
+  # Two sl.interposer.dll copies at once (Gothic Remake with RenoDX DLSS): a stand-in interposer, copied twice by the test, no Streamline or GPU needed.
+  add_library(fake_interposer SHARED tests/fake_interposer.cpp tests/fake_interposer.def)
+  target_include_directories(fake_interposer SYSTEM PRIVATE "${HSF_STREAMLINE}/include")
+  add_executable(sl_copies_test tests/sl_copies_test.cpp src/sl_game.cpp src/hook_patch.cpp src/safe_try.cpp)
+  target_include_directories(sl_copies_test SYSTEM PRIVATE "${HSF_STREAMLINE}/include")
+  target_link_libraries(sl_copies_test PRIVATE d3d12 dxgi hsf_minhook)
+  target_link_options(sl_copies_test PRIVATE "/ENTRY:wmainCRTStartup")
+  add_dependencies(sl_copies_test fake_interposer)
   # Offline test of the frame checks, no game needed.
   # A small program with no Streamline of its own: HSF must bring Streamline to it. Needs a folder with Streamline's DLLs and a GPU.
   add_executable(sl_bring_test tests/sl_bring_test.cpp src/sl_bring.cpp src/debug_view.cpp src/depth_fit.cpp src/compose.cpp src/frame_checks.cpp src/nvof_flow.cpp)

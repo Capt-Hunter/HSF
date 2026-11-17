@@ -11,14 +11,14 @@
 #include <vector>
 
 #include "hook_patch.h"
+#include "ngx_call.h"
 
 namespace hsf::ngx {
 namespace {
 
 namespace api = reshade::api;
 
-constexpr int NGX_SUCCESS = 1;
-constexpr int FLAG_MV_LOW_RES = 1 << 1, FLAG_DEPTH_INVERTED = 1 << 3;
+using call::NGX_SUCCESS;
 
 // NGX's Vulkan resource, laid out as nvsdk_ngx_defs_vk.h has it (NVSDK_NGX_Resource_VK).
 struct ImageViewInfoVk {
@@ -82,6 +82,7 @@ int g_write = 0;
 std::vector<OldCopies> g_old;  // still read by frames on the GPU when replaced
 FrameVk g_frame;                // the last call recorded
 bool g_have_frame = false;
+bool g_logged_first = false;  // the first call taken is logged once, whether or not it worked
 // A call's copy is handed over only once its command buffer has gone to a queue (ReShade's execute_command_list): a bridge copy submitted
 // after it on the same queue then reads it whole.
 struct Pending {
@@ -94,9 +95,8 @@ bool g_have_submitted = false;
 void* g_submit_queue = nullptr;  // the queue the last call's command buffer went to
 constexpr uint64_t NO_SUBMITS_AFTER = 30;  // calls recorded with no submit seen: ReShade does not report submits, hand over the last call recorded
 uint64_t g_serial = 0;
-int g_create_flags = -1;
-uint32_t g_create_width = 0, g_create_height = 0, g_create_out_width = 0, g_create_out_height = 0;
-uint64_t g_largest_area = 0, g_largest_serial = 0;
+call::Created g_created;  // from the last CreateFeature for DLSS
+call::MainCall g_main;
 int g_refused_motion = 0, g_refused_depth = 0;
 bool g_tried = false;
 hookpatch::HookSet g_hooks;  // NGX's Vulkan calls: removed by UnhookVk only
@@ -130,14 +130,6 @@ void Line(const char* format, ...) {
   g_log(text);
 }
 
-float ReadFloat(const Parameter* parameters, const char* name, float otherwise) {
-  float value = 0.f;
-  return parameters->Get(name, &value) == NGX_SUCCESS ? value : otherwise;
-}
-uint32_t ReadUint(const Parameter* parameters, const char* name) {
-  unsigned int value = 0;
-  return parameters->Get(name, &value) == NGX_SUCCESS ? value : 0;
-}
 const ImageViewInfoVk* Image(const Parameter* parameters, const char* name) {
   void* pointer = nullptr;
   if (parameters->Get(name, &pointer) != NGX_SUCCESS || pointer == nullptr) return nullptr;
@@ -299,20 +291,21 @@ void Record(VkCommandBuffer cmd, const Copies& copies, bool copy_written, const 
   g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, count, after);
 }
 
-// After a call that worked. Logs the first call and every change of what is copied.
-void Take(VkCommandBuffer cmd, const Parameter* parameters) {
-  if (cmd == VK_NULL_HANDLE || parameters == nullptr) return;
+// Before the call goes on (see HookEvaluate): the part in use of the vectors and depth copied on its command buffer, and what HSF reads of the call
+// in `out`. False when the call is not taken: nothing is recorded then. Logs every change of what is copied.
+bool Take(VkCommandBuffer cmd, const Parameter* parameters, FrameVk& out) {
+  if (cmd == VK_NULL_HANDLE || parameters == nullptr) return false;
   // Only the upscalers have vectors under this name, so frame generation or anything else on this call never gets here.
   const ImageViewInfoVk* const motion = Image(parameters, "MotionVectors");
-  if (motion == nullptr) return;
+  if (motion == nullptr) return false;
   const ImageViewInfoVk* depth = Image(parameters, "Depth");
 
   Lock lock;
-  if (g_device == nullptr || g_vk.CmdCopyImage == nullptr) return;
+  if (g_device == nullptr || g_vk.CmdCopyImage == nullptr) return false;
   if (MotionFormat(motion->format) == api::format::unknown) {
     if (g_refused_motion != motion->format) Line("Vulkan DLSS: vectors in VkFormat %d are not taken, so this game stays on flow", static_cast<int>(motion->format));
     g_refused_motion = motion->format;
-    return;
+    return false;
   }
   if (depth != nullptr && DepthRoute(depth->format) == 0) {
     if (g_refused_depth != depth->format) Line("Vulkan DLSS: depth in VkFormat %d is not copied, the effect's depth is used", static_cast<int>(depth->format));
@@ -320,49 +313,12 @@ void Take(VkCommandBuffer cmd, const Parameter* parameters) {
     depth = nullptr;
   }
 
-  int flags = g_create_flags;
-  if (flags < 0 && parameters->Get("DLSS.Feature.Create.Flags", &flags) != NGX_SUCCESS) flags = -1;
-  const bool flags_known = flags >= 0;
-  const bool low_res = !flags_known || (flags & FLAG_MV_LOW_RES) != 0;
-  uint32_t render_width = ReadUint(parameters, "DLSS.Render.Subrect.Dimensions.Width");
-  uint32_t render_height = ReadUint(parameters, "DLSS.Render.Subrect.Dimensions.Height");
-  if (render_width == 0 || render_height == 0) {
-    render_width = g_create_width;
-    render_height = g_create_height;
-  }
-  if (render_width == 0 || render_height == 0) {
-    render_width = motion->width;
-    render_height = motion->height;
-  }
-  // The vectors' part in use: the render size for low-resolution vectors, otherwise the output.
-  uint32_t width = render_width, height = render_height;
-  if (!low_res && g_create_out_width != 0 && g_create_out_height != 0) {
-    width = g_create_out_width;
-    height = g_create_out_height;
-  }
-  if (width == 0 || height == 0 || width > motion->width || height > motion->height) {
-    width = motion->width;
-    height = motion->height;
-  }
-  uint32_t mx = ReadUint(parameters, "DLSS.Input.MV.Subrect.Base.X"), my = ReadUint(parameters, "DLSS.Input.MV.Subrect.Base.Y");
-  if (mx + width > motion->width || my + height > motion->height) mx = my = 0;
-  uint32_t depth_width = 0, depth_height = 0, dx = 0, dy = 0;
-  if (depth != nullptr) {
-    depth_width = render_width <= depth->width ? render_width : depth->width;
-    depth_height = render_height <= depth->height ? render_height : depth->height;
-    dx = ReadUint(parameters, "DLSS.Input.Depth.Subrect.Base.X");
-    dy = ReadUint(parameters, "DLSS.Input.Depth.Subrect.Base.Y");
-    if (dx + depth_width > depth->width || dy + depth_height > depth->height) dx = dy = 0;
-  }
-
-  // The main call: not less than half the largest of the last 240 calls.
-  const uint64_t area = static_cast<uint64_t>(width) * height;
-  if (g_serial - g_largest_serial > 240) g_largest_area = 0;
-  if (area * 2 < g_largest_area) return;
-  if (area >= g_largest_area) {
-    g_largest_area = area;
-    g_largest_serial = g_serial;
-  }
+  const call::DlssCall c = call::Read(parameters, g_created, motion->width, motion->height);
+  const uint32_t width = c.width, height = c.height, mx = c.x, my = c.y;
+  call::DepthPart d;
+  if (depth != nullptr) d = call::ReadDepthPart(parameters, c, depth->width, depth->height);
+  const uint32_t depth_width = d.width, depth_height = d.height, dx = d.x, dy = d.y;
+  if (!g_main.Take(c.Area(), g_serial)) return false;
 
   const VkFormat depth_format = depth != nullptr ? depth->format : VK_FORMAT_UNDEFINED;
   const Copies& now = g_ring[0];
@@ -372,8 +328,8 @@ void Take(VkCommandBuffer cmd, const Parameter* parameters) {
     bool all = true;
     for (int i = 0; i < RING && all; ++i) all = MakeCopies(made[i], width, height, motion->format, depth_width, depth_height, depth_format, i != 0);
     if (!all) {
-      for (Copies& c : made) Release(c);
-      return;
+      for (Copies& m : made) Release(m);
+      return false;
     }
     for (int i = 0; i < RING; ++i) {
       if (g_ring[i].motion.handle != 0) g_old.push_back({g_ring[i], g_serial});
@@ -399,13 +355,31 @@ void Take(VkCommandBuffer cmd, const Parameter* parameters) {
   f.depth = depth != nullptr ? copies.depth : api::resource{0};
   f.width = width;
   f.height = height;
-  f.to_pixels[0] = ReadFloat(parameters, "MV.Scale.X", 1.f);
-  f.to_pixels[1] = ReadFloat(parameters, "MV.Scale.Y", 1.f);
-  f.depth_inverted = flags_known ? ((flags & FLAG_DEPTH_INVERTED) != 0 ? 1 : 0) : -1;
-  int reset = 0;
-  f.reset = parameters->Get("Reset", &reset) == NGX_SUCCESS && reset != 0;
+  f.to_pixels[0] = c.to_pixels[0];
+  f.to_pixels[1] = c.to_pixels[1];
+  f.jitter[0] = c.jitter[0];
+  f.jitter[1] = c.jitter[1];
+  f.jittered = c.jittered;
+  f.depth_inverted = c.depth_inverted;
+  f.reset = c.reset;
   f.serial = ++g_serial;
+  out = f;
+  if (!g_logged_first) {
+    g_logged_first = true;
+    Line("Vulkan DLSS: first call on thread %lu: vectors %ux%u in use at %u,%u of %ux%u, MV scale %.3f %.3f, depth %s %ux%u, flags %s0x%x, image layout taken as "
+         "SHADER_READ_ONLY_OPTIMAL, copied before the call goes on",
+         GetCurrentThreadId(), width, height, mx, my, motion->width, motion->height, f.to_pixels[0], f.to_pixels[1], depth != nullptr ? "copied" : "not copied",
+         depth_width, depth_height, c.flags >= 0 ? "" : "not known, taken as low resolution ", c.flags >= 0 ? c.flags : 0);
+  }
+  return true;
+}
+
+// After the call worked: the copy waits for its command buffer to go to a queue.
+void Publish(VkCommandBuffer cmd, const FrameVk& f) {
+  Lock lock;
+  if (g_have_frame && f.serial < g_frame.serial) return;  // a newer call on another thread was handed over first
   g_frame = f;
+  g_have_frame = true;
   Stamp(g_last_call, g_call_ms);
   // A command buffer recorded again before it went to a queue replaces its older call.
   for (size_t i = 0; i < g_pending.size(); ++i)
@@ -415,28 +389,14 @@ void Take(VkCommandBuffer cmd, const Parameter* parameters) {
     }
   if (g_pending.size() >= RING) g_pending.erase(g_pending.begin());
   g_pending.push_back({cmd, f});
-  if (!g_have_frame) {
-    g_have_frame = true;
-    Line("Vulkan DLSS: first call taken on thread %lu: vectors %ux%u in use at %u,%u of %ux%u, MV scale %.3f %.3f, depth %s %ux%u, flags %s0x%x, image layout taken as "
-         "SHADER_READ_ONLY_OPTIMAL",
-         GetCurrentThreadId(), width, height, mx, my, motion->width, motion->height, f.to_pixels[0], f.to_pixels[1], depth != nullptr ? "copied" : "not copied",
-         depth_width, depth_height, flags_known ? "" : "not known, taken as low resolution ", flags_known ? flags : 0);
-  }
 }
 
 void NoteCreate(const Parameter* parameters, int feature, int result) {
-  constexpr int FEATURE_SUPER_SAMPLING = 1, FEATURE_RAY_RECONSTRUCTION = 13;
-  if (result != NGX_SUCCESS || parameters == nullptr || (feature != FEATURE_SUPER_SAMPLING && feature != FEATURE_RAY_RECONSTRUCTION)) return;
-  int flags = 0;
-  const bool have_flags = parameters->Get("DLSS.Feature.Create.Flags", &flags) == NGX_SUCCESS;
+  if (result != NGX_SUCCESS) return;
   Lock lock;
-  if (have_flags) g_create_flags = flags;
-  g_create_width = ReadUint(parameters, "Width");
-  g_create_height = ReadUint(parameters, "Height");
-  g_create_out_width = ReadUint(parameters, "OutWidth");
-  g_create_out_height = ReadUint(parameters, "OutHeight");
-  Line("Vulkan DLSS: made, feature %d, flags 0x%x, render %ux%u, output %ux%u", feature, have_flags ? flags : -1, g_create_width, g_create_height, g_create_out_width,
-       g_create_out_height);
+  if (call::ReadCreate(parameters, feature, g_created))
+    Line("Vulkan DLSS: made, feature %d, flags 0x%x, render %ux%u, output %ux%u", feature, g_created.flags, g_created.width, g_created.height, g_created.out_width,
+         g_created.out_height);
 }
 
 int __cdecl HookCreate(VkCommandBuffer cmd, int feature, const Parameter* parameters, void** handle) {
@@ -449,14 +409,20 @@ int __cdecl HookCreate1(VkDevice device, VkCommandBuffer cmd, int feature, const
   NoteCreate(parameters, feature, result);
   return result;
 }
+// The copies are recorded BEFORE the call goes on, for the same reason as on Direct3D 12 (ngx_input.cpp HookEvaluate): another mod's DLSS under
+// this hook can leave the game's images in another layout, or with other contents. The copy is handed over only if the call worked.
 int __cdecl HookEvaluate(VkCommandBuffer cmd, const void* handle, const Parameter* parameters, void* callback) {
+  FrameVk f;
+  const bool taken = Take(cmd, parameters, f);
   const int result = g_real_evaluate(cmd, handle, parameters, callback);
-  if (result == NGX_SUCCESS) Take(cmd, parameters);
+  if (taken && result == NGX_SUCCESS) Publish(cmd, f);
   return result;
 }
 int __cdecl HookEvaluateC(VkCommandBuffer cmd, const void* handle, const Parameter* parameters, void* callback) {
+  FrameVk f;
+  const bool taken = Take(cmd, parameters, f);
   const int result = g_real_evaluate_c(cmd, handle, parameters, callback);
-  if (result == NGX_SUCCESS) Take(cmd, parameters);
+  if (taken && result == NGX_SUCCESS) Publish(cmd, f);
   return result;
 }
 
@@ -490,6 +456,7 @@ void PollVk(api::device* device) {
     g_have_submitted = false;
     g_submit_queue = nullptr;
     g_have_frame = false;
+    g_logged_first = false;
   }
   if (g_tried) return;
   HMODULE module = GetModuleHandleW(L"_nvngx.dll");
@@ -585,6 +552,7 @@ void StopVk(bool release) {
   g_submitted = FrameVk{};
   g_submit_queue = nullptr;
   g_have_frame = false;
+  g_logged_first = false;
   g_frame = FrameVk{};
   g_device = nullptr;
 }

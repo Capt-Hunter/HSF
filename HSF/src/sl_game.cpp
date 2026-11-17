@@ -1156,7 +1156,17 @@ bool IsHsfStreamline(HMODULE module) {
 }
 
 bool g_only_hsf_streamline = false;  // the only sl.interposer.dll loaded is HSF's own
-HMODULE g_picked = nullptr;           // a copy picked in the menu, used while it stays loaded
+HMODULE g_picked = nullptr;           // a copy picked in the menu (or moved to, see MoveOnWithoutFrames), used while it stays loaded
+
+// Two or more copies loaded: another mod can load a stray copy from the game's folder before the game loads its own (RenoDX DLSS, Oct 2026 build, in
+// Gothic Remake), and HSF hooks the first that loads. The copy the game started wins (FindGameInterposer). When none says it was started, a copy that
+// gets no frame from the game in NO_FRAMES_MOVE_ON_MS is left for the next one not yet tried, each once. Copies followed that long with none are kept in
+// g_no_frame_copies, for the route pick (AllCopiesTried).
+constexpr ULONGLONG NO_FRAMES_MOVE_ON_MS = 3000;
+HMODULE g_followed = nullptr;  // the copy the wait is timed for
+ULONGLONG g_followed_since = 0;
+HMODULE g_no_frame_copies[8] = {};
+int g_no_frame_count = 0;
 
 // Every sl.interposer.dll loaded, HSF's own too.
 int AllInterposers(HMODULE* out, int max) {
@@ -1173,7 +1183,29 @@ int AllInterposers(HMODULE* out, int max) {
   return count;
 }
 
-HMODULE FindGameInterposer() {
+// Whether the game started this copy (slInit called): its slIsFeatureLoaded, which only reads, answers something other than eErrorNotInitialized or
+// eErrorInitNotCalled. A copy without that export counts as started, so an unknown Streamline is trusted as before.
+bool CopyStarted(HMODULE module) {
+  const auto is_loaded = reinterpret_cast<IsFeatureLoadedFn>(GetProcAddress(module, "slIsFeatureLoaded"));
+  if (is_loaded == nullptr) return true;
+  bool loaded = false;
+  const sl::Result result = is_loaded(sl::kFeatureDLSS_G, loaded);
+  return result != sl::Result::eErrorNotInitialized && result != sl::Result::eErrorInitNotCalled;
+}
+
+// The game's copies loaded (not HSF's own), at most max.
+int GameCopies(HMODULE* out, int max) {
+  HMODULE all[8];
+  const int count = AllInterposers(all, 8);
+  int games = 0;
+  for (int i = 0; i < count && games < max; ++i)
+    if (!IsHsfStreamline(all[i])) out[games++] = all[i];
+  return games;
+}
+
+// ask_started: with two or more of the game's copies loaded, the one the game started wins (Gothic Remake: RenoDX DLSS's stray copy loads first and is
+// never started). Not under the loader lock (it calls into each copy), so Start leaves it to the first Poll.
+HMODULE FindGameInterposer(bool ask_started) {
   HMODULE all[8];
   const int count = AllInterposers(all, 8);
   g_only_hsf_streamline = false;
@@ -1181,6 +1213,13 @@ HMODULE FindGameInterposer() {
     for (int i = 0; i < count; ++i)
       if (all[i] == g_picked) return g_picked;
     g_picked = nullptr;
+  }
+  if (ask_started) {
+    HMODULE copies[8];
+    const int games = GameCopies(copies, 8);
+    if (games >= 2)
+      for (int i = 0; i < games; ++i)
+        if (CopyStarted(copies[i])) return copies[i];
   }
   const HMODULE first = GetModuleHandleW(L"sl.interposer.dll");
   if (first == nullptr || !IsHsfStreamline(first)) return first;
@@ -1688,7 +1727,7 @@ void Start(const wchar_t* log_path, bool drive, bool dynamic_resolution_known) {
   wchar_t exe[MAX_PATH] = L"?";
   GetModuleFileNameW(nullptr, exe, MAX_PATH);
   Line("=== HSF %s started in %ls. %s ===", HSF_VERSION, exe, drive ? "Driving DLSS-G inside the game." : "Only logging: every call goes on unchanged.");
-  g_interposer = FindGameInterposer();
+  g_interposer = FindGameInterposer(false);
   if (g_interposer != nullptr) HookInterposer(g_interposer);
   else Line("sl.interposer.dll not loaded yet");
   AdoptOptionsStub();
@@ -1826,6 +1865,83 @@ int ListInterposers(Interposer* out, int max) {
   return count;
 }
 
+namespace {
+
+// Under g_lock, from Poll: one line for each sl.interposer.dll copy the first time it is seen loaded, with its version and folder, so a log shows at once
+// which copies a game has (Gothic Remake had RenoDX DLSS's stray copy loaded before its own, and the log named only the one HSF hooked).
+void LogNewCopies() {
+  static HMODULE s_seen[8] = {};
+  static int s_seen_count = 0;
+  HMODULE all[8];
+  const int count = AllInterposers(all, 8);
+  for (int i = 0; i < count; ++i) {
+    bool seen = false;
+    for (int j = 0; j < s_seen_count; ++j) seen = seen || s_seen[j] == all[i];
+    if (seen) continue;
+    if (s_seen_count < 8) s_seen[s_seen_count++] = all[i];
+    wchar_t path[MAX_PATH] = L"?";
+    GetModuleFileNameW(all[i], path, MAX_PATH);
+    uint32_t version[4] = {};
+    const bool have_version = ModuleVersion(all[i], version);
+    Line("sl.interposer.dll copy %d of %d loaded at %p, version %u.%u.%u.%u%s, %s: %ls", i + 1, count, all[i], version[0], version[1], version[2], version[3],
+         have_version ? "" : " (none in the file)", IsHsfStreamline(all[i]) ? "HSF's own" : "the game's or a mod's", path);
+  }
+}
+
+// Under g_lock, from Poll. See NO_FRAMES_MOVE_ON_MS.
+void MoveOnWithoutFrames(ULONGLONG now) {
+  if (g_interposer != g_followed) {
+    g_followed = g_interposer;
+    g_followed_since = now;
+  }
+  if (g_interposer == nullptr || g_frames != 0 || now - g_followed_since < NO_FRAMES_MOVE_ON_MS) return;
+  // A copy the game started is the game's, frames or not: a game sends none in its menus or with its own frame generation off (Gothic Remake), and
+  // leaving it for that sent HSF round and round between two copies.
+  if (CopyStarted(g_interposer)) return;
+  const auto tried = [](HMODULE module) {
+    for (int i = 0; i < g_no_frame_count; ++i)
+      if (g_no_frame_copies[i] == module) return true;
+    return false;
+  };
+  if (!tried(g_interposer) && g_no_frame_count < 8) g_no_frame_copies[g_no_frame_count++] = g_interposer;
+  HMODULE copies[8];
+  const int count = GameCopies(copies, 8);
+  if (count < 2) return;
+  // Each copy once, in load order: once all have had their turn with no frame, HSF stays where it is.
+  HMODULE next = nullptr;
+  for (int i = 0; i < count && next == nullptr; ++i)
+    if (!tried(copies[i])) next = copies[i];
+  if (next == nullptr) return;
+  wchar_t path[MAX_PATH] = L"?";
+  GetModuleFileNameW(next, path, MAX_PATH);
+  Line("sl.interposer.dll %p got no frame from the game in %llu ms and %d copies are loaded: moving to %ls", g_interposer, NO_FRAMES_MOVE_ON_MS, count, path);
+  g_picked = next;
+  g_followed_since = now;  // the next copy gets its own wait (g_followed changes once it is hooked)
+}
+
+}  // namespace
+
+bool AllCopiesTried() {
+  Lock lock;
+  if (g_frames != 0) return true;
+  HMODULE copies[8];
+  const int count = GameCopies(copies, 8);
+  for (int i = 0; i < count; ++i) {
+    bool tried = false;
+    for (int j = 0; j < g_no_frame_count; ++j) tried = tried || g_no_frame_copies[j] == copies[i];
+    if (!tried) return false;
+  }
+  return true;
+}
+
+bool AnyCopyStarted() {
+  HMODULE copies[8];
+  const int count = GameCopies(copies, 8);
+  for (int i = 0; i < count; ++i)
+    if (CopyStarted(copies[i])) return true;
+  return false;
+}
+
 void PickInterposer(void* module) {
   Lock lock;
   g_picked = static_cast<HMODULE>(module);
@@ -1865,10 +1981,14 @@ void Poll() {
     if (!g_started) return;
     Summary();
     ScanPlugins();
-    const HMODULE module = FindGameInterposer();
+    LogNewCopies();
+    MoveOnWithoutFrames(now);
+    const HMODULE module = FindGameInterposer(true);
     if (module != g_interposer) {
       Line("sl.interposer.dll changed: %p to %p", g_interposer, module);
-      ForEachHook([](Hook& hook) { hook.installed = false; });
+      // Off the old copy first: a hook left in it would lead its callers (another mod's) into the new copy's functions. Removing puts its bytes back, or with
+      // someone's jump on top points HSF's relay at the old trampoline, so their calls skip HSF and reach the old copy's own code.
+      ForEachHook([](Hook& hook) { Remove(hook); });
       g_interposer = module;
       g_asked_features = false;
       g_have_options.store(false);

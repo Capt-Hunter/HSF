@@ -2494,7 +2494,7 @@ void Dlss11Motion(effect_runtime* runtime, device* dev) {
   ID3D11Device* const native = reinterpret_cast<ID3D11Device*>(dev->get_native());
   ID3D11Texture2D* fitted = nullptr;
   if (use) {
-    const float to_pixels[2] = {f.scale[0], f.scale[1]};
+    const float to_pixels[2] = {f.to_pixels[0], f.to_pixels[1]};
     fitted = hsf::depth::FitMotion(native, f.motion, f.x, f.y, f.width, f.height, to_pixels, out_width, out_height);
     use = fitted != nullptr;
   }
@@ -2544,19 +2544,12 @@ constexpr uint32_t ROUTE_DECIDE_FRAMES = 300;
 bool g_route_decided = false;  // PickD3d12Route or LeaveAutoD3d12Route has acted this run; only one of them ever does
 
 #ifdef HSF_SL_GAME
-// Whether the sl.interposer.dll loaded in this process was started by the game (slInit called). A copy left in a game folder that never uses it (RDR2 with a stray
+// Whether a copy of the game's sl.interposer.dll loaded in this process was started by the game (slInit called). A copy left in a game folder that never uses it (RDR2 with a stray
 // copy: every tag answered eErrorNotInitialized) is loaded but never started, and the in-game route can do nothing with it. Asks slIsFeatureLoaded, which only
 // reads: before slInit it answers eErrorNotInitialized or eErrorInitNotCalled. True when there is no such export, so an unknown Streamline is trusted as before.
-bool GameStreamlineStarted() {
-  const HMODULE module = GetModuleHandleW(L"sl.interposer.dll");
-  if (module == nullptr) return false;
-  using IsFeatureLoadedFn = int (*)(uint32_t, bool&);
-  const auto is_loaded = reinterpret_cast<IsFeatureLoadedFn>(GetProcAddress(module, "slIsFeatureLoaded"));
-  if (is_loaded == nullptr) return true;
-  bool loaded = false;
-  const int result = is_loaded(sl::kFeatureDLSS_G, loaded);
-  return result != static_cast<int>(sl::Result::eErrorNotInitialized) && result != static_cast<int>(sl::Result::eErrorInitNotCalled);
-}
+// Every loaded copy is asked (sl_game's AnyCopyStarted): RenoDX DLSS loads a stray copy in Gothic Remake before the game's own, and asking only the first
+// loaded wrote SlBringIn=2 on every launch.
+bool GameStreamlineStarted() { return hsf::slgame::AnyCopyStarted(); }
 #endif
 
 // A D3D12 route switch in HSF.ini (SlBringIn, InGameDlssg). unset: the key is not there; on: 1 (or any other value above 0), set by hand or by an
@@ -2619,6 +2612,8 @@ bool g_drive_left = false;  // LeaveUnstartedStreamline switched this game to Sl
 void LeaveUnstartedStreamline() {
   static bool s_done = false;
   if (s_done || !D3d12Run() || g_d3d12_frames.load(std::memory_order_relaxed) < ROUTE_DECIDE_FRAMES) return;
+  // A stray copy loaded first (another mod's): HSF moves on to the game's own copy by itself, so wait until every copy has had its turn.
+  if (!hsf::slgame::AllCopiesTried()) return;
   s_done = true;
   if (GameStreamlineStarted() || hsf::slgame::GameFrames() != 0 || hsf::slgame::GetStats().have_options) return;
   WriteRoute(L"InGameDlssg", Route::unset);

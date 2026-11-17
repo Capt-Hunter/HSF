@@ -1,0 +1,9 @@
+EXPORTS
+  slSetTag
+  slSetTagForFrame
+  slSetConstants
+  slEvaluateFeature
+  slGetNewFrameToken
+  slGetFeatureFunction
+  slSetFeatureLoaded
+  slIsFeatureLoaded

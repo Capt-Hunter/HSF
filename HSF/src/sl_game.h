@@ -32,6 +32,13 @@ struct Interposer {
 };
 int ListInterposers(Interposer* out, int max);
 void PickInterposer(void* module);
+// False while a loaded copy of the game's sl.interposer.dll has not yet been followed for a few seconds with no frame from the game (with more than one copy
+// loaded, HSF moves from a copy without frames to the next by itself). True once any copy got frames.
+bool AllCopiesTried();
+// Whether any loaded copy of the game's sl.interposer.dll (not HSF's own) was started by the game (slInit called). Asks each copy's slIsFeatureLoaded, which only
+// reads: before slInit it answers eErrorNotInitialized or eErrorInitNotCalled. A copy without that export counts as started. False when none is loaded.
+// Every copy, not the first: a stray copy another mod loads first is never started, and asking only it sent Gothic Remake to the bring route on every launch.
+bool AnyCopyStarted();
 // What HSF wants, with drive on. allowed false holds generation off. frames is generated per real frame (1 = 2x).
 void SetGeneration(bool allowed, uint32_t frames);
 // True holds generation off while the game's window is not in front and for a moment after it comes back. Crimson Desert drops its device (DXGI_ERROR_ACCESS_DENIED)

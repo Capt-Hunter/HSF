@@ -1,6 +1,6 @@
 // The game's DLSS data on Vulkan. A mod that runs DLSS on a Vulkan game (GITC Uplift in the Kyty emulator) hands the driver's _nvngx.dll the vectors and
 // depth every frame through NGX's Vulkan calls. HSF hooks those calls the same way as on Direct3D 12 (ngx_input.h), always calls through, and copies the
-// part in use of the vectors and depth on the same command buffer just after each call, into images of its own on the game's device. The Vulkan bridge
+// part in use of the vectors and depth on the same command buffer just before each call goes on, into images of its own on the game's device. The Vulkan bridge
 // (vk_bridge.h) takes them over to HSF's helper in place of the flow.
 #pragma once
 
@@ -27,6 +27,8 @@ struct FrameVk {
   reshade::api::resource depth{0};  // {0}: this depth format is not copied (the effect's depth is used instead)
   uint32_t width = 0, height = 0;   // the vectors' copy
   float to_pixels[2] = {};          // NGX's MV.Scale: a vector times this is in pixels of the part in use
+  float jitter[2] = {};             // in pixels of the render size
+  bool jittered = false;            // the vectors include the jitter
   int depth_inverted = -1;          // from DLSS's flags: 1 reversed, 0 normal, -1 not known
   bool reset = false;
   uint64_t serial = 0;              // goes up with each call taken
