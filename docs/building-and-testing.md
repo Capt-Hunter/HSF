@@ -52,6 +52,16 @@ House rules for test installs:
 
 These need no game. Most need an NVIDIA GPU, and the D3D12 ones need D3D12.
 
+Run them all with one command after `build.cmd`:
+
+```bash
+cmd /c HSF\tools\test.cmd
+```
+
+It prints one PASS or FAIL line per test and a total, and exits 0 only when all passed. `test.cmd x64` or `x86` runs one build; `nohelper` skips `helper_exit_test.ps1`. Each test's full output goes to `build\testlogs\<arch>_<test>.txt`. It runs `guard.ps1` first.
+
+The single tests:
+
 | Run | Checks |
 |---|---|
 | `build\x64\compose_test.exe` | compose pass |
@@ -60,6 +70,9 @@ These need no game. Most need an NVIDIA GPU, and the D3D12 ones need D3D12.
 | `build\x64\frame_checks_test.exe` | cuts, stills, HUD mask |
 | `build\x64\debug_view_test.exe` | D3D12 debug view |
 | `build\x64\sl_game_test.exe` | hooks on a copy of `sl.interposer.dll` |
+| `build\x64\hook_test.exe` | the patcher: length decoder, unaligned functions, the decoder's safe-try switch |
+| `build\x64\sl_copies_test.exe [--unstarted]` | two `sl.interposer.dll` copies at once (`fake_interposer.dll` next to it) |
+| `build\<arch>\safe_try_test.exe`, `hsf_log_test.exe` | crash protection marks; `HSF.log` fresh, previous and append rules |
 | `build\x64\sl_bring_test.exe` | HSF bringing Streamline into a small D3D12 program (needs Streamline's DLLs next to it) |
 | `build\x64\ngx_input_test.exe` | the NGX hook on this machine's `_nvngx.dll` |
 | `build\x64\depth_fit_test.exe` | depth fit: render-size depth brought up to the vectors' size |
@@ -73,7 +86,13 @@ These need no game. Most need an NVIDIA GPU, and the D3D12 ones need D3D12.
 | `build\x64\vk_scene.exe [--fps N] [--seconds N] [--size WxH]` | by hand, not in the suite: a small Vulkan program to bring the Vulkan route up without a game. ReShade's Vulkan layer and HSF must be set up next to it |
 | `build\x86\helper_exit_test.exe <helper> <ms> hdr10\|hdr10bug` | eye test on an HDR display, Windows HDR on: `hdr10` must show the right half (400 nits) glowing brighter than the left (100 nits); `hdr10bug` sends the same picture as sRGB, two flat greys |
 
-Each test prints its checks as it runs. Look for `FAIL` in the output. The exit code is not reliable across all tests yet: some return non-zero on failure, and others only print.
+Each test prints its checks as it runs. `test.cmd` judges each one by its exit code.
+
+### Stack sweep
+
+`tools\stack_sweep.ps1` runs `build\x64\d3d12_scene.exe`, a stand-in D3D12 game, with the real mod stack players run: ReShade 6.8.0 and HSF as a fresh install, with or without RenoDX DLSS and GITC Uplift; no Streamline, the game's 2.14 or 2.13; ReShade before or after Streamline; SDR, HDR10, FP16 or borderless; and the game's DLSS through Streamline or NGX. A case passes when the scene runs to its end and DLSS-G showed more than one frame per real frame. `-Quick` runs about 10 cases, the default a longer list, `-Full` every mix. It takes a long time and holds the GPU: run it only when the maintainer asks.
+
+`d3d12_scene.exe` is built only when the NGX SDK is found in the Luma checkout next to `HSF`.
 
 ## 5. Testing in games
 
@@ -97,13 +116,13 @@ Main test games:
 
 ## 6. Hung processes
 
-`tools/dump_process.ps1` writes a full-memory minidump of a hung test process, for reading in a debugger.
+`tools/dump_process.ps1` writes a full-memory minidump of a hung test process, for reading in a debugger. `tools/hang_stacks.py <dump>` reads a full dump of a hung 64-bit game (Task Manager: Create memory dump file) and prints where each thread is.
 
 HSF's early in-house presenter (its code, `interp_test`, the PresentMon and smoothness measurements) and the early probes (`dlssg_probe`, `on12_probe`, `harness`, `debug_strings`, `smooth_capture`), are kept by the maintainer outside the repo.
 
 ## 7. Git
 
 - `main` is the only long-lived branch, on GitHub `Capt-Hunter/HSF`.
-- Work happens on a branch (`hsf-<topic>`), which is merged into `main` with a merge commit, pushed, then deleted locally and on GitHub.
+- Work happens on a branch (`hsf-<topic>`), which is merged into `main` fast-forward only, pushed, then deleted locally and on GitHub.
 - Only the maintainer (Capt-Hunter) merges into `main` and pushes it. Outside changes come in as pull requests (see [CONTRIBUTING.md](../CONTRIBUTING.md)).
 - Git ignores `build/`, `*.addon32` and `*.addon64`, the `Streamline SDK` folder next to `HSF`, and local working folders and notes.

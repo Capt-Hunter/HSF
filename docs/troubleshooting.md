@@ -40,6 +40,10 @@ Start with the menu's status box. It names the route and gives the reason under 
 | D3D12 game's own DLSS option is gone or greyed out with HSF | Streamline started DLSS before the game, without the game's `nvngx_dlss.dll` (HSF 0.9.8 and older) | Update HSF. HSF finds the game's copy once and saves it as `SlNgxPath`. If it picked the wrong one, remove that line from `HSF.ini`. |
 | HDR game looks washed out or SDR with frame generation on | An old HSF build (before HDR10 support on the helper) | Update HSF: install every file from the new zip together. |
 | Helper does not start after an update ("of another version" in `HSF.log`) | The add-on and `hsf-dlssg-helper64.exe` come from different releases | Copy the whole zip again, `HSF_streamline` included. |
+| D3D12 game with its own Streamline crashes once, on its first launch with HSF 0.9.9 | A hook step crashed against another tool's hook. CRASH PROTECTION turns it off for this game by itself | Start the game again: it works. ADVANCED > CRASH PROTECTION shows what was turned off. A proper fix comes in the next update. |
+| Frame generation hitches with Windows display scaling above 100% | Known issue | Resize the game window once, or set display scaling to 100%. |
+| Steam overlay (Shift+Tab) does not show | Known issue while frame generation is on | Turn FRAME GEN off to use the overlay. |
+| A switch in CRASH PROTECTION reads OFF AFTER A CRASH | A launch ended (most likely a crash) while HSF tried that step | Leave it off, or switch it back ON and restart. If the game crashes again, HSF turns it off again. |
 
 ## 2. Logs
 
@@ -64,7 +68,7 @@ Notes from testing that matter for set-up:
 | Final Fantasy VII Remake (DX12; `-dx11` for D3D11) | No Streamline of its own: the bring-in route. Lumenite works as the source. Other mods in `_mods_off`. In D3D11 (`-dx11`) with Luma, HSF uses Luma's DLSS data (works at 6x). Its exit-time access violation in the NVIDIA driver after Alt+F4 is not an HSF crash. |
 | RE Village (DX12) | Bring-in route. Uplift and DFC NR work too (DFC needs its "Present with frame generation" on). |
 | Jusant (DX12) | NGX route, with motion from the game's DLSS. `SlLog=0`. |
-| AC Shadows, The Witcher 3 (DX12) | In-game route. Turn their own FG off. FLOW works in The Witcher 3. In AC Shadows FLOW works with TAA (DLSS off); with DLSS on it shakes (low base rate) and the GPU hung twice, so use MOTION AUTO or DLSS there. |
+| AC Shadows, The Witcher 3 (DX12) | In-game route. Turn their own FG off. AC Shadows crashes once on its first launch with 0.9.9 (the NGX hook); CRASH PROTECTION then turns NGX MOTION off, and it runs. FLOW works in The Witcher 3. In AC Shadows FLOW works with TAA (DLSS off); with DLSS on it shakes (low base rate) and the GPU hung twice, so use MOTION AUTO or DLSS there. |
 | Crimson Desert (DX12) | Fails. Since its 4 Nov update the game refuses ReShade and crashes even without HSF. RTSS also crashes it at start. HSF's swap-chain flag fix (`KeepDxgiFlags`) is in, but not proven there. |
 | Returnal (DX12) | Streamline 1.x: HSF stays idle. |
 | Sekiro, Mirror's Edge Catalyst (DX11) | Need LaunchPad. Use a recent NR mod build. |
@@ -103,3 +107,5 @@ These cost real time. Check them before going down the same road again.
 - **ReShade does not turn on external semaphores on Vulkan.** HSF hooks `vkCreateDevice` itself; RTSS's hooks crash with that hook in, so it stays out while RTSS is in the process.
 - **A child window on another process's window shares its input queue.** On Vulkan that made the mouse choppy; a click-through top-level window fixed it.
 - **A cap at exactly the refresh rate waits on VSync.** Cap a few frames below it.
+- **Safe try blames every step still marked.** A crash turns off each hook step whose mark is still in `HSF_safe_try.ini`, not only the one that crashed. Find the real culprit in the log (the last step begun) before blaming the others.
+- **Git Bash `sed -i` drops CRLF line endings.** Edit CRLF files (release `README.txt`, `HSF.ini`) with a tool that keeps them.

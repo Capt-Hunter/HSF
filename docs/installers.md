@@ -56,7 +56,7 @@ HSF sets LaunchPad up for frame generation by itself (the LAUNCHPAD row's AUTO, 
 
 ### HDR
 
-HSF passes the game's HDR on to DLSS-G: HDR10 output (from RenoDX, for example) reaches the screen as HDR10. FP16 scRGB output is turned into HDR10 while Windows HDR is on. No setting is needed.
+HSF passes the game's HDR on to DLSS-G: HDR10 output (from RenoDX, for example) reaches the screen as HDR10. FP16 scRGB output is turned into HDR10 while Windows HDR is on, on DirectX 12 too. No setting is needed.
 
 ### Frame generation unlockers
 
@@ -77,6 +77,7 @@ Delete these and nothing else:
 
 - `hsf.addon64` or `hsf.addon32`
 - `HSF.ini`
+- `HSF_safe_try.ini` (HSF writes it when CRASH PROTECTION turns a hook step off)
 - the `HSF_streamline` folder, with its logs and any `mods` folder in it
 - `reshade-shaders\Shaders\HSF.fx`
 - HSF's logs next to `HSF.ini`: `HSF.log`, `HSF.previous.log`

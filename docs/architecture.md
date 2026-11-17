@@ -41,8 +41,10 @@ Both D3D12 routes must start in `DllMain`, before the game makes its device. So 
 
 This route is for games that ship Streamline 2.x, usually because they have DLSS-G of their own.
 
-- **Hooks.** HSF hooks the game's `sl.interposer.dll` exports with its own hook code. It writes a 5-byte jump at the start of each function to a relay page near the module, and uses a trampoline that holds the moved prologue. If a prologue looks unexpected, HSF installs no hook there and only writes a log line. Game memory is read under structured exception handling, so a bad read never takes the game down.
-- **Drive.** With `InGameDlssg=1`, HSF turns DLSS-G on through the game's own Streamline, whatever the game's FG setting says. It sets the multiplier and tags the motion and depth the game gives its DLSS. If the game does not call DLSS, or `MotionFrom=optical`, HSF tags its own flow and depth instead (`slgame::TagOptical`). Unreal's Streamline plugin tags depth and motion for DLSS-G itself and runs DLSS outside Streamline, so no evaluate reaches HSF: the game's own motion tags then count as its DLSS data, and give HSF the frame token and viewport to tag with.
+- **Hooks.** HSF hooks the game's `sl.interposer.dll` exports with its own patcher (`hook_patch.cpp`). It writes a 5-byte jump at the start of each function to a relay page near the module, and uses a trampoline that holds the moved prologue. A function start on HSF's short list is moved as is; for others a full instruction decoder works out the length (HOOK DECODER). A function that already starts with another tool's jump is chained behind it, not skipped. If a prologue still looks unexpected, HSF installs no hook there and only writes a log line. The patcher has its own lock and calls nothing while holding it. Game memory is read under structured exception handling, so a bad read never takes the game down.
+- **Plugin hook and load watch.** DLSS-G's settings call is taken where Streamline asks DLSS-G's plugin for it (PLUGIN HOOK), so DLSS-G's own code stays unpatched for MFG-Unlocker. Windows' DLL load notification tells HSF the moment a Streamline file loads (LOAD WATCH), before the game's first call.
+- **Two copies.** A game can load two `sl.interposer.dll` copies (a mod's stray one and its own). The route check asks every copy whether it was started (`AnyCopyStarted`), and HSF moves its hooks to the copy that gets frames.
+- **Drive.** With `InGameDlssg=1`, HSF turns DLSS-G on through the game's own Streamline, whatever the game's FG setting says. It sets the multiplier and tags motion and depth in this order: what the game tags for its Streamline, then the game's DLSS read through NGX (`ngx_input`, NGX MOTION), then HSF's own flow and depth (`slgame::TagOptical`, also with `MotionFrom=optical`). Flow is always labelled as flow. The timings that decide between them are in `motion_timing.h`. Unreal's Streamline plugin tags depth and motion for DLSS-G itself and runs DLSS outside Streamline, so no evaluate reaches HSF: the game's own motion tags then count as its DLSS data, and give HSF the frame token and viewport to tag with.
 - **Camera.** With `DlssgRebuildCamera=1`, HSF rebuilds `clipToPrevClip` and `prevClipToClip` from the camera. With `DlssgCutCheck`, a camera jump that came with no reset from the game gets one.
 - **Readouts.** ReShade presents DLSS-G's generated frames too on this route. So the menu counts a real frame only when the game's own frame token moves forward (`slgame::GameFrames`).
 - **Reflex.** The game runs its own Reflex. Some games send `slReflexSetOptions` only once, at start (AC Shadows does). So HSF keeps the game's options and sends them again with its cap and boost whenever those change. The cap goes as 1000000/cap, because Reflex's limit already counts shown frames.
@@ -59,6 +61,9 @@ This route is for D3D12 games without Streamline.
 4. Each frame, HSF sends the Reflex markers and frame tokens a Streamline game would send, then the motion and depth (`slbring::Frame`).
 5. The motion is the game's DLSS data from `ngx_input`, when there is any and `MotionFrom` allows it. Otherwise it is the flow source plus depth, run through the compose pass on the game's device.
 6. `debug_view.cpp` can replace the picture with exactly what DLSS-G was tagged with (the DEPTH and MOTION views).
+7. When the game exits, HSF shuts its Streamline down while the game's threads still run (`slbring::ShutdownForExit`), so the game does not crash on quit.
+
+**FP16 (scRGB) games** (`fp16_swap.cpp`). DLSS-G takes no FP16 frames and presents on the game's own swap chain. So HSF makes that swap chain through Streamline as R10G10B10A2, and hands the game FP16 textures of its own in place of Streamline's back buffers. The game keeps drawing scRGB. At each Present, before Streamline takes the frame, HSF converts it into Streamline's back buffer (`hdr_out`: HDR10 when the display is in HDR mode, sRGB otherwise). The game still reads FP16 and scRGB back.
 
 **The game's own DLSS.** Streamline starts NGX before the game does, with only its plugin folders to look in. A game that runs DLSS through NGX itself (Unreal's DLSS plugin) would then find no DLSS and hide it. HSF gives Streamline the folder of the game's `nvngx_dlss.dll` as a second plugin folder: the copy the game has loaded, else the newest one under the game folder. The answer is saved in `HSF.ini` as `SlNgxPath`, so the search runs once per game (again only when the exe changes).
 
@@ -72,7 +77,9 @@ Start-up switches for games that crash while Streamline starts: `SlFactoryProxy`
 
 ### 3.3 NGX input (`ngx_input.cpp`, `ngx_input.h`)
 
-A game that calls DLSS through NGX, without Streamline, hands the driver's `_nvngx.dll` its motion, depth, jitter and reset every frame. HSF hooks that evaluate call, always calls through (so the game's own DLSS still runs), and copies the motion and depth on the game's command list just after it. These copies are what the bring-in route uses as "DLSS" motion. It was proven in Jusant.
+A game that calls DLSS through NGX, without Streamline, hands the driver's `_nvngx.dll` its motion, depth, jitter and reset every frame. HSF hooks that evaluate call, always calls through (so the game's own DLSS still runs), and copies the motion and depth on the game's command list just after it. These copies are what the bring-in route uses as "DLSS" motion, and the in-game route's second choice. It was proven in Jusant.
+
+Depth in D24 or D16 cannot be copied into R32_FLOAT (it is not in the same copy family). A small shader reads it as UNORM and writes R32_FLOAT instead, so these games get their real depth and not flow. `ngx_call.h` holds the one reading of a DLSS call (the part in use, scale, jitter, flags, reset) that the D3D12, D3D11 and Vulkan hooks share.
 
 ## 4. The D3D11 and DX9 routes
 
@@ -136,6 +143,7 @@ Like DX9, a Vulkan game gets a D3D11 device of HSF's own on the same GPU, picked
 - **Reflex**: the sleep runs at ReShade's `finish_present` (event 100, after `vkQueuePresentKHR`, registered by number), so it is counted in the frame. Older ReShade keeps it at present.
 - **Depth**: the depth module runs on HSF's D3D11 device on the bridged depth. Depth of another shape than the picture (an emulator's 16:9 picture on a wider window) is fitted into the picture's middle, and a square depth under a non-square picture is taken for a shadow map and replaced by a constant.
 - **Shut-down**: the bridge goes at `destroy_effect_runtime` (queue idle first). At `destroy_device` ReShade has already removed the device from its tables.
+- **The game's DLSS**: a mod that runs DLSS on a Vulkan game (Uplift in the Kyty emulator) hands NGX's Vulkan calls the game's vectors and depth. `ngx_vk.cpp` hooks those calls, always calls through, and copies the vectors and depth on the same command buffer into images of HSF's own. The bridge takes them to the helper in place of the flow while MOTION is not FLOW. From the first such frame, the motion goes over at the back buffer's size whatever its source, so the two can take turns.
 - **Fallback layer**: `vk_layer.cpp` (`VK_LAYER_HSF_bridge`) does the same as the hook from outside, for a game whose device the hook misses. It needs no registry entry: it is turned on per run through `VK_ADD_LAYER_PATH`.
 
 ### 4.5 HDR (`hdr_out.cpp`, `dlssg_core.cpp`)
@@ -143,7 +151,7 @@ Like DX9, a Vulkan game gets a D3D11 device of HSF's own on the same GPU, picked
 All HDR code follows RenoDX (MIT): its colour maths, its HDR display check and its colour space mapping.
 
 - **HDR10 games**: the add-on reads the colour space of the game's swap chain from the private data that RenoDX, ReShade and Special K write on it (`SKID_SwapChainColorSpace`), with ReShade's own value as the fallback and for Vulkan. It goes to the helper in `dlssg_link.h` (`color_space`), and the helper's swap chain takes the same colour space with `SetColorSpace1`, as RenoDX's `ChangeColorSpace` does. Without that, an HDR10 frame would be shown as SDR.
-- **FP16 (scRGB) games**: DLSS-G takes no FP16. The frame and the HUD-less image are turned into HDR10 (when the display is in HDR mode) or sRGB, into an R10G10B10A2 swap chain.
+- **FP16 (scRGB) games**: DLSS-G takes no FP16. The frame and the HUD-less image are turned into HDR10 (when the display is in HDR mode) or sRGB, into an R10G10B10A2 swap chain. The helper does this for D3D11, DX9 and Vulkan; on the D3D12 bring-in route `fp16_swap.cpp` does it on the game's own swap chain (3.2).
 
 ## 5. Motion and depth
 
@@ -206,7 +214,13 @@ DLSS-G paces its own generated frames.
 
 Without LaunchPad installed, it draws one point into a 1x1 texture.
 
-## 9. Logs
+## 9. Crash protection (`safe_try.cpp`, `safe_try.h`)
+
+A risky new way of doing something (a new kind of hook) is tried with the old way kept as the backup. Before a new way is first used in a launch, HSF writes a mark (`<step>_trying=<pid>`) in `HSF_safe_try.ini`, under the game's exe name. The mark goes once the game has run 30 s since, or at a normal unload or exit. A mark still there at the next launch, from a process that is gone, means that launch ended while the new way was in use: from then on that step is off for this game (`<step>_off=1`) and the old way is used. The steps are NGX MOTION (`T2_ngx_game_streamline`), PLUGIN HOOK (`H1_plugin`), LOAD WATCH (`H2_load_notify`) and HOOK DECODER (`H3_decoder`). The menu's CRASH PROTECTION lists them and can turn each back on. `SafeTry=0` turns the whole thing off, for the developer.
+
+A crash turns off every step still marked, not only the one that caused it.
+
+## 10. Logs
 
 Every part of HSF writes to one file, `HSF.log`, next to `HSF.ini` (`src/hsf_log.cpp`). Each line has the time and a tag for the part that wrote it:
 

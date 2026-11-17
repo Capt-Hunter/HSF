@@ -38,7 +38,7 @@ A ReShade add-on. Up to 6x. DirectX 9, 11, 12 and Vulkan. 32-bit and 64-bit. SDR
 
 ### The easy way: RHI
 
-HSF is being added to [RHI (ReShade HDR Installer)](https://github.com/RankFTW/RHI) by RankFTW. Once it is in, RHI installs, updates and removes HSF for you, along with ReShade and the flow source.
+HSF is in [RHI (ReShade HDR Installer)](https://github.com/RankFTW/RHI) by RankFTW. RHI installs, updates and removes HSF for you, along with ReShade and the flow source.
 
 ### By hand
 

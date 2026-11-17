@@ -8,7 +8,7 @@ HSF runs inside the game as a ReShade add-on. It takes each finished game frame,
 
 The motion comes from one of two places:
 
-- **The game's own DLSS data**, on DirectX 12 games that run DLSS. This is the motion the game engine computed itself, so it is the most exact. The menu calls it **DLSS**. In DirectX 11 games that a Luma mod adds DLSS to, HSF reads the motion and depth Luma hands to DLSS, and the menu calls it **LUMA**.
+- **The game's own DLSS data**, on DirectX 12 games that run DLSS. This is the motion the game engine computed itself, so it is the most exact. The menu calls it **DLSS**. In DirectX 11 games that a Luma mod adds DLSS to, HSF reads the motion and depth Luma hands to DLSS, and the menu calls it **LUMA**. On Vulkan, HSF reads the motion and depth that a DLSS mod (such as Uplift) hands to DLSS.
 - **Optical flow** from a ReShade effect, together with the game's depth buffer. This works in any game ReShade can run in. The menu calls it **FLOW**.
 
 HSF then sends the motion through its own clean-up (the compose pass), which uses depth to sharpen motion at object edges and steady it over time. It also checks for scene cuts, still pictures (menus, loading screens), the HUD and overlays, so these are not smeared by generation.
@@ -24,7 +24,7 @@ HSF then sends the motion through its own clean-up (the compose pass), which use
 | A flow source (only when the game gives no DLSS data) | **iMMERSE LaunchPad** by Marty (`MartysMods_LAUNCHPAD.fx` plus its `MartysMods` folder and textures), or **LumeniteFX Kernel** (`lumenite_Kernel.fx` **with its `include` folder**). You download these yourself. HSF never ships them. |
 | Windowed or borderless window | Needed on DirectX 9, DirectX 11 and Vulkan, where DLSS-G shows on a window of HSF's own over the game. HSF turns exclusive fullscreen into borderless on DirectX 9 by itself. |
 
-HDR works. A game in HDR10 (its own HDR, or a RenoDX mod set to HDR10) stays HDR10 through DLSS-G. A game that outputs FP16 (scRGB) is turned into HDR10 while Windows HDR is on. Nothing needs setting.
+HDR works. A game in HDR10 (its own HDR, or a RenoDX mod set to HDR10) stays HDR10 through DLSS-G. A game that outputs FP16 (scRGB), RenoDX on scRGB included, is turned into HDR10 while Windows HDR is on (SDR otherwise), on every API. DLSS-G itself takes no FP16 frames, so without this a DirectX 12 scRGB game showed real frames only. Nothing needs setting.
 
 Not supported in version 1: OpenGL, and any game with online anti-cheat. Never use HSF in an online anti-cheat game, as you risk your account.
 
@@ -34,11 +34,11 @@ HSF picks a route by itself. Knowing which one you are on helps when something g
 
 | Game | Route | Motion | Where DLSS-G runs |
 |---|---|---|---|
-| DirectX 12 with its own Streamline (it ships `sl.interposer.dll`, usually because it has DLSS-G) | **In-game route** (`InGameDlssg=1`) | DLSS when the game sends it, else flow | Inside the game, on the game's own Streamline |
+| DirectX 12 with its own Streamline (it ships `sl.interposer.dll`, usually because it has DLSS-G) | **In-game route** (`InGameDlssg=1`) | The game's own Streamline data first, then the game's DLSS through NGX, then flow | Inside the game, on the game's own Streamline |
 | DirectX 12 without Streamline | **Bring-in route** (`SlBringIn=1` or `2`) | DLSS through the game's NGX calls when it runs DLSS, else flow | Inside the game, on HSF's own Streamline 2.14 from `HSF_streamline` |
 | DirectX 11, 32-bit or 64-bit | **Helper route** | Flow and depth | `hsf-dlssg-helper64.exe`, on a child window over the game |
 | DirectX 9, 32-bit or 64-bit | **DX9 bridge**, then the helper route | Flow and depth | `hsf-dlssg-helper64.exe` |
-| Vulkan (games and emulators such as RPCS3) | **Vulkan bridge**, then the helper route | Flow and depth | `hsf-dlssg-helper64.exe`, on a click-through window over the game |
+| Vulkan (games and emulators such as RPCS3) | **Vulkan bridge**, then the helper route | The game's DLSS data when a mod runs DLSS, else flow and depth | `hsf-dlssg-helper64.exe`, on a click-through window over the game |
 
 The first time a DirectX 12 game runs with HSF, HSF writes the route into `HSF.ini` and the menu says **D3D12: HSF HAS SET UP ITS D3D12 ROUTE. RESTART THE GAME ONCE**. Restart the game. A DirectX 12 route must start before the game makes its device, so it cannot start in the same run.
 
@@ -46,7 +46,7 @@ Streamline 1.x games (for example Returnal, which shipped in 2023) are not suppo
 
 ## 4. Install
 
-HSF is being added to [RHI (ReShade HDR Installer)](https://github.com/RankFTW/RHI) by RankFTW. Once it is in, RHI installs HSF, ReShade and a flow source for you, and you can skip this section.
+HSF is in [RHI (ReShade HDR Installer)](https://github.com/RankFTW/RHI) by RankFTW. RHI installs HSF, ReShade and a flow source for you, and you can skip this section.
 
 To install by hand, download the latest `HSF-<version>.zip` from the [releases page](https://github.com/Capt-Hunter/HSF/releases). `<game>` below is the folder that holds the game's exe.
 
@@ -118,7 +118,7 @@ Generation keeps running while ReShade's menu is open, and the big number is liv
 |---|---|---|
 | FRAME GEN | on / off | Turns generation on or off (`Extra`). On DirectX 9, 11 and Vulkan, OFF keeps the helper running so ON is instant, and a red **CLOSE HELPER** box appears beside it: press it to stop the helper, so the game shows its own frame rate. With FRAME GEN on but no motion (no flow effect, no NVOF), the helper does not start, and a running one stops after 3 s without motion. |
 | MULTIPLIER | 2X 3X 4X 5X 6X | Real frame plus 1 to 5 generated (`DlssgFrames`). Choices above what DLSS-G says this card can do are crossed out. F7 cycles it in game. On RTX 20, 30 and 40 with MFG-Unlocker, a line shows the card and how far it is unlocked. On RTX 20 and 30, MFG-Unlocker runs its own frame generation and sets the multiplier itself: the row shows its number and points to its menu. |
-| MOTION | DirectX 12: AUTO / DLSS / FLOW. DirectX 11 with Luma: AUTO / LUMA / FLOW. Others: FLOW | AUTO uses the game's DLSS data (or Luma's) while it comes, else flow. DLSS is crossed out until the game has sent DLSS data in this run. The note on the right shows what is in use: GAME DATA, FLOW, or FLOW + DEPTH. With Luma, a line says when the game runs in DX12 (start it in DX11), when Luma sends no DLSS data yet (turn on DLSS in Luma's settings), and offers **SWITCH TO LUMA (DLSS)** while MOTION is on FLOW. |
+| MOTION | DirectX 12: AUTO / DLSS / FLOW. DirectX 11 with Luma: AUTO / LUMA / FLOW. Vulkan: AUTO / DLSS / FLOW once a mod's DLSS data has come. Others: FLOW | AUTO uses the game's DLSS data (or Luma's) while it comes, else flow. DLSS is crossed out until the game has sent DLSS data in this run. The note on the right shows what is in use: GAME DATA, FLOW, or FLOW + DEPTH. With Luma, a line says when the game runs in DX12 (start it in DX11), when Luma sends no DLSS data yet (turn on DLSS in Luma's settings), and offers **SWITCH TO LUMA (DLSS)** while MOTION is on FLOW. |
 | FLOW PAUSE | ON / OFF | DirectX 11 with Luma. ON (default, `FlowPause`) turns the flow effect off while Luma's DLSS data comes, and back on when it stops (cuts, menus). Other effects that read the same flow stop moving while it is off. |
 | FLOW FROM | AUTO / LAUNCHPAD / LUMENITE | Which effect's optical flow HSF reads (`Source`). AUTO takes the first one loaded, in that order. A source that is not loaded is crossed out. It switches on the next frame, in play. The note on the right shows the source in use, or NONE FOUND. |
 | LAUNCHPAD | AUTO / LOW / MEDIUM / HIGH, UNDO | Shown while LaunchPad gives the flow. Sets LaunchPad's Flow Quality (`LaunchPadQuality`). Higher quality costs more GPU time, and the cost grows with resolution. AUTO is the default: HSF tunes LaunchPad by itself, picks the quality from the game's resolution (HIGH up to 1920x1200, MEDIUM up to 3440x1440, LOW above, so LOW at 4K) and picks again if you change resolution. Every pick also moves LaunchPad to the top of the effect order and sets its depth settings to what HSF found (on DirectX 9 only from `HSF.ini`'s depth settings, because a LaunchPad recompile there can freeze a 32-bit game). Each tune recompiles LaunchPad, so AUTO tunes once per setting. It works only through ReShade, as you would by hand, and never changes Marty's file. A box is lit only while LaunchPad is set that way. Hover over a box to see what it does. UNDO puts back what was there before HSF's first tune, and stops AUTO. |
@@ -176,7 +176,7 @@ DLSS features are seen only on DirectX 12 and 11 games that call NVIDIA's DLSS d
 | WINDOW | WINDOWED / BORDERLESS. DirectX 9, 11 and 12. BORDERLESS makes a game in windowed mode borderless fullscreen while it runs; WINDOWED puts it back as it was (`ForceBorderless`). A DirectX 9 game that asked for fullscreen is made borderless fullscreen by itself. Some games crash when their window changes size (The Darkness II does). For those, use a tool like Borderless Gaming. |
 | GPU RESERVE | On by default (`GpuReserve`). Only when the card is at 95% load or more AND the game's real frames stutter, HSF lowers the FPS cap a small step at a time until the stutter stops, then slowly gives the frames back. It never goes above your own cap, and never takes the game under 30 fps. The line beside it says WATCHING FOR STUTTER, or ACTING with the cap in use. |
 | SETTINGS | RESET TO DEFAULTS. Click twice within 3 seconds. Route switches and hotkeys are kept. |
-| CRASH PROTECTION | Every switch that HSF turns OFF by itself after a crash, in one list. Only the rows that apply to this game are shown. SAFE TRY, on by default (`SafeTry`), covers the hook steps: NGX MOTION and PLUGIN HOOK (games with their own Streamline), LOAD WATCH (64-bit games that use Streamline) and HOOK DECODER (every game). DX9 9EX shows in DirectX 9 games and BORDERLESS when WINDOW is set to BORDERLESS; these two have their own crash rules. When the game crashes, HSF switches the row OFF for this game and marks it OFF AFTER A CRASH; you can switch any row back ON, or OFF yourself. Hover over a switch to see what it does and what changes when it is off. Changes apply after a game restart, except BORDERLESS, which applies at once. A step that is off is always shown, so it can be turned back on. |
+| CRASH PROTECTION | Every switch that HSF turns OFF by itself after a crash, in one list. Only the rows that apply to this game are shown. SAFE TRY, on by default (`SafeTry`), covers the hook steps: NGX MOTION and PLUGIN HOOK (games with their own Streamline), LOAD WATCH (64-bit games that use Streamline) and HOOK DECODER (every game). DX9 9EX shows in DirectX 9 games and BORDERLESS when WINDOW is set to BORDERLESS; these two have their own crash rules. When the game crashes, HSF switches the row OFF for this game and marks it OFF AFTER A CRASH (it keeps this in `HSF_safe_try.ini`); you can switch any row back ON, or OFF yourself. Hover over a switch to see what it does and what changes when it is off. Changes apply after a game restart, except BORDERLESS, which applies at once. A step that is off is always shown, so it can be turned back on. |
 
 ### 5.5 OVERLAY section
 
@@ -244,7 +244,8 @@ Frame generation and the overlay have no key until you set one, because the free
 | `HSF.ini` | next to the add-on | all settings. The menu writes it, and HSF reads it again when it changes. |
 | `HSF.log` | next to the add-on | HSF's one log, started fresh at each game start. Send this file when you report a problem. |
 | `HSF.previous.log` | next to the add-on | the log of the run before |
+| `HSF_safe_try.ini` | next to the add-on | which hook steps CRASH PROTECTION turned off, per game. HSF writes it itself. |
 
 ## 9. Uninstall
 
-Delete `hsf.addon64` or `hsf.addon32`, `HSF.ini`, `HSF.log`, `HSF.previous.log`, the `HSF_streamline` folder and `reshade-shaders\Shaders\HSF.fx`. HSF changes nothing else in the game folder. There is one exception: on DirectX 9 games that ran out of memory, the 4 GB flag may have been set by hand in the exe, and the original was kept next to it.
+Delete `hsf.addon64` or `hsf.addon32`, `HSF.ini`, `HSF_safe_try.ini`, `HSF.log`, `HSF.previous.log`, the `HSF_streamline` folder and `reshade-shaders\Shaders\HSF.fx`. HSF changes nothing else in the game folder. There is one exception: on DirectX 9 games that ran out of memory, the 4 GB flag may have been set by hand in the exe, and the original was kept next to it.

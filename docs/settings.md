@@ -110,11 +110,13 @@ Older files may still have `Presenter`, `Generated` and `Pacing`. They belonged 
 | `DepthKey` | `121` (F10) | key code | Live | D3D11, DX9 | Test: real depth, or a constant. It is not saved. |
 | `StackIgnore` | empty | file names, split by commas | Live | All | Files MOD STACK leaves out (`foo.dll, bar.asi`). Files made by Microsoft, NVIDIA, Intel or AMD, and NVIDIA's DLSS models from the driver, are always left out. |
 | `RecordKey` | `117` (F6) | key code | Live | D3D11 | Records 30 s of camera data (camera_record.h). |
+| `SafeTry` | `1` | 0, 1 | Start | All | CRASH PROTECTION's hook steps (safe_try.h). 0: nothing is marked or turned off after a crash, and steps turned off before are used again. For the developer, to try a step again and again. |
 
 ## 7. Other sections and files
 
 - `[LaunchPadUndo]` `Saved`, `Quality`, `Reversed`, `UpsideDown`: HSF writes these. They hold what LaunchPad had before HSF's first tune from the LAUNCHPAD row, so UNDO can put it back.
 - `HSF_profiles\<exe>.ini`, section `[Camera]`, key `Matrix`: the camera matrix HSF locked in this game, so the next run starts with it (D3D11).
+- `HSF_safe_try.ini`, one section per game exe: `<step>_trying=<pid>` while a launch tries a hook step (cleared after ~30 s or a clean exit), and `<step>_off=1` (turned off after a crash) or `=2` (turned off in the menu). HSF writes it; the menu's CRASH PROTECTION reads and changes it.
 - `ReShade.ini [DEPTH] DepthCopyBeforeClears`: ReShade's own setting. HSF offers a button for it in ALL DETAILS when depth reads flat for a long time. It needs a game restart.
 
 ## 8. Example files
