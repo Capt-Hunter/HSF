@@ -47,6 +47,15 @@ SRWLOCK g_lock = SRWLOCK_INIT;
 std::atomic<bool> g_want{false};    // the swap chain DXGI made is R10G10B10A2 in place of the game's FP16
 std::atomic<bool> g_active{false};  // and HSF converts it
 std::atomic<void*> g_game{nullptr}, g_made{nullptr};
+// DXGI's own swap chain under Streamline's: the one DLSS-G presents on and Windows shows. Not held.
+std::atomic<void*> g_native{nullptr};
+// The colour space goes on again at the next Present (after a start or a resize) and then every SPACE_EVERY presents. Rise of the Tomb Raider
+// with RenoDX showed HSF's HDR10 frames as SDR although the set at the start returned S_OK: nothing in the game sets a colour space later, so
+// that one set had to hold through every layer. Setting it again at Present, also straight on DXGI's swap chain, does not depend on that.
+std::atomic<bool> g_space_due{false};
+constexpr UINT64 SPACE_EVERY = 300;
+UINT64 g_presents = 0;
+HRESULT g_space_logged[2] = {S_FALSE, S_FALSE};  // what the last logged push got from Streamline's swap chain and DXGI's
 ComPtr<ID3D12Device> g_game_device;  // as the game sees it (ReShade's, under ReShade): the FP16 textures are made through it, as if the game had made them
 ComPtr<ID3D12Device> g_device;       // under any wrapper: HSF's own work
 ComPtr<ID3D12CommandQueue> g_queue;  // the game's queue under any wrapper, so the conversion lands after the game's last draw
@@ -142,6 +151,22 @@ void ApplySpace() {
   if (t != nullptr && t->set_space != nullptr) hr = t->set_space(static_cast<IDXGISwapChain3*>(game), g_space);
   else hr = native->SetColorSpace1(g_space);
   Line("FP16 (scRGB) swap chain: DLSS-G gets %s frames (display %s), colour space set: 0x%08lx", g_pq ? "HDR10" : "sRGB", g_pq ? "in HDR mode" : "in SDR mode", hr);
+  g_space_due = true;
+}
+
+// At Present: HSF's colour space on Streamline's swap chain (its hook passes it down) and straight on DXGI's. Logged the first time after a start
+// or a resize, and whenever a result changes.
+void PushSpace(bool due) {
+  HRESULT made_hr = E_NOINTERFACE, native_hr = E_NOINTERFACE;
+  if (ComPtr<IDXGISwapChain3> made = Made()) made_hr = made->SetColorSpace1(g_space);
+  ComPtr<IDXGISwapChain3> native;
+  IUnknown* const raw = static_cast<IUnknown*>(g_native.load());
+  if (raw != nullptr && raw != g_made.load() && SUCCEEDED(raw->QueryInterface(IID_PPV_ARGS(&native)))) native_hr = native->SetColorSpace1(g_space);
+  if (!due && made_hr == g_space_logged[0] && native_hr == g_space_logged[1]) return;
+  g_space_logged[0] = made_hr;
+  g_space_logged[1] = native_hr;
+  Line("FP16: colour space %u set again at Present %llu: on Streamline's swap chain 0x%08lx, on DXGI's under it 0x%08lx%s", static_cast<unsigned>(g_space),
+       static_cast<unsigned long long>(g_presents), made_hr, native_hr, native_hr == E_NOINTERFACE ? " (not known: no separate one)" : "");
 }
 
 // Under g_lock. The game's FP16 back buffers, at the real ones' size and count.
@@ -389,6 +414,8 @@ void Start(IUnknown* game, IUnknown* made, IUnknown* queue, IUnknown* real_queue
 
 void BeforePresent(IUnknown* game) {
   if (!g_active.load() || game != g_game.load()) return;
+  const bool due = g_space_due.exchange(false);
+  if (due || ++g_presents % SPACE_EVERY == 0) PushSpace(due);
   AcquireSRWLockExclusive(&g_lock);
   ComPtr<IDXGISwapChain3> made = Made();
   const UINT index = made ? made->GetCurrentBackBufferIndex() : UINT_MAX;
@@ -417,6 +444,8 @@ void BeforePresent(IUnknown* game) {
   }
   ReleaseSRWLockExclusive(&g_lock);
 }
+
+void SetNative(IUnknown* native) { g_native = native; }
 
 bool Active() { return g_active.load(); }
 

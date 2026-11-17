@@ -23,6 +23,9 @@ void Start(IUnknown* game, IUnknown* made, IUnknown* queue, IUnknown* real_queue
 // The game presents `game`: the FP16 frame goes into the real back buffer first.
 void BeforePresent(IUnknown* game);
 
+// DXGI's own swap chain, made under Streamline's: HSF's colour space goes on it straight as well. Not held.
+void SetNative(IUnknown* native);
+
 // HSF is converting this swap chain's frames.
 bool Active();
 

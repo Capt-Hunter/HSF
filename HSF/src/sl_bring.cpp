@@ -1054,7 +1054,10 @@ HRESULT NativeCreate(IDXGIFactory* factory, IUnknown* queue, DXGI_SWAP_CHAIN_DES
 // Streamline's call down to DXGI: the swap chain it makes is the one DLSS-G presents on.
 template <typename T>
 HRESULT KeepNative(HRESULT hr, T** swap_chain) {
-  if (SUCCEEDED(hr) && swap_chain != nullptr && *swap_chain != nullptr) g_native_swap_chain = *swap_chain;
+  if (SUCCEEDED(hr) && swap_chain != nullptr && *swap_chain != nullptr) {
+    g_native_swap_chain = *swap_chain;
+    hsf::fp16swap::SetNative(*swap_chain);
+  }
   return hr;
 }
 
