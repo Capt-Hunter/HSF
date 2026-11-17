@@ -445,6 +445,7 @@ std::atomic<uint32_t> g_game_vectors_streak{0};
 std::atomic<ULONGLONG> g_last_game_constants{0};
 // The game's own slDLSSGSetOptions asks for frame generation. While it does not, the game's Reflex frame limit is meant for its real frames.
 std::atomic<bool> g_game_fg_on{false};
+std::atomic<bool> g_game_dlss_on{false};  // the game's last slDLSSSetOptions had DLSS super resolution on (any mode but off)
 // The newest frame token each thread asked for. Unreal asks on its game thread for the frame it simulates and on its render thread for the frame it renders, one apart
 // (PBZ: 1143 render, 1144 game, 1143 render again). With no evaluates and no tags of the game's, the frame being presented is the render thread's, the lowest recent one.
 struct TokenAsked {
@@ -948,6 +949,7 @@ sl::Result HookDlssOptions(const sl::ViewportHandle& viewport, const sl::DLSSOpt
         g_output_width.store(o.outputWidth, std::memory_order_relaxed);
         g_output_height.store(o.outputHeight, std::memory_order_relaxed);
       }
+      g_game_dlss_on.store(o.mode != sl::DLSSMode::eOff, std::memory_order_relaxed);
       if ((o.mode != g_last_dlss_mode || g_dlss_lines < 3) && g_dlss_lines < 60) {
         ++g_dlss_lines;
         g_last_dlss_mode = o.mode;
@@ -1689,6 +1691,7 @@ void Start(const wchar_t* log_path, bool drive, bool dynamic_resolution_known) {
   g_last_frame.store(nullptr);
   g_last_game_constants.store(0);
   g_game_fg_on.store(false);
+  g_game_dlss_on.store(false);
   for (TokenAsked& t : g_tokens_asked) t = {};
   g_token_pick_highest.store(false);
   g_own_constants_last.store(0);
@@ -1861,6 +1864,7 @@ int ListInterposers(Interposer* out, int max) {
     GetModuleFileNameW(all[i], out[i].path, MAX_PATH);
     out[i].hsf_own = IsHsfStreamline(all[i]);
     out[i].in_use = all[i] == g_interposer;
+    ModuleVersion(all[i], out[i].version);
   }
   return count;
 }
@@ -2253,6 +2257,19 @@ void ClearHudless() {
 void LogLine(const char* text) {
   Lock lock;
   Line("%s", text);
+}
+
+uint32_t GameDlss() {
+  uint32_t bits = 0;
+  if (g_game_dlss_on.load(std::memory_order_relaxed)) bits |= GAME_DLSS_SR;
+  if (g_game_fg_on.load(std::memory_order_relaxed)) bits |= GAME_DLSS_FG;
+  Lock lock;
+  for (const FeatureSeen& f : g_features) {
+    if (!f.used || f.count == 0) continue;
+    if (f.feature == sl::kFeatureDLSS) bits |= GAME_DLSS_SR;
+    if (f.feature == sl::kFeatureDLSS_RR) bits |= GAME_DLSS_RR;
+  }
+  return bits;
 }
 
 Stats GetStats() {

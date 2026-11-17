@@ -95,7 +95,7 @@ Generation keeps running while ReShade's menu is open, and the big number is liv
 
 ### 5.1 Header and readout
 
-- **HSF // FRAME GEN**, with your GPU and the API on the right.
+- **HSF // FRAME GEN**, with your GPU and the API on the right. Left of the GPU, five small squares are colour presets (see 5.7): click one and the menu and the overlay fade to it.
 - **The big number**: frames shown per second (FPS OUT). Under it: the real (BASE) frame rate and its frame time in ms.
 - **The tag**: GENERATING (green), NOT GENERATING (amber), PROBLEM (red) or OFF.
 
@@ -132,10 +132,26 @@ The verdicts are:
 - **WAITING** (amber): something is still missing, and the reason is shown under it (for example no motion found yet).
 - **PROBLEM** (red): something failed, and the reason is shown under it.
 - **OFF**: FRAME GEN is off.
+- **CONFLICT** (red): a mod known to break HSF's frame generation is loaded (see MOD STACK below). It names the mod. HSF keeps running; remove the mod from the game folder to fix it.
 
 The **GPU guard** turns FRAME GEN off and closes the helper by itself when DLSS-G's GPU waits keep timing out: the card cannot keep up, and the driver would reset next. The menu says so in red. Turn FRAME GEN on to try again. The guard's OFF is not saved to `HSF.ini`.
 
 Under it, a small line graph shows the recent frame times.
+
+**MOD STACK**, under ADVANCED and closed until you click it, shows what each tool in the game is doing, as far as HSF can see. It only shows things; it changes nothing. Each row has the tool's name on the left and a dot with its status on the right: green working, amber a warning or not tested, red a problem, grey idle. Short lines under a row give the details; hover over one to see the file's full path.
+
+| Row | What it shows |
+|---|---|
+| HSF | Generating (and at what multiplier), waiting or a problem, with the reason. Under it, the route and where motion comes from. |
+| RENODX | Each RenoDX add-on loaded and its version. For RenoDX DLSS, where it hooks DLSS (after upscaling or at present). |
+| UPLIFT | ON or OFF (its Enabled setting in `ReShade.ini`) and its version, and its PresentWithFrameGen setting. |
+| MFG-UNLOCKER | Whether it runs and found DLSS-G, and its multiplier. |
+| Other mods | Mods HSF finds by what they are, not by their file name: a Windows DLL name (such as `dxgi.dll` or `version.dll`) loaded from the game's folder, an ASI plugin, a DLL that answers the game's DLSS or Streamline calls, or a mod HSF knows by its version info. Each shows in red when it is known to break HSF (OptiScaler), amber when it is not tested with HSF (Special K, unknown mods), and green when it works with HSF. A red one also turns the status box to CONFLICT. Files made by Microsoft, NVIDIA, Intel or AMD (such as `dbghelp.dll` or the driver's DLSS models) are never listed, and `StackIgnore` in `HSF.ini` leaves out more. |
+| GAME | The DLSS the game makes (super resolution, frame generation, ray reconstruction) and on which API (D3D12, D3D11 or Vulkan), and each Streamline copy loaded with its version. DLSS made by a mod (Luma, Uplift, RenoDX) shows under that mod's row instead, and DLSS frame generation from HSF's own Streamline under HSF. DX9 and 32-bit games have no DLSS, and the row says so. A copy no one uses next to the game's own shows in amber: it is another mod's, or a leftover file. |
+| OTHER ADD-ONS | Any other ReShade add-on loaded. |
+| NOT LOADED | RenoDX, Uplift and MFG-Unlocker, when they are not there. |
+
+DLSS features are seen only on DirectX 12 and 11 games that call NVIDIA's DLSS directly (NGX), and Streamline copies only in 64-bit games. Each mod found is written to the log once.
 
 ### 5.4 ADVANCED
 
@@ -143,17 +159,34 @@ Under it, a small line graph shows the recent frame times.
 |---|---|
 | PROTECT GAME HUD | Keeps the game's HUD out of generation, so it does not smear. Which setting it switches depends on the route: `GameHud` on DirectX 11, `DlssgHud` on the in-game route, `FrameChecks` on the bring-in route. |
 | KEEP OVERLAYS OUT | DirectX 9, 11 and Vulkan. DLSS-G gets the frame from before RTSS, Steam, Discord and ReShade drew their overlays (`KeepOverlaysOut`). |
-| HOTKEYS | Shows the keys in use. |
-| DX9 GPU ROUTE | DirectX 9 only. ON (D3D9EX) means frames reach DLSS-G on the GPU, at almost no cost. OFF means CPU copies. If a game crashed on 9Ex, the button OFF: GAME CRASHED WITH IT // TRY AGAIN lets the next launch try again. |
+| DX9 GPU ROUTE | DirectX 9 only. Shows this launch: ON (D3D9EX) means frames reach DLSS-G on the GPU, at almost no cost. OFF means CPU copies. The switch is DX9 9EX in CRASH PROTECTION. |
 | WINDOW | WINDOWED / BORDERLESS. DirectX 9, 11 and 12. BORDERLESS makes a game in windowed mode borderless fullscreen while it runs; WINDOWED puts it back as it was (`ForceBorderless`). A DirectX 9 game that asked for fullscreen is made borderless fullscreen by itself. Some games crash when their window changes size (The Darkness II does). For those, use a tool like Borderless Gaming. |
 | GPU RESERVE | On by default (`GpuReserve`). Only when the card is at 95% load or more AND the game's real frames stutter, HSF lowers the FPS cap a small step at a time until the stutter stops, then slowly gives the frames back. It never goes above your own cap, and never takes the game under 30 fps. The line beside it says WATCHING FOR STUTTER, or ACTING with the cap in use. |
 | SETTINGS | RESET TO DEFAULTS. Click twice within 3 seconds. Route switches and hotkeys are kept. |
+| CRASH PROTECTION | Every switch that HSF turns OFF by itself after a crash, in one list. Only the rows that apply to this game are shown. SAFE TRY, on by default (`SafeTry`), covers the hook steps: NGX MOTION and PLUGIN HOOK (games with their own Streamline), LOAD WATCH (64-bit games that use Streamline) and HOOK DECODER (every game). DX9 9EX shows in DirectX 9 games and BORDERLESS when WINDOW is set to BORDERLESS; these two have their own crash rules. When the game crashes, HSF switches the row OFF for this game and marks it OFF AFTER A CRASH; you can switch any row back ON, or OFF yourself. Hover over a switch to see what it does and what changes when it is off. Changes apply after a game restart, except BORDERLESS, which applies at once. A step that is off is always shown, so it can be turned back on. |
 
 ### 5.5 OVERLAY section
 
 Settings for the on-screen overlay: OFF / SIMPLE / ADVANCED (the same setting as the OVERLAY row), SIZE 50 to 200 %, OPACITY 0 to 100 % (the panel behind the text), CORNER, X and Y OFFSET in pixels at 1440p (scaled to your resolution), and RESET THIS OVERLAY. Simple and advanced each keep their own look.
 
-### 5.6 DEBUG, for testers
+### 5.6 KEYBINDS
+
+The in-game hotkeys. Click a key, then press the new one: ESC keeps the old key, BACKSPACE sets none. A key another HSF hotkey had is taken from it. The keys are saved to `HSF.ini`, and work while ReShade's menu is closed.
+
+| Setting | What it does |
+|---|---|
+| FRAME GEN ON / OFF | Turns frame generation on and off (`FrameGenKey`). None by default. |
+| MULTIPLIER | Cycles the multiplier, 2x up to what this card can do (`MfgKey`, F7). With MFG-Unlocker on RTX 30 or 20, the unlocker sets the multiplier instead. |
+| OVERLAY ON / OFF | Turns the on-screen overlay off, and back to SIMPLE or ADVANCED, whichever it was (`OsdKey`). None by default. |
+| DEBUG VIEW | DirectX 9, 11 and Vulkan: cycles the debug view (`ViewKey`, F8). |
+
+A key set here shows beside its row at the top of the menu, as F7 does beside MULTIPLIER.
+
+### 5.7 COLOURS
+
+The menu's and the overlay's colours. PANEL is the panel behind the text (its border and lines follow it), ACCENT the corner mark. Click the square to pick a colour; RESET puts the default back. PRESET (DEFAULT, CRIMSON, NAVY, VIOLET, MONO) sets both at once, as the swatches in the header do; none is lit while the colours are your own. A change fades in over 0.3 s. Saved to `HSF.ini` (`UiPanel`, `UiAccent`). Green, red and amber stay as they are, because they mean good, error and warning.
+
+### 5.8 DEBUG, for testers
 
 | Setting | What it does |
 |---|---|
@@ -176,18 +209,20 @@ Settings for the on-screen overlay: OFF / SIMPLE / ADVANCED (the same setting as
 
 ## 7. Hotkeys
 
-Each key can be changed or turned off in `HSF.ini` (a virtual-key code, 0 = none).
+Frame generation, the multiplier, the overlay and the debug view are set in the menu's KEYBINDS section. Every key can also be changed or turned off in `HSF.ini` (a virtual-key code, 0 = none).
 
 | Key | Does | HSF.ini |
 |---|---|---|
+| none | turns frame generation on and off | `FrameGenKey=0` |
 | F7 | cycles the multiplier | `MfgKey=118` |
+| none | turns the on-screen overlay off and on | `OsdKey=0` |
 | F8 | cycles the debug view | `ViewKey=119` |
 | F9 | test: cycles DLSS-G's motion input through each source, then zero motion | `InputKey=120` |
 | F10 | test: real depth, or a constant | `DepthKey=121` |
 | F11 | in-game route: HSF's rebuilt camera matrices, or the game's | `DlssgCameraKey=122` |
 | F6 | records 30 s of camera data | `RecordKey=117` |
 
-No hotkey turns frame generation on or off, because F5 is quicksave in many games.
+Frame generation and the overlay have no key until you set one, because the free keys (F5 is quicksave in many games) differ from game to game.
 
 ## 8. Where things are written
 

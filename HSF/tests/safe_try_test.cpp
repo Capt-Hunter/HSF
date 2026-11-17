@@ -46,6 +46,7 @@ int main() {
   // Launch 3: B stays off, C's mark went with the normal exit.
   st::InitForTest(file.c_str(), nullptr, GetCurrentProcessId(), 1000);
   Check(!st::Allowed("B"), "launch 3: B stays off");
+  Check(st::State("B") == st::OFF_AFTER_CRASH, "switch: B shows OFF after a crash");
   Check(st::Allowed("C"), "launch 3: C allowed after a normal exit");
 
   // A mark from a process still running (a parent that started this one) is not a crash.
@@ -63,7 +64,21 @@ int main() {
   Check(st::ListOff(names, 8) == 0, "list: empty after B is turned back on");
   st::InitForTest(file.c_str(), nullptr, GetCurrentProcessId(), 1000);
   Check(st::Allowed("B"), "next launch: B allowed again");
-  Check(std::strcmp(st::Describe("T2_ngx_game_streamline"), "NGX MOTION (GAME'S STREAMLINE)") == 0 && std::strcmp(st::Describe("Z"), "Z") == 0, "plain names");
+  Check(std::strcmp(st::Describe("T2_ngx_game_streamline"), "NGX MOTION") == 0 && std::strcmp(st::Describe("Z"), "Z") == 0, "plain names");
+  const st::Step* steps = nullptr;
+  const int step_count = st::Steps(&steps);
+  bool steps_ok = step_count == 4;
+  for (int i = 0; i < step_count; ++i) steps_ok = steps_ok && steps[i].tip != nullptr && steps[i].tip[0] != 0;
+  Check(steps_ok, "every step has a name and an explanation");
+
+  // The panel's ON / OFF switch: a crash shows as OFF_AFTER_CRASH (B above), the player's OFF as OFF_BY_PLAYER, and either keeps the way off.
+  Check(st::State("B") == st::ON, "switch: B on after TURN BACK ON");
+  st::TurnOff("G");
+  Check(st::State("G") == st::OFF_BY_PLAYER, "switch: G off by the player");
+  st::InitForTest(file.c_str(), nullptr, GetCurrentProcessId(), 1000);
+  Check(!st::Allowed("G"), "next launch: G stays off");
+  st::TurnBackOn("G");
+  Check(st::State("G") == st::ON, "switch: G back on");
 
   // SafeTry=0: a way left marked by a dead launch is not turned off, and nothing is marked.
   st::InitForTest(file.c_str(), nullptr, GONE_PID, 1000);

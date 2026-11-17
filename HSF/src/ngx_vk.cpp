@@ -6,6 +6,8 @@
 
 #include <vulkan/vulkan.h>
 
+#include <intrin.h>
+
 #include <cstdarg>
 #include <cstdio>
 #include <vector>
@@ -391,8 +393,9 @@ void Publish(VkCommandBuffer cmd, const FrameVk& f) {
   g_pending.push_back({cmd, f});
 }
 
-void NoteCreate(const Parameter* parameters, int feature, int result) {
+void NoteCreate(const Parameter* parameters, int feature, int result, void* caller) {
   if (result != NGX_SUCCESS) return;
+  NoteMade(feature, MADE_VULKAN, caller);  // for the menu's MOD STACK
   Lock lock;
   if (call::ReadCreate(parameters, feature, g_created))
     Line("Vulkan DLSS: made, feature %d, flags 0x%x, render %ux%u, output %ux%u", feature, g_created.flags, g_created.width, g_created.height, g_created.out_width,
@@ -401,12 +404,12 @@ void NoteCreate(const Parameter* parameters, int feature, int result) {
 
 int __cdecl HookCreate(VkCommandBuffer cmd, int feature, const Parameter* parameters, void** handle) {
   const int result = g_real_create(cmd, feature, parameters, handle);
-  NoteCreate(parameters, feature, result);
+  NoteCreate(parameters, feature, result, _ReturnAddress());
   return result;
 }
 int __cdecl HookCreate1(VkDevice device, VkCommandBuffer cmd, int feature, const Parameter* parameters, void** handle) {
   const int result = g_real_create1(device, cmd, feature, parameters, handle);
-  NoteCreate(parameters, feature, result);
+  NoteCreate(parameters, feature, result, _ReturnAddress());
   return result;
 }
 // The copies are recorded BEFORE the call goes on, for the same reason as on Direct3D 12 (ngx_input.cpp HookEvaluate): another mod's DLSS under

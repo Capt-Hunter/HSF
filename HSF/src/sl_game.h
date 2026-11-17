@@ -29,6 +29,7 @@ struct Interposer {
   wchar_t path[260];
   bool hsf_own;   // HSF's own, from HSF_streamline
   bool in_use;    // the one HSF has hooked
+  uint32_t version[4];  // the file's version, all 0 when it has none
 };
 int ListInterposers(Interposer* out, int max);
 void PickInterposer(void* module);
@@ -112,6 +113,10 @@ struct Stats {
   uint32_t hooks_installed;  // of HSF's hooks on the game's Streamline
 };
 Stats GetStats();
+// The DLSS the game asks of its own Streamline, as seen by the hooks: super resolution (slDLSSSetOptions on, or slEvaluateFeature for DLSS), its own
+// frame generation (slDLSSGSetOptions on), ray reconstruction (slEvaluateFeature for DLSS-RR). For the menu's MOD STACK. 0 until the game asks.
+constexpr uint32_t GAME_DLSS_SR = 1, GAME_DLSS_FG = 2, GAME_DLSS_RR = 4;
+uint32_t GameDlss();
 // Real frames the game has made so far (new frame tokens). No lock: cheap enough for every present. On this route ReShade also sees DLSS-G's generated frames,
 // so this, not ReShade's present count, is the real frame count.
 uint64_t GameFrames();
