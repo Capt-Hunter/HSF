@@ -5443,6 +5443,61 @@ const OlderCardMod& OlderCardModNow() {
   return mod;
 }
 
+// A game whose own Streamline is too old for MFG: before 2.7.2 DLSS-G takes 2x only, so 3X-6X are crossed out. The menu says why and where the game's copy is,
+// so the player can update it (docs/user-guide.md, "A game's Streamline is too old for MFG"). HSF changes no game files. Shown only on the Direct3D 12 routes,
+// only when this card can do MFG (RTX 50, or RTX 40 with MFG-Unlocker), and only once DLSS-G has said 2x only. Read once a second; logged once.
+const char* GpuName();
+
+struct OldStreamline {
+  bool show = false;
+  uint32_t version[3] = {};
+  char text[96] = "";       // the line under the multiplier
+  char tip[640] = "";       // the crossed-out boxes' tooltip
+};
+
+const OldStreamline& OldStreamlineNow(uint32_t max_frames, const OlderCardMod& older) {
+  static OldStreamline old;
+  static ULONGLONG last_read = 0;
+  const ULONGLONG now_ms = GetTickCount64();
+  if (last_read != 0 && now_ms - last_read < 1000) return old;
+  last_read = now_ms;
+  old = OldStreamline{};
+#ifdef HSF_SL_GAME
+  const char* const gpu = GpuName();
+  const bool card_mfg = std::strstr(gpu, "RTX 50") != nullptr || std::strstr(gpu, "BLACKWELL") != nullptr || (older.live && older.family == 1 && older.safe_max > 2);
+  hsf::slgame::Interposer copy;
+  if (max_frames != 1 || !card_mfg || !D3d12Run() || !hsf::slgame::GameCopy(&copy)) return old;
+  const uint32_t limit = hsf::slgame::MultiplierLimit(copy.version);
+  if (limit == 0 || limit > 2) return old;
+  old.show = true;
+  for (int i = 0; i < 3; ++i) old.version[i] = copy.version[i];
+  wchar_t folder[260];
+  wcsncpy_s(folder, copy.path, _TRUNCATE);
+  if (wchar_t* slash = wcsrchr(folder, L'\\')) *slash = L'\0';
+  std::snprintf(old.text, sizeof(old.text), "GAME'S STREAMLINE %u.%u.%u IS TOO OLD FOR MFG // 2X ONLY", copy.version[0], copy.version[1], copy.version[2]);
+  std::snprintf(old.tip, sizeof(old.tip),
+                "This game ships Streamline %u.%u.%u. DLSS-G only does 2x through it.\n"
+                "MFG needs Streamline 2.7.2 or newer (up to 4x), and 2.11 or newer for 5x and 6x.\n\n"
+                "To get 3x-6x, update the game's Streamline files in:\n%ls\n\n"
+                "HSF's own copy is in its HSF_streamline folder.\n"
+                "How to: HSF's user guide, \"A game's Streamline is too old for MFG\".\n"
+                "Back up the folder first.",
+                copy.version[0], copy.version[1], copy.version[2], folder);
+  static bool s_logged = false;
+  if (!s_logged) {
+    s_logged = true;
+    char line[512];
+    std::snprintf(line, sizeof(line), "menu: the game's Streamline %u.%u.%u is too old for MFG (needs 2.7.2 or newer), so DLSS-G does 2x only; the game's copy is in %ls",
+                  copy.version[0], copy.version[1], copy.version[2], folder);
+    Log(line);
+  }
+#else
+  (void)max_frames;
+  (void)older;
+#endif
+  return old;
+}
+
 void DrawOlderCardMod() {
   const OlderCardMod& mod = OlderCardModNow();
   if (!mod.live) return;
@@ -7202,9 +7257,19 @@ void DrawPanel(effect_runtime* runtime) {
     if (now.max_frames != 0)
       for (int i = 0; i < 5; ++i)
         if (static_cast<uint32_t>(i) + 1 > now.max_frames) above |= 1u << i;
-    if (ui::Choice("##mult", MODES, 5, &mode, above)) {
+    // The game's own Streamline too old for MFG: the crossed-out boxes say why.
+    const OldStreamline& old_sl = OldStreamlineNow(now.max_frames, older);
+    const char* tips[5] = {};
+    for (int i = 0; old_sl.show && i < 5; ++i)
+      if (above & (1u << i)) tips[i] = old_sl.tip;
+    if (ui::Choice("##mult", MODES, 5, &mode, above, old_sl.show ? tips : nullptr)) {
       g_dlssg_frames = static_cast<uint32_t>(mode) + 1;
       changed = true;
+    }
+    if (old_sl.show) {
+      ImGui::SetCursorScreenPos(ImVec2(ui::ControlX(), ImGui::GetCursorScreenPos().y));
+      ui::Caps(old_sl.text, c::AMBER, 0.75f);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", old_sl.tip);
     }
   }
   if (g_mfg_key != 0 && !mod_sets_multiplier) {

@@ -32,6 +32,13 @@ struct Interposer {
   uint32_t version[4];  // the file's version, all 0 when it has none
 };
 int ListInterposers(Interposer* out, int max);
+// The highest multiplier (2 = 2x) DLSS-G can be asked for through a Streamline of this file version, from NVIDIA's sl_dlss_g.h for each release: before
+// 2.7.2 numFramesToGenerate "Must be 1" (2x only); 2.7.2 (January 2025, DLSS 4) brought MFG up to 4x; 2.11.1 (April 2026) is the first to name 6x.
+// 0 when the version is not known (all 0).
+uint32_t MultiplierLimit(const uint32_t version[4]);
+// The game's own sl.interposer.dll copy, for the menu: the copy HSF hooks when it is the game's, else the oldest loaded copy that is not HSF's
+// (on HSF's own Streamline route the game's copy can still be loaded and still limit DLSS-G). False when no such copy is loaded.
+bool GameCopy(Interposer* out);
 void PickInterposer(void* module);
 // False while a loaded copy of the game's sl.interposer.dll has not yet been followed for a few seconds with no frame from the game (with more than one copy
 // loaded, HSF moves from a copy without frames to the next by itself). True once any copy got frames.

@@ -1869,6 +1869,36 @@ int ListInterposers(Interposer* out, int max) {
   return count;
 }
 
+uint32_t MultiplierLimit(const uint32_t version[4]) {
+  if (version[0] == 0 && version[1] == 0 && version[2] == 0 && version[3] == 0) return 0;
+  const auto below = [&](uint32_t major, uint32_t minor, uint32_t patch) {
+    if (version[0] != major) return version[0] < major;
+    if (version[1] != minor) return version[1] < minor;
+    return version[2] < patch;
+  };
+  if (below(2, 7, 2)) return 2;
+  if (below(2, 11, 1)) return 4;
+  return 6;
+}
+
+bool GameCopy(Interposer* out) {
+  Interposer copies[4];
+  const int count = ListInterposers(copies, 4);
+  int pick = -1;
+  for (int i = 0; i < count; ++i)
+    if (copies[i].in_use && !copies[i].hsf_own) pick = i;
+  for (int i = 0; pick < 0 && i < count; ++i) {
+    if (copies[i].hsf_own) continue;
+    bool oldest = true;
+    for (int j = 0; j < count; ++j)
+      if (j != i && !copies[j].hsf_own && std::lexicographical_compare(copies[j].version, copies[j].version + 4, copies[i].version, copies[i].version + 4)) oldest = false;
+    if (oldest) pick = i;
+  }
+  if (pick < 0) return false;
+  *out = copies[pick];
+  return true;
+}
+
 namespace {
 
 // Under g_lock, from Poll: one line for each sl.interposer.dll copy the first time it is seen loaded, with its version and folder, so a log shows at once

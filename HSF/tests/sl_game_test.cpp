@@ -622,6 +622,16 @@ int wmain(int argc, wchar_t** argv) {
   Check(set_loaded != nullptr, "slSetFeatureLoaded found");
   TestDrive(set_loaded, evaluate, device.Get(), texture.Get(), small_texture.Get(), argv[2]);
 
+  // The menu's old-Streamline line: the multiplier each Streamline version allows (sl_dlss_g.h for each release).
+  {
+    const uint32_t v200[4] = {2, 0, 0, 0}, v2415[4] = {2, 4, 15, 0}, v272[4] = {2, 7, 2, 0}, v2103[4] = {2, 10, 3, 0}, v2111[4] = {2, 11, 1, 0},
+                   v21416[4] = {2, 14, 16, 0}, v300[4] = {3, 0, 0, 0}, none[4] = {0, 0, 0, 0};
+    namespace sg = hsf::slgame;
+    Check(sg::MultiplierLimit(v200) == 2 && sg::MultiplierLimit(v2415) == 2, "old Streamline: 2.0.0 and 2.4.15 allow 2x only");
+    Check(sg::MultiplierLimit(v272) == 4 && sg::MultiplierLimit(v2103) == 4, "old Streamline: 2.7.2 to 2.10 allow up to 4x");
+    Check(sg::MultiplierLimit(v2111) == 6 && sg::MultiplierLimit(v21416) == 6 && sg::MultiplierLimit(v300) == 6, "old Streamline: 2.11.1 and newer allow 6x");
+    Check(sg::MultiplierLimit(none) == 0, "old Streamline: no version means not known");
+  }
   std::printf(g_failures == 0 ? "all passed\n" : "%d FAILED\n", g_failures);
   return g_failures == 0 ? 0 : 1;
 }
