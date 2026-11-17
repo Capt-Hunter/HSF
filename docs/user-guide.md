@@ -143,7 +143,6 @@ Under it, a small line graph shows the recent frame times.
 |---|---|
 | PROTECT GAME HUD | Keeps the game's HUD out of generation, so it does not smear. Which setting it switches depends on the route: `GameHud` on DirectX 11, `DlssgHud` on the in-game route, `FrameChecks` on the bring-in route. |
 | KEEP OVERLAYS OUT | DirectX 9, 11 and Vulkan. DLSS-G gets the frame from before RTSS, Steam, Discord and ReShade drew their overlays (`KeepOverlaysOut`). |
-| HOTKEYS | Shows the keys in use. |
 | DX9 GPU ROUTE | DirectX 9 only. ON (D3D9EX) means frames reach DLSS-G on the GPU, at almost no cost. OFF means CPU copies. If a game crashed on 9Ex, the button OFF: GAME CRASHED WITH IT // TRY AGAIN lets the next launch try again. |
 | WINDOW | WINDOWED / BORDERLESS. DirectX 9, 11 and 12. BORDERLESS makes a game in windowed mode borderless fullscreen while it runs; WINDOWED puts it back as it was (`ForceBorderless`). A DirectX 9 game that asked for fullscreen is made borderless fullscreen by itself. Some games crash when their window changes size (The Darkness II does). For those, use a tool like Borderless Gaming. |
 | GPU RESERVE | On by default (`GpuReserve`). Only when the card is at 95% load or more AND the game's real frames stutter, HSF lowers the FPS cap a small step at a time until the stutter stops, then slowly gives the frames back. It never goes above your own cap, and never takes the game under 30 fps. The line beside it says WATCHING FOR STUTTER, or ACTING with the cap in use. |
@@ -153,7 +152,20 @@ Under it, a small line graph shows the recent frame times.
 
 Settings for the on-screen overlay: OFF / SIMPLE / ADVANCED (the same setting as the OVERLAY row), SIZE 50 to 200 %, OPACITY 0 to 100 % (the panel behind the text), CORNER, X and Y OFFSET in pixels at 1440p (scaled to your resolution), and RESET THIS OVERLAY. Simple and advanced each keep their own look.
 
-### 5.6 DEBUG, for testers
+### 5.6 KEYBINDS
+
+The in-game hotkeys. Click a key, then press the new one: ESC keeps the old key, BACKSPACE sets none. A key another HSF hotkey had is taken from it. The keys are saved to `HSF.ini`, and work while ReShade's menu is closed.
+
+| Setting | What it does |
+|---|---|
+| FRAME GEN ON / OFF | Turns frame generation on and off (`FrameGenKey`). None by default. |
+| MULTIPLIER | Cycles the multiplier, 2x up to what this card can do (`MfgKey`, F7). With MFG-Unlocker on RTX 30 or 20, the unlocker sets the multiplier instead. |
+| OVERLAY ON / OFF | Turns the on-screen overlay off, and back to SIMPLE or ADVANCED, whichever it was (`OsdKey`). None by default. |
+| DEBUG VIEW | DirectX 9, 11 and Vulkan: cycles the debug view (`ViewKey`, F8). |
+
+A key set here shows beside its row at the top of the menu, as F7 does beside MULTIPLIER.
+
+### 5.7 DEBUG, for testers
 
 | Setting | What it does |
 |---|---|
@@ -176,18 +188,20 @@ Settings for the on-screen overlay: OFF / SIMPLE / ADVANCED (the same setting as
 
 ## 7. Hotkeys
 
-Each key can be changed or turned off in `HSF.ini` (a virtual-key code, 0 = none).
+Frame generation, the multiplier, the overlay and the debug view are set in the menu's KEYBINDS section. Every key can also be changed or turned off in `HSF.ini` (a virtual-key code, 0 = none).
 
 | Key | Does | HSF.ini |
 |---|---|---|
+| none | turns frame generation on and off | `FrameGenKey=0` |
 | F7 | cycles the multiplier | `MfgKey=118` |
+| none | turns the on-screen overlay off and on | `OsdKey=0` |
 | F8 | cycles the debug view | `ViewKey=119` |
 | F9 | test: cycles DLSS-G's motion input through each source, then zero motion | `InputKey=120` |
 | F10 | test: real depth, or a constant | `DepthKey=121` |
 | F11 | in-game route: HSF's rebuilt camera matrices, or the game's | `DlssgCameraKey=122` |
 | F6 | records 30 s of camera data | `RecordKey=117` |
 
-No hotkey turns frame generation on or off, because F5 is quicksave in many games.
+Frame generation and the overlay have no key until you set one, because the free keys (F5 is quicksave in many games) differ from game to game.
 
 ## 8. Where things are written
 
