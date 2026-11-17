@@ -11,13 +11,13 @@ A ReShade add-on. Up to 6x. DirectX 9, 11, 12 and Vulkan. 32-bit and 64-bit. SDR
 </p>
 
 <p align="center">
-  <a href="docs/images/hsf-main.png"><img src="docs/images/hsf-main.png" width="32%" alt="HSF 0.9.8 at a glance: hardware, install steps, known issues, bug report"></a>
-  <a href="docs/images/hsf-patch.png"><img src="docs/images/hsf-patch.png" width="32%" alt="HSF 0.9.8 patch notes: Vulkan, Luma, HDR10 and fixes"></a>
-  <a href="docs/images/hsf-upcoming.png"><img src="docs/images/hsf-upcoming.png" width="32%" alt="HSF upcoming: version 2 and beyond"></a>
+  <a href="docs/images/hsf-main.png"><img src="docs/images/hsf-main.png" width="32%" alt="HSF 0.9.9 at a glance: hardware, features, install steps, known issues, bug report"></a>
+  <a href="docs/images/hsf-patch.png"><img src="docs/images/hsf-patch.png" width="32%" alt="HSF 0.9.9 patch notes: scRGB HDR, real depth, Vulkan motion, keybinds, colour themes and fixes"></a>
+  <a href="docs/images/hsf-roadmap.png"><img src="docs/images/hsf-roadmap.png" width="32%" alt="HSF roadmap: what comes in the next update and after"></a>
 </p>
 <p align="center"><sub>Click a card to see it full size.</sub></p>
 
-> **Status:** preview (0.9.8.8). HSF runs in a wide range of games across DX9, DX11, DX12 and Vulkan, from old 32-bit titles to path-traced ones, and in PS3 and PS5 emulators. If a game misbehaves, send the log: see [troubleshooting](docs/troubleshooting.md).
+> **Status:** preview (0.9.9). HSF runs in a wide range of games across DX9, DX11, DX12 and Vulkan, from old 32-bit titles to path-traced ones, and in PS3 and PS5 emulators. If a game misbehaves, send the log: see [troubleshooting](docs/troubleshooting.md).
 
 ## What you get
 
