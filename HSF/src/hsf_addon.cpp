@@ -33,6 +33,7 @@
 #ifdef HSF_SL_GAME
 #include <d3d12.h>
 #include "sl_bring.h"
+#include "hook_patch.h"
 #include "ngx_input.h"
 #include "frame_checks.h"
 #include "sl_game.h"
@@ -385,6 +386,15 @@ bool D3d12Run() { return g_d3d12_frames.load(std::memory_order_relaxed) > g_d3d1
 
 #ifdef HSF_SL_GAME
 bool g_sl_bring = false;  // SlBringIn=1: a D3D12 game with no Streamline gets it from HSF
+// The bring route's Streamline must be shut down before Windows unloads the DLLs at exit (slbring::ShutdownForExit). ExitProcess ends in ntdll's RtlExitUserProcess,
+// which still runs with every thread alive and no loader lock held, so the hook goes there.
+using ExitUserProcessFn = void(NTAPI*)(LONG);
+ExitUserProcessFn g_real_exit_user_process = nullptr;
+hsf::hookpatch::HookSet g_exit_hook;
+void NTAPI OnExitUserProcess(LONG code) {
+  hsf::slbring::ShutdownForExit();
+  g_real_exit_user_process(code);
+}
 bool g_ngx_input = true;  // NgxInput=0: flow even when the game's DLSS could give its vectors
 bool g_sl_game = false;   // StreamlineProbe=1 or InGameDlssg=1: hooks on the game's own Streamline
 bool g_sl_drive = false;  // InGameDlssg=1: DLSS-G runs inside the game, through the game's Streamline
@@ -8638,6 +8648,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         sl_options.ini_path = g_ini_path;
         sl_options.route_dlssg = static_cast<int>(GetPrivateProfileIntW(L"HSF", L"SlRouteDlssg", -1, g_ini_path));
         hsf::slbring::Start(bring_log.c_str(), have_own ? own.c_str() : folder, sl_options);
+        if (void* const exit_user_process = reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlExitUserProcess")))
+          Log(g_exit_hook.Add("RtlExitUserProcess", exit_user_process, reinterpret_cast<void*>(&OnExitUserProcess), reinterpret_cast<void**>(&g_real_exit_user_process), &Log)
+                  ? "exit hook in: HSF's Streamline is shut down before the DLLs unload"
+                  : "exit hook not in: the game may crash at quit (DLSS-G's fail fast)");
         g_ngx_input = GetPrivateProfileIntW(L"HSF", L"NgxInput", 1, g_ini_path) != 0;
         if (g_ngx_input) hsf::ngx::Start(&hsf::slbring::LogLine);
       }
@@ -8673,6 +8687,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         hsf::ngx::StopVk(false);
       }
       if (g_sl_bring) hsf::slbring::Stop(reserved != nullptr);
+      if (g_sl_bring && reserved == nullptr) g_exit_hook.RemoveAll(&Log);  // the game goes on: no hook into a freed HSF
       if (g_sl_game && reserved == nullptr) DropSlChecks();  // at process exit the game's device and this code's order are not ours to rely on
 #else
       (void)reserved;

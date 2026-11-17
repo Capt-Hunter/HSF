@@ -72,10 +72,13 @@ PFun_slReflexSetOptions* g_sl_reflex_options = nullptr;
 PFun_slReflexSleep* g_sl_reflex_sleep = nullptr;
 PFun_slPCLSetMarker* g_sl_marker = nullptr;
 PFun_slUpgradeInterface* g_sl_upgrade = nullptr;
+PFun_slShutdown* g_sl_shutdown = nullptr;
 StartOptions g_start_options;
 
 std::atomic<bool> g_tried{false};
 std::atomic<bool> g_up{false};
+std::atomic<bool> g_sl_started{false};  // slInit worked in this process, here or in an earlier load of HSF
+std::atomic<bool> g_shut{false};        // shut down for the exit: nothing more goes to Streamline
 std::atomic<ID3D12Device*> g_device{nullptr};
 ID3D12Device* g_device_set = nullptr;  // the one Streamline was told about
 SRWLOCK g_create_lock = SRWLOCK_INIT;
@@ -244,6 +247,7 @@ bool StartStreamline() {
     return false;
   }
   PFun_slInit* init = nullptr;
+  g_sl_shutdown = reinterpret_cast<PFun_slShutdown*>(GetProcAddress(g_interposer, "slShutdown"));
   g_sl_create_factory = reinterpret_cast<CreateFactory2Fn>(GetProcAddress(g_interposer, "CreateDXGIFactory2"));
   if (!Lookup(init, "slInit") || !Lookup(g_sl_set_device, "slSetD3DDevice") || !Lookup(g_sl_is_loaded, "slIsFeatureLoaded") || !Lookup(g_sl_is_supported, "slIsFeatureSupported") ||
       !Lookup(g_sl_get_function, "slGetFeatureFunction") || !Lookup(g_sl_new_token, "slGetNewFrameToken") || !Lookup(g_sl_tag, "slSetTagForFrame") || !Lookup(g_sl_constants, "slSetConstants") ||
@@ -289,6 +293,7 @@ bool StartStreamline() {
   const DWORD done_length = GetEnvironmentVariableW(L"HSF_SL_BRING_UP", done, static_cast<DWORD>(std::size(done)));
   if (done_length != 0 && done_length < std::size(done) && wcscmp(done, mark) == 0) {
     Line("Streamline was started earlier in this process");
+    g_sl_started = true;
     return true;
   }
   if (done_length != 0) Line("Streamline mark from another process or an earlier copy of the interposer (%ls, now %ls): starting it here", done, mark);
@@ -296,6 +301,7 @@ bool StartStreamline() {
   Line("slInit: %d, from %ls", static_cast<int>(result), dll.c_str());
   if (result != sl::Result::eOk) return false;
   SetEnvironmentVariableW(L"HSF_SL_BRING_UP", mark);
+  g_sl_started = true;
   return true;
 }
 
@@ -864,6 +870,7 @@ void CheckColourSpace() {
 // ---- Present: everything that must be just before or after the real one ----
 
 void BeforePresent() {
+  if (g_shut.load(std::memory_order_acquire)) return;
   CheckColourSpace();
   if (g_sl_new_token == nullptr) return;
   if (g_token == nullptr) BeginFrame(false);
@@ -885,7 +892,7 @@ void BeforePresent() {
 }
 
 void AfterPresent() {
-  if (g_sl_new_token == nullptr) return;
+  if (g_sl_new_token == nullptr || g_shut.load(std::memory_order_acquire)) return;
   Mark(sl::PCLMarker::ePresentEnd);
   g_presented.fetch_add(1);
   g_presented_total.fetch_add(1, std::memory_order_relaxed);
@@ -903,6 +910,7 @@ UINT SyncFor(UINT asked) {
 }
 
 HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swap_chain, UINT sync, UINT flags) {
+  if (g_shut.load(std::memory_order_acquire) && swap_chain == g_game_swap_chain.load()) return S_OK;  // Streamline is shut down for the exit
   if (swap_chain != g_game_swap_chain.load() || (flags & DXGI_PRESENT_TEST) != 0) return g_real_present(swap_chain, sync, flags);
   BeforePresent();
   const double before = NowMs();
@@ -916,6 +924,7 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swap_chain, UINT sync, UIN
 }
 
 HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* swap_chain, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters) {
+  if (g_shut.load(std::memory_order_acquire) && swap_chain == g_game_swap_chain.load()) return S_OK;
   if (swap_chain != g_game_swap_chain.load() || (flags & DXGI_PRESENT_TEST) != 0) return g_real_present1(swap_chain, sync, flags, parameters);
   BeforePresent();
   const double before = NowMs();
@@ -1330,7 +1339,7 @@ void NoteDevice(void* device) {
 }
 
 void Poll() {
-  if (g_sl_dlssg_state == nullptr) return;
+  if (g_sl_dlssg_state == nullptr || g_shut.load(std::memory_order_acquire)) return;
   const uint64_t now = GetTickCount64();
   if (now < g_next_report) return;
   g_next_report = now + 5000;
@@ -1365,6 +1374,7 @@ bool FeedFrame(const FrameFeed& in);
 }
 
 bool Frame(const FrameFeed& in) {
+  if (g_shut.load(std::memory_order_acquire)) return false;
   const double before = NowMs();
   const bool fed = FeedFrame(in);
   g_times.feed_worst = std::max(g_times.feed_worst, NowMs() - before);
@@ -1617,6 +1627,15 @@ void Stop(bool process_exiting) {
   }
   g_sl_dlssg_state = nullptr;
   Line("=== stopped catching swap chains ===");
+}
+
+void ShutdownForExit() {
+  if (!g_sl_started.load() || g_sl_shutdown == nullptr || g_shut.exchange(true)) return;
+  Line("the game is exiting: shutting HSF's Streamline down while its threads still run");
+  const sl::Result result = g_sl_shutdown();
+  Line("slShutdown: %d", static_cast<int>(result));
+  SetEnvironmentVariableW(L"HSF_SL_BRING_UP", nullptr);
+  g_sl_dlssg_state = nullptr;
 }
 
 Stats GetStats() {

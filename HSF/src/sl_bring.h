@@ -67,6 +67,10 @@ void SetReflex(uint32_t fps_cap, bool boost, bool sleep);
 void LogLine(const char* text);
 // Stops catching swap chains. Streamline itself stays, as a swap chain made through it may be in use. A process that is exiting has nothing to put back.
 void Stop(bool process_exiting);
+// The process is exiting and its threads still run: called from the add-on's exit hook, before Windows unloads any DLL. If HSF started Streamline in this
+// process, it is shut down now; left up, DLSS-G ends the process with a fail fast (0xC0000409) while the DLLs unload. Afterwards nothing more goes to
+// Streamline and Present on the game's swap chain does nothing. Once only.
+void ShutdownForExit();
 
 struct Stats {
   bool streamline_up;        // slInit worked
