@@ -33,6 +33,7 @@
 #include "compose.h"
 #include "debug_view.h"
 #include "depth_fit.h"
+#include "fp16_swap.h"
 #include "frame_checks.h"
 #include "nvof_flow.h"
 
@@ -106,6 +107,9 @@ UINT g_back_buffers = 3;
 // The swap chain DXGI made for Streamline, under Streamline's own: DLSS-G presents on it, so its colour space is what the screen shows. Not held: it lives as long as
 // the game's, and is only used while the game presents.
 std::atomic<IUnknown*> g_native_swap_chain{nullptr};
+// Streamline's swap chain and the queue the game made it with, for the FP16 conversion (fp16_swap.h). Not held, as above.
+IUnknown* g_made_swap_chain = nullptr;
+IUnknown* g_made_queue = nullptr;
 // The game's colour space (DXGI_COLOR_SPACE_TYPE) from FrameFeed, and what CheckColourSpace last logged for g_native_swap_chain. UINT32_MAX: none yet.
 std::atomic<uint32_t> g_game_space{UINT32_MAX};
 IUnknown* g_space_on = nullptr;
@@ -682,6 +686,7 @@ void AfterSwapChain(HRESULT hr, IUnknown* swap_chain, UINT game_flags) {
   Line("swap chain through Streamline: 0x%08lx, %p, game asked for flags 0x%x", hr, swap_chain, game_flags);
   if (SUCCEEDED(hr) && swap_chain != nullptr) {
     g_made_table = *reinterpret_cast<void***>(swap_chain);
+    g_made_swap_chain = swap_chain;
     g_present_owner.clear();
     CheckPresentOwner();
   }
@@ -912,6 +917,7 @@ UINT SyncFor(UINT asked) {
 HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swap_chain, UINT sync, UINT flags) {
   if (g_shut.load(std::memory_order_acquire) && swap_chain == g_game_swap_chain.load()) return S_OK;  // Streamline is shut down for the exit
   if (swap_chain != g_game_swap_chain.load() || (flags & DXGI_PRESENT_TEST) != 0) return g_real_present(swap_chain, sync, flags);
+  hsf::fp16swap::BeforePresent(swap_chain);
   BeforePresent();
   const double before = NowMs();
   const HRESULT hr = g_real_present(swap_chain, SyncFor(sync), flags);
@@ -926,6 +932,7 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swap_chain, UINT sync, UIN
 HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* swap_chain, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters) {
   if (g_shut.load(std::memory_order_acquire) && swap_chain == g_game_swap_chain.load()) return S_OK;
   if (swap_chain != g_game_swap_chain.load() || (flags & DXGI_PRESENT_TEST) != 0) return g_real_present1(swap_chain, sync, flags, parameters);
+  hsf::fp16swap::BeforePresent(swap_chain);
   BeforePresent();
   const double before = NowMs();
   const HRESULT hr = g_real_present1(swap_chain, SyncFor(sync), flags, parameters);
@@ -937,11 +944,14 @@ HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* swap_chain, UINT sync, U
   return hr;
 }
 
+IUnknown* RealQueue(IUnknown* queue);
+
 // `swap_chain` is the one the game holds.
 void CatchPresent(IUnknown* swap_chain) {
   if (swap_chain == nullptr) return;
   void** const table = *reinterpret_cast<void***>(swap_chain);
   g_game_swap_chain = swap_chain;
+  if (g_made_queue != nullptr) hsf::fp16swap::Start(swap_chain, g_made_swap_chain, g_made_queue, RealQueue(g_made_queue), &Line);
   if (g_present_table == table) return;
   if (g_present_table != nullptr) {
     Line("a second kind of swap chain: its frames are not followed");
@@ -998,6 +1008,7 @@ HRESULT ThroughStreamline(IUnknown* factory, IUnknown* queue, UINT game_flags, I
   if (sl_factory != nullptr) {
     t_inside = true;
     t_native_factory = factory;
+    g_made_queue = game_queue;
     hr = through(sl_factory, game_queue);
     t_inside = false;
     t_native_factory = nullptr;
@@ -1007,11 +1018,26 @@ HRESULT ThroughStreamline(IUnknown* factory, IUnknown* queue, UINT game_flags, I
   return sl_factory != nullptr ? hr : direct();
 }
 
+// The swap chain made through Streamline's factory: an FP16 one is made R10G10B10A2, which DLSS-G takes (fp16_swap.h). Streamline hands the game back
+// buffers of its own in that format, and HSF hands the game FP16 ones in their place.
+const DXGI_SWAP_CHAIN_DESC1* ForDlssg(const DXGI_SWAP_CHAIN_DESC1* desc, DXGI_SWAP_CHAIN_DESC1& copy) {
+  if (desc == nullptr) return desc;
+  copy = *desc;
+  return hsf::fp16swap::Rewrite(copy.Format) ? &copy : desc;
+}
+
+DXGI_SWAP_CHAIN_DESC* ForDlssg(DXGI_SWAP_CHAIN_DESC* desc, DXGI_SWAP_CHAIN_DESC& copy) {
+  if (desc == nullptr) return desc;
+  copy = *desc;
+  return hsf::fp16swap::Rewrite(copy.BufferDesc.Format) ? &copy : desc;
+}
+
 HRESULT NativeForHwnd(IDXGIFactory2* factory, IUnknown* queue, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen, IDXGIOutput* output, IDXGISwapChain1** swap_chain, CreateForHwndFn real) {
   return ThroughStreamline(factory, queue, desc->Flags, reinterpret_cast<IUnknown**>(swap_chain),
                            [&](IDXGIFactory2* sl_factory, IUnknown* game_queue) {
                              // The game's own flags. Adding the frame latency waitable for a game that never waits on it turns off the queue limit that holds it back (Red Dead Redemption 2).
-                             return sl_factory->CreateSwapChainForHwnd(game_queue, hwnd, desc, fullscreen, output, swap_chain);
+                             DXGI_SWAP_CHAIN_DESC1 copy{};
+                             return sl_factory->CreateSwapChainForHwnd(game_queue, hwnd, ForDlssg(desc, copy), fullscreen, output, swap_chain);
                            },
                            [&] { return real(factory, queue, hwnd, desc, fullscreen, output, swap_chain); });
 }
@@ -1019,7 +1045,8 @@ HRESULT NativeForHwnd(IDXGIFactory2* factory, IUnknown* queue, HWND hwnd, const 
 HRESULT NativeCreate(IDXGIFactory* factory, IUnknown* queue, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** swap_chain, CreateSwapChainFn real) {
   return ThroughStreamline(factory, queue, desc->Flags, reinterpret_cast<IUnknown**>(swap_chain),
                            [&](IDXGIFactory2* sl_factory, IUnknown* game_queue) {
-                             return sl_factory->CreateSwapChain(game_queue, desc, swap_chain);
+                             DXGI_SWAP_CHAIN_DESC copy{};
+                             return sl_factory->CreateSwapChain(game_queue, ForDlssg(desc, copy), swap_chain);
                            },
                            [&] { return real(factory, queue, desc, swap_chain); });
 }
@@ -1391,7 +1418,8 @@ bool FeedFrame(const FrameFeed& in) {
   if (in.colour_space != UINT32_MAX) g_game_space = in.colour_space;
   // DLSS-G takes SDR or HDR10 frames, not FP16 (NVIDIA's DLSS-G guide, section 11.0): it accepts the options and shows only the real frames. The helper converts
   // FP16 to HDR10 for its own swap chain, but here DLSS-G presents on the game's, so the game (or RenoDX's swap chain setting) has to output HDR10.
-  const bool fp16 = back.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || back.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS;
+  // When HSF converts the game's FP16 frames itself (fp16_swap.h), DLSS-G sees R10G10B10A2 and this is no problem.
+  const bool fp16 = (back.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || back.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS) && !hsf::fp16swap::Active();
   if (fp16 && !g_fp16.exchange(true)) Line("the swap chain is FP16 (scRGB): DLSS-G generates nothing from it; set the game or RenoDX to HDR10");
   if (!fp16) g_fp16 = false;
   D3D12_RESOURCE_DESC depth_desc = in.depth->GetDesc();

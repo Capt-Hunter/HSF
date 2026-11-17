@@ -42,7 +42,7 @@ else()
   set(HSF_STREAMLINE "${CMAKE_SOURCE_DIR}/../Streamline SDK")
   # NVIDIA Optical Flow SDK 5.0 interface headers (NVIDIA's permissive licence, in each file). The engine itself is the driver's nvofapi64.dll.
   set(HSF_NVOF "${CMAKE_SOURCE_DIR}/third_party/nvof")
-  target_sources(hsf_addon PRIVATE src/compose.cpp src/frame_checks.cpp src/sl_game.cpp src/hook_patch.cpp src/sl_bring.cpp src/debug_view.cpp src/depth_fit.cpp src/ngx_input.cpp src/ngx_vk.cpp src/nvof_flow.cpp)
+  target_sources(hsf_addon PRIVATE src/compose.cpp src/frame_checks.cpp src/sl_game.cpp src/hook_patch.cpp src/sl_bring.cpp src/fp16_swap.cpp src/hdr_out.cpp src/debug_view.cpp src/depth_fit.cpp src/ngx_input.cpp src/ngx_vk.cpp src/nvof_flow.cpp)
   target_compile_definitions(hsf_addon PRIVATE HSF_SL_GAME)
   target_include_directories(hsf_addon SYSTEM PRIVATE "${HSF_STREAMLINE}/include" "${HSF_NVOF}")
   target_link_libraries(hsf_addon PRIVATE "${HSF_STREAMLINE}/lib/x64/sl.interposer.lib" delayimp version)
@@ -73,7 +73,7 @@ else()
   add_dependencies(sl_copies_test fake_interposer)
   # Offline test of the frame checks, no game needed.
   # A small program with no Streamline of its own: HSF must bring Streamline to it. Needs a folder with Streamline's DLLs and a GPU.
-  add_executable(sl_bring_test tests/sl_bring_test.cpp src/sl_bring.cpp src/hsf_log.cpp src/debug_view.cpp src/depth_fit.cpp src/compose.cpp src/frame_checks.cpp src/nvof_flow.cpp)
+  add_executable(sl_bring_test tests/sl_bring_test.cpp src/sl_bring.cpp src/fp16_swap.cpp src/hdr_out.cpp src/hsf_log.cpp src/debug_view.cpp src/depth_fit.cpp src/compose.cpp src/frame_checks.cpp src/nvof_flow.cpp)
   target_include_directories(sl_bring_test SYSTEM PRIVATE "${HSF_STREAMLINE}/include" "${HSF_NVOF}")
   target_link_libraries(sl_bring_test PRIVATE d3d12 dxgi d3dcompiler)
   target_link_options(sl_bring_test PRIVATE "/ENTRY:wmainCRTStartup")
