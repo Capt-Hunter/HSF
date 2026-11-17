@@ -79,9 +79,9 @@ else()
   target_link_options(sl_bring_test PRIVATE "/ENTRY:wmainCRTStartup")
 
   # The hook on this machine's real _nvngx.dll, and a stand-in DLSS call on a real device.
-  add_executable(ngx_input_test tests/ngx_input_test.cpp src/ngx_input.cpp src/sl_game.cpp src/hsf_log.cpp src/hook_patch.cpp src/safe_try.cpp)
+  add_executable(ngx_input_test tests/ngx_input_test.cpp src/ngx_input.cpp src/depth_fit.cpp src/sl_game.cpp src/hsf_log.cpp src/hook_patch.cpp src/safe_try.cpp)
   target_include_directories(ngx_input_test SYSTEM PRIVATE "${HSF_STREAMLINE}/include")
-  target_link_libraries(ngx_input_test PRIVATE d3d12 dxgi hsf_minhook)
+  target_link_libraries(ngx_input_test PRIVATE d3d12 dxgi d3dcompiler hsf_minhook)
 
   # Offline test of HSF's patcher on made-up functions: the full length decoder (H3), unaligned functions, and the safe-try switch for it.
   add_executable(hook_test tests/hook_test.cpp src/sl_game.cpp src/hsf_log.cpp src/hook_patch.cpp src/safe_try.cpp)

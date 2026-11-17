@@ -17,6 +17,9 @@ void Start(LogFunction log);
 // Often, from the thread that presents: hooks _nvngx.dll once the game has loaded it.
 void Poll();
 void Stop(bool process_exiting);
+// Test only (hidden HSF.ini key NgxDepthShader): depth that could be copied goes through the conversion shader too, so the path D24 and D16
+// depth take can be tried in a game whose depth is D32.
+void ConvertAllDepth(bool on);
 
 // What the last DLSS call gave. The textures are HSF's copies, readable by any shader, and hold the data of the last call that has run on the GPU, as HSF's list runs after the game's on the same queue.
 struct Frame {

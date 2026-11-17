@@ -270,19 +270,69 @@ int main() {
   hsf::ngx::Latest(&frame);
   Check(frame.serial == before && frame.width == 640, "a small second call does not take over");
 
-  // Depth that cannot be copied leaves the last good frame and no broken one.
-  tex.Format = DXGI_FORMAT_R24G8_TYPELESS;
-  ComPtr<ID3D12Resource> d24;
-  D3D12_CLEAR_VALUE d24_clear{};
-  d24_clear.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-  gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &tex, D3D12_RESOURCE_STATE_DEPTH_WRITE, &d24_clear, IID_PPV_ARGS(&d24));
-  block.resources["Depth"] = d24.Get();
+  // D24 and D16 depth cannot be copied to R32_FLOAT: a shader converts them, and the values come through.
+  struct UnormCase {
+    DXGI_FORMAT resource, view;
+    float value, tolerance;
+    const char* name;
+  };
+  const UnormCase unorm_cases[] = {{DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT, 0.5f, 1e-5f, "D24"},
+                                   {DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_D16_UNORM, 0.25f, 1e-4f, "D16"}};
   block.uints["DLSS.Render.Subrect.Dimensions.Width"] = 640;
   block.uints["DLSS.Render.Subrect.Dimensions.Height"] = 360;
+  uint64_t last = frame.serial;
+  for (const UnormCase& u : unorm_cases) {
+    tex.Format = u.resource;
+    ComPtr<ID3D12Resource> unorm;
+    D3D12_CLEAR_VALUE unorm_clear{};
+    unorm_clear.Format = u.view;
+    unorm_clear.DepthStencil.Depth = u.value;
+    char what[160];
+    snprintf(what, sizeof(what), "game's %s depth", u.name);
+    Check(SUCCEEDED(gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &tex, D3D12_RESOURCE_STATE_DEPTH_WRITE, &unorm_clear, IID_PPV_ARGS(&unorm))), what);
+    if (unorm == nullptr) continue;
+    D3D12_DEPTH_STENCIL_VIEW_DESC unorm_dsv{};
+    unorm_dsv.Format = u.view;
+    unorm_dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    gpu.device->CreateDepthStencilView(unorm.Get(), &unorm_dsv, dsv_heap->GetCPUDescriptorHandleForHeapStart());
+    gpu.list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, u.value, 0, 0, nullptr);
+    BarrierOf(gpu.list.Get(), unorm.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    block.resources["Depth"] = unorm.Get();
+    hsf::ngx::Capture(gpu.list.Get(), &block);
+    gpu.Run();
+    hsf::ngx::Latest(&frame);
+    snprintf(what, sizeof(what), "%s depth is taken", u.name);
+    Check(frame.serial > last, what);
+    last = frame.serial;
+    if (frame.depth == nullptr) continue;
+    snprintf(what, sizeof(what), "%s depth comes out R32_FLOAT", u.name);
+    Check(frame.depth->GetDesc().Format == DXGI_FORMAT_R32_FLOAT, what);
+    float read_unorm = -1.f;
+    ReadFirst(gpu, frame.depth, &read_unorm, sizeof(read_unorm));
+    printf("     converted %s depth %.6f\n", u.name, read_unorm);
+    snprintf(what, sizeof(what), "%s depth %.2f comes through the conversion", u.name, u.value);
+    Check(std::fabs(read_unorm - u.value) < u.tolerance, what);
+    // A second frame on the same texture reuses the pass and still reads right.
+    hsf::ngx::Capture(gpu.list.Get(), &block);
+    gpu.Run();
+    hsf::ngx::Latest(&frame);
+    read_unorm = -1.f;
+    ReadFirst(gpu, frame.depth, &read_unorm, sizeof(read_unorm));
+    snprintf(what, sizeof(what), "%s depth, second frame", u.name);
+    Check(frame.serial > last && std::fabs(read_unorm - u.value) < u.tolerance, what);
+    last = frame.serial;
+  }
+
+  // Depth in a format HSF has no way to read leaves the last good frame and no broken one.
+  tex.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  tex.Flags = D3D12_RESOURCE_FLAG_NONE;
+  ComPtr<ID3D12Resource> odd;
+  gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &tex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&odd));
+  block.resources["Depth"] = odd.Get();
   hsf::ngx::Capture(gpu.list.Get(), &block);
   gpu.Run();
   hsf::ngx::Latest(&frame);
-  Check(frame.serial == before, "depth in a format that cannot be copied is refused");
+  Check(frame.serial == last, "depth in a format that cannot be read is refused");
 
   Check(gpu.device->GetDeviceRemovedReason() == S_OK, "the device is fine");
   hsf::ngx::Stop(false);

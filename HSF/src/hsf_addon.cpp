@@ -532,6 +532,9 @@ void PollIni() {
   g_borderless = GetPrivateProfileIntW(L"HSF", L"Borderless", 1, g_ini_path) != 0;
   g_force_borderless = GetPrivateProfileIntW(L"HSF", L"ForceBorderless", 0, g_ini_path) != 0;
   g_borderless_crash = GetPrivateProfileIntW(L"HSF", L"BorderlessCrash", 0, g_ini_path) != 0;
+#ifdef HSF_SL_GAME
+  hsf::ngx::ConvertAllDepth(GetPrivateProfileIntW(L"HSF", L"NgxDepthShader", 0, g_ini_path) != 0);  // test only: hidden, never written
+#endif
   {
     wchar_t mode[16];
     GetPrivateProfileStringW(L"HSF", L"LaunchPadQuality", L"auto", mode, static_cast<DWORD>(std::size(mode)), g_ini_path);

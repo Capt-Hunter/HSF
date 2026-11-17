@@ -10,10 +10,12 @@
 #include <cstdarg>
 #include <cwchar>
 #include <iterator>
+#include <memory>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
+#include "depth_fit.h"
 #include "hook_patch.h"
 #include "ngx_call.h"
 
@@ -77,11 +79,16 @@ using CreateFn = int(__cdecl*)(ID3D12GraphicsCommandList*, int, const Parameter*
 EvaluateFn g_real_evaluate = nullptr, g_real_evaluate_c = nullptr;
 CreateFn g_real_create = nullptr;
 
+// Sets of descriptors for the depth conversion: as many as frames HSF keeps old copies for (g_old), so a set is never rewritten while the GPU reads it.
+constexpr UINT CONVERT_FRAMES = 16;
+
 struct Copies {
   ComPtr<ID3D12Resource> motion, depth;
   UINT64 width = 0;
   UINT height = 0;
   DXGI_FORMAT motion_format = DXGI_FORMAT_UNKNOWN;
+  DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
+  std::unique_ptr<depthfit::Pass> convert;  // for depth that is not copied but converted (DepthConverts), with `depth` its result
 };
 
 SRWLOCK g_lock = SRWLOCK_INIT;  // guards everything from here to the hooks
@@ -97,6 +104,7 @@ std::vector<OldCopies> g_old;  // still used by frames on the GPU when replaced
 call::Created g_created;  // from the last CreateFeature for DLSS
 call::MainCall g_main;
 uint32_t g_refused_format = 0;
+bool g_convert_all = false;  // ConvertAllDepth
 
 struct Lock {
   Lock() { AcquireSRWLockExclusive(&g_lock); }
@@ -114,7 +122,7 @@ DXGI_FORMAT TypedMotion(DXGI_FORMAT format) {
   }
 }
 
-// Depth whose first plane can be copied straight to R32_FLOAT. D24 cannot: that game stays on flow.
+// Depth whose first plane can be copied straight to R32_FLOAT.
 bool DepthCopies(DXGI_FORMAT format) {
   switch (format) {
     case DXGI_FORMAT_D32_FLOAT:
@@ -129,6 +137,23 @@ bool DepthCopies(DXGI_FORMAT format) {
   }
 }
 
+// Depth that a copy cannot turn into R32_FLOAT (D24 and D16 are not in its copy family). A shader reads it as UNORM and writes R32_FLOAT instead: the
+// depth fit pass (depth_fit.h) at the depth's own size, which reads these formats already.
+bool DepthConverts(DXGI_FORMAT format) {
+  switch (format) {
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_D16_UNORM:
+    case DXGI_FORMAT_R16_TYPELESS:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// The depth goes through the conversion shader rather than a copy.
+bool Converted(DXGI_FORMAT format) { return DepthConverts(format) || g_convert_all; }
+
 bool MakeCopies(ID3D12Device* device, const D3D12_RESOURCE_DESC& motion, const D3D12_RESOURCE_DESC& depth, Copies& out) {
   const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
   D3D12_RESOURCE_DESC desc{};
@@ -140,7 +165,15 @@ bool MakeCopies(ID3D12Device* device, const D3D12_RESOURCE_DESC& motion, const D
   desc.SampleDesc.Count = 1;
   desc.Format = TypedMotion(motion.Format);
   HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, READABLE, nullptr, IID_PPV_ARGS(&out.motion));
-  if (SUCCEEDED(hr)) {
+  if (SUCCEEDED(hr) && Converted(depth.Format)) {
+    out.convert = std::make_unique<depthfit::Pass>();
+    const char* what = nullptr;
+    if (!out.convert->Init(device, static_cast<UINT>(depth.Width), depth.Height, CONVERT_FRAMES, what, hr)) {
+      Line("NGX: depth format %u needs converting, and the conversion is not available: %s (0x%08lx), so this game stays on flow", static_cast<unsigned>(depth.Format), what, hr);
+      return false;
+    }
+    out.depth = out.convert->Result();
+  } else if (SUCCEEDED(hr)) {
     desc.Width = depth.Width;
     desc.Height = depth.Height;
     desc.Format = DXGI_FORMAT_R32_FLOAT;
@@ -150,10 +183,12 @@ bool MakeCopies(ID3D12Device* device, const D3D12_RESOURCE_DESC& motion, const D
     Line("NGX: copies of %llux%u and %llux%u not made: 0x%08lx", motion.Width, motion.Height, depth.Width, depth.Height, hr);
     return false;
   }
+  out.depth_format = depth.Format;
   out.width = motion.Width;
   out.height = motion.Height;
   out.motion_format = motion.Format;
-  Line("NGX: vectors %llux%u format %u, depth %llux%u format %u", motion.Width, motion.Height, static_cast<unsigned>(motion.Format), depth.Width, depth.Height, static_cast<unsigned>(depth.Format));
+  Line("NGX: vectors %llux%u format %u, depth %llux%u format %u%s", motion.Width, motion.Height, static_cast<unsigned>(motion.Format), depth.Width, depth.Height, static_cast<unsigned>(depth.Format),
+       out.convert != nullptr ? ", converted to R32_FLOAT by a shader" : "");
   return true;
 }
 
@@ -243,7 +278,7 @@ bool Record(ID3D12GraphicsCommandList* list, const Parameter* parameters, Frame&
   if (motion_desc.SampleDesc.Count > 1 || depth_desc.SampleDesc.Count > 1) return false;
 
   Lock lock;
-  if (!DepthCopies(depth_desc.Format)) {
+  if (!DepthCopies(depth_desc.Format) && !DepthConverts(depth_desc.Format)) {
     if (g_refused_format != static_cast<uint32_t>(depth_desc.Format)) Line("NGX: depth format %u cannot be copied, so this game stays on flow", static_cast<unsigned>(depth_desc.Format));
     g_refused_format = static_cast<uint32_t>(depth_desc.Format);
     return false;
@@ -253,7 +288,7 @@ bool Record(ID3D12GraphicsCommandList* list, const Parameter* parameters, Frame&
   if (!g_main.Take(c.Area(), g_serial)) return false;
 
   if (g_copies.motion == nullptr || g_copies.width != motion_desc.Width || g_copies.height != motion_desc.Height || g_copies.motion_format != motion_desc.Format ||
-      g_copies.depth->GetDesc().Width != depth_desc.Width || g_copies.depth->GetDesc().Height != depth_desc.Height) {
+      g_copies.depth_format != depth_desc.Format || (g_copies.convert != nullptr) != Converted(depth_desc.Format) || g_copies.depth->GetDesc().Width != depth_desc.Width || g_copies.depth->GetDesc().Height != depth_desc.Height) {
     ComPtr<ID3D12Device> device;
     if (FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return false;
     Copies made;
@@ -264,7 +299,10 @@ bool Record(ID3D12GraphicsCommandList* list, const Parameter* parameters, Frame&
   while (!g_old.empty() && g_serial - g_old.front().serial > 16) g_old.erase(g_old.begin());
 
   CopyOn(list, motion, g_copies.motion.Get());
-  CopyOn(list, depth, g_copies.depth.Get());
+  // The game's depth is in NGX's state, which a compute shader reads. The pass sets HSF's descriptor heap and compute state on the game's list; that is
+  // fine before the call, which sets its own (the DLSS guide has the game set its state again after the call).
+  if (g_copies.convert != nullptr) g_copies.convert->Record(list, static_cast<UINT>(g_serial % CONVERT_FRAMES), depth);
+  else CopyOn(list, depth, g_copies.depth.Get());
 
   Frame f;
   f.motion = g_copies.motion.Get();
@@ -327,6 +365,12 @@ void Rescan() {
 }
 
 void Start(LogFunction log) { g_log = log; }
+
+void ConvertAllDepth(bool on) {
+  Lock lock;
+  if (on != g_convert_all) Line("NGX: test switch NgxDepthShader %s: all depth goes through the conversion shader%s", on ? "on" : "off", on ? "" : " no more");
+  g_convert_all = on;
+}
 
 void Poll() {
   if (g_tried) return;
