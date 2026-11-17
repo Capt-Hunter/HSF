@@ -117,6 +117,11 @@ else()
   target_include_directories(vk_scene SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/third_party/vulkan-headers/include")
   target_link_options(vk_scene PRIVATE "/ENTRY:wmainCRTStartup")
 
+  # A stand-in D3D12 game, with or without Streamline, for tools\stack_sweep.ps1 (build\x64\d3d12_scene.exe). Holds no HSF code; not part of tools\test.cmd.
+  add_executable(d3d12_scene tests/d3d12_scene.cpp)
+  target_include_directories(d3d12_scene SYSTEM PRIVATE "${HSF_STREAMLINE}/include")
+  target_link_options(d3d12_scene PRIVATE "/ENTRY:wmainCRTStartup")
+
   # HSF's Vulkan layer: adds the shared-semaphore extension to a Vulkan game's device, so the bridge hands frames over in the same frame.
   # Its manifest (hsf_vk_layer64.json) goes next to it.
   add_library(hsf_vk_layer SHARED src/vk_layer.cpp)
