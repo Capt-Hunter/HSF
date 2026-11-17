@@ -212,6 +212,7 @@ The menu's and the overlay's colours. PANEL is the panel behind the text (its bo
 | CAMERA MOTION, CAMERA FIT, CAMERA RECORD | DirectX 11. Exact motion for the still world from the game's camera matrices. CAMERA FIT can shake. CAMERA RECORD (F6) records 30 s for offline study. |
 | REBUILD CAMERA, CUT CHECK, QUICK OFF, SCORE GUARD | In-game route only. See [settings.md](settings.md). |
 | STREAMLINE switches | Bring-in route only: SL LOG, SL FACTORY PROXY, SL MANUAL HOOKING, SL EARLY LOAD, NGX INPUT. They apply after a game restart. |
+| USE HSF'S STREAMLINE | In-game route (GAME'S STREAMLINE). For a game whose own Streamline never brings DLSS-G: some games load Streamline for Reflex only. HSF says when to try it. On, HSF brings its own Streamline from the next launch; off goes back. |
 | COPY LOG TO CLIPBOARD | Copies `HSF.log`. Paste it when you report a problem. |
 | ALL DETAILS | Every number HSF knows. |
 

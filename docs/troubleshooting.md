@@ -11,6 +11,7 @@ Start with the menu's status box. It names the route and gives the reason under 
 | LumeniteFX fails to compile | Only `lumenite_Kernel.fx` was copied | Copy the whole set with `include/lumenite_*.fxh`. |
 | D3D12: "D3D12: HSF HAS SET UP ITS D3D12 ROUTE. RESTART THE GAME ONCE" | First run in a D3D12 game | Restart the game. |
 | D3D12: "HSF's D3D12 routes are off in HSF.ini" | `SlBringIn=0` or `InGameDlssg=0` set by hand | Remove the key. HSF picks the route again at the next launch. |
+| "This game's own Streamline has no DLSS-G", or "The game's DLSS-G is not found yet" that never goes away with DLSS on | The game starts Streamline for Reflex only, without DLSS-G (an Unreal game with NVIDIA's Streamline plugin and DLSS-G left out) | ADVANCED > GAME'S STREAMLINE > USE HSF'S STREAMLINE on, then restart the game. Turning it off goes back. |
 | "This game's Streamline is too old for HSF (1.x)" | The game ships Streamline 1.x (Returnal) | Not supported in version 1. Use the game's own frame generation. |
 | Red box "THIS GAME HAS ITS OWN FRAME GENERATION" | In-game route | Turn the game's own FG off in its settings, then press OK. |
 | Orange box "5X AND 6X ARE NOT RECOMMENDED WITH FLOW" | D3D12 game with DLSS, flow at 5x or 6x | Set MOTION to DLSS, or go to 4X or below. |
