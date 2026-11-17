@@ -20,7 +20,9 @@ Older files may still have `Presenter`, `Generated` and `Pacing`. They belonged 
 |---|---|---|---|---|---|
 | `Extra` | `1` | 0, 1 | Live | All | The menu's FRAME GEN. 0 shows real frames only. |
 | `DlssgFrames` | `1` | 1 to 5 | Live | All | Generated frames per real frame: 1 = 2x, up to 5 = 6x. It is capped to what DLSS-G reports this GPU can do. |
-| `MfgKey` | `118` (F7) | key code, 0 = none | Live | All | Cycles `DlssgFrames` in game. |
+| `MfgKey` | `118` (F7) | key code, 0 = none | Live | All | Cycles `DlssgFrames` in game. Set in the menu's KEYBINDS section. |
+| `FrameGenKey` | `0` (none) | key code, 0 = none | Live | All | Turns frame generation (`Extra`) on and off in game. Set in KEYBINDS. |
+| `OsdKey` | `0` (none) | key code, 0 = none | Live | All | Turns the on-screen overlay off, and back to the look it had (`Overlay` 1 or 2). Set in KEYBINDS. |
 | `Overlay` | `1` | 0 off, 1 simple, 2 advanced | Live | All | The on-screen overlay. |
 | `OverlaySimple`, `OverlayAdvanced` | `100,59,0,28,28` and `100,96,0,28,28` | size %, opacity %, corner (0 top left, 1 top right, 2 bottom left, 3 bottom right), x, y | Live | All | Each overlay's look. The offsets are pixels at 1440 lines, scaled to the frame. |
 | `GameFgWarningOk` | `0` | 0, 1 | HSF writes | D3D12-G | 1 after you pressed OK on "THIS GAME HAS ITS OWN FRAME GENERATION". |

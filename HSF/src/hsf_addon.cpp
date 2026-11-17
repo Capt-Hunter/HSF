@@ -162,6 +162,9 @@ bool g_vk_dlss_depth_empty = false;
 bool g_vk_dlss_depth_good = false;      // a read-back of the DLSS depth was not flat: it is kept
 uint32_t g_vk_dlss_depth_since = 0;     // the read-back count from which Current() is of the DLSS depth, 0 before the first set with it
 uint32_t g_mfg_key = VK_F7;   // HSF.ini MfgKey: virtual-key code that cycles DlssgFrames in game (0 = none)
+uint32_t g_fg_key = 0;        // HSF.ini FrameGenKey: turns frame generation (Extra) on and off in game (0 = none)
+uint32_t g_osd_key = 0;       // HSF.ini OsdKey: turns the on-screen overlay off, and back to the look it had (0 = none)
+int g_overlay_last = 1;       // the overlay's look (1 simple, 2 advanced) to come back to when OsdKey turns it on again
 // HSF.ini FpsCap: frames on screen per second (real + generated; 0 = no cap). With DLSS-G it is Reflex's FPS cap, applied where the game
 // thread sleeps on Reflex; otherwise HSF's own limiter holds the game thread after its Present.
 uint32_t g_fps_cap = 0;
@@ -364,7 +367,7 @@ uint32_t MainMonitorHz() {
 // ---- HSF.ini ----
 // [HSF] Extra=0|1 (frame generation on), Motion=auto|uv|-uv|mvpx|-mvpx|px|-px,
 // Source=auto|launchpad|lumenite (an old "uplift" reads as auto), Overlay=0|1, DlssgFrames=1-5, MfgKey=<virtual-key code> (cycles DlssgFrames,
-// 118 = F7, 0 = none), FpsCap=<fps on screen, 0 = none>, GpuReserve=0|1 (default 1), ReflexBoost=0|1, GameQueue1=0|1, ReflexSleep=0|1, Score=0|1, ViewKey=<code> (119 = F8),
+// 118 = F7, 0 = none), FrameGenKey=<code> (Extra on/off, 0 = none), OsdKey=<code> (overlay off/on, 0 = none), FpsCap=<fps on screen, 0 = none>, GpuReserve=0|1 (default 1), ReflexBoost=0|1, GameQueue1=0|1, ReflexSleep=0|1, Score=0|1, ViewKey=<code> (119 = F8),
 // InputKey=<code> (120 = F9), Depth=0|1, Compose=0|1, DepthInverted=-1|0|1, DepthUpsideDown=-1|0|1, DepthKey=<code> (121 = F10). Re-read whenever the file's time stamp changes;
 // the panel writes it. With InGameDlssg=1: DlssgRebuildCamera=0|1, DlssgCameraKey=<code> (122 = F11, 0 = none), DlssgDynamicRes=0|1, DlssgCutCheck=0|1, DlssgQuickOff=0|1, DlssgScoreGuard=0|1, DlssgChecks=0|1, DlssgHud=0|1, DlssgHudWatch=0|1.
 
@@ -446,6 +449,10 @@ void SaveIni() {
   wchar_t key[8];
   swprintf(key, std::size(key), L"%u", g_mfg_key);
   WritePrivateProfileStringW(L"HSF", L"MfgKey", key, g_ini_path);
+  swprintf(key, std::size(key), L"%u", g_fg_key);
+  WritePrivateProfileStringW(L"HSF", L"FrameGenKey", key, g_ini_path);
+  swprintf(key, std::size(key), L"%u", g_osd_key);
+  WritePrivateProfileStringW(L"HSF", L"OsdKey", key, g_ini_path);
 #ifdef HSF_SL_GAME
   if (g_sl_drive) {
     WritePrivateProfileStringW(L"HSF", L"DlssgRebuildCamera", g_sl_camera_rebuild ? L"1" : L"0", g_ini_path);
@@ -544,6 +551,8 @@ void PollIni() {
   }
   g_dlssg_frames = std::clamp<UINT>(GetPrivateProfileIntW(L"HSF", L"DlssgFrames", 1, g_ini_path), 1, 5);
   g_mfg_key = std::min<UINT>(GetPrivateProfileIntW(L"HSF", L"MfgKey", VK_F7, g_ini_path), 255);
+  g_fg_key = std::min<UINT>(GetPrivateProfileIntW(L"HSF", L"FrameGenKey", 0, g_ini_path), 255);
+  g_osd_key = std::min<UINT>(GetPrivateProfileIntW(L"HSF", L"OsdKey", 0, g_ini_path), 255);
 #ifdef HSF_SL_GAME
   g_sl_camera_rebuild = GetPrivateProfileIntW(L"HSF", L"DlssgRebuildCamera", 1, g_ini_path) != 0;
   g_sl_camera_key = std::min<UINT>(GetPrivateProfileIntW(L"HSF", L"DlssgCameraKey", VK_F11, g_ini_path), 255);
@@ -615,6 +624,28 @@ void Log(const char* text) {
   char line[400];
   std::snprintf(line, sizeof(line), "HSF: %s", text);
   reshade::log_message(reshade::log_level::info, line);
+}
+
+// FrameGenKey and OsdKey, called next to MfgKey on every route. Saved to HSF.ini like a panel change. A route can reach this twice in one
+// frame (ReShade's present event and the route's own frame), and a pressed key reads as pressed in both, so a second press within 150 ms
+// is the same press.
+void HandleToggleKeys(effect_runtime* runtime) {
+  if (g_overlay_mode != 0) g_overlay_last = g_overlay_mode;
+  if (g_menu_open) return;
+  static ULONGLONG last = 0;
+  const ULONGLONG now = GetTickCount64();
+  if (now - last < 150) return;
+  if (g_fg_key != 0 && runtime->is_key_pressed(g_fg_key)) {
+    last = now;
+    g_extra_enabled = !g_extra_enabled;
+    Log(g_extra_enabled ? "FrameGenKey: frame generation on" : "FrameGenKey: frame generation off");
+    SaveIni();
+  }
+  if (g_osd_key != 0 && runtime->is_key_pressed(g_osd_key)) {
+    last = now;
+    g_overlay_mode = g_overlay_mode != 0 ? 0 : g_overlay_last;
+    SaveIni();
+  }
 }
 
 double Seconds(LONGLONG ticks) {
@@ -2832,6 +2863,7 @@ void BringFrame(effect_runtime* runtime, device* dev, resource target) {
     g_dlssg_frames = g_dlssg_frames >= std::max(hsf::slbring::GetStats().max_frames, 1u) ? 1 : g_dlssg_frames + 1;
     SaveIni();
   }
+  HandleToggleKeys(runtime);
   hsf::slbring::SetReflex(CapInForce(), g_reflex_boost, g_reflex_sleep);
   UpdateDlssgMotionScale();
 
@@ -3614,6 +3646,7 @@ void Dx9Frame(effect_runtime* runtime, device* dev) {
     g_dlssg_frames = g_dlssg_frames >= std::max(g_dlssg_stats.max_frames, 1u) ? 1 : g_dlssg_frames + 1;
     SaveIni();
   }
+  HandleToggleKeys(runtime);
   hsf::dlssg::SetOptions(g_extra_enabled, g_dlssg_frames);
   hsf::dlssg::SetMenuOpen(g_menu_open);
   hsf::dlssg::SetReflex(CapInForce(), g_reflex_boost);
@@ -3995,6 +4028,7 @@ void VkFrame(effect_runtime* runtime, device* dev, resource target) {
     g_dlssg_frames = g_dlssg_frames >= std::max(g_dlssg_stats.max_frames, 1u) ? 1 : g_dlssg_frames + 1;
     SaveIni();
   }
+  HandleToggleKeys(runtime);
   hsf::dlssg::SetOptions(g_extra_enabled, g_dlssg_frames);
   hsf::dlssg::SetMenuOpen(g_menu_open);
   hsf::dlssg::SetReflex(CapInForce(), g_reflex_boost);
@@ -4806,6 +4840,7 @@ void OnFinishEffects(effect_runtime* runtime, command_list*, resource_view rtv, 
     g_dlssg_frames = g_dlssg_frames >= std::max(g_dlssg_stats.max_frames, 1u) ? 1 : g_dlssg_frames + 1;
     SaveIni();
   }
+  HandleToggleKeys(runtime);
   hsf::dlssg::SetOptions(g_extra_enabled, g_dlssg_frames);
   hsf::dlssg::SetMenuOpen(g_menu_open);
   hsf::dlssg::SetReflex(CapInForce(), g_reflex_boost);
@@ -4846,6 +4881,7 @@ void OnReshadePresent(effect_runtime* runtime) {
       g_dlssg_frames = g_dlssg_frames >= std::max(hsf::slgame::GetStats().max_frames, 1u) ? 1 : g_dlssg_frames + 1;
       SaveIni();
     }
+    HandleToggleKeys(runtime);
     if (g_sl_camera_key != 0 && !g_menu_open && runtime->is_key_pressed(g_sl_camera_key)) {
       g_sl_camera_rebuild = !g_sl_camera_rebuild;
       SaveIni();
@@ -6191,10 +6227,70 @@ const char* GpuName() {
   return name;
 }
 
-// A virtual-key code as its key name: F1-F24, else its number.
+// A virtual-key code as its key name: F1-F24, else the name Windows gives the key on this keyboard layout, else its number.
 void KeyName(uint32_t key, char* text, size_t size) {
-  if (key >= VK_F1 && key <= VK_F24) std::snprintf(text, size, "F%u", key - VK_F1 + 1);
-  else std::snprintf(text, size, "KEY %u", key);
+  if (key >= VK_F1 && key <= VK_F24) {
+    std::snprintf(text, size, "F%u", key - VK_F1 + 1);
+    return;
+  }
+  LONG scan = static_cast<LONG>(MapVirtualKeyW(key, MAPVK_VK_TO_VSC));
+  // Keys of the navigation block and the arrows share scan codes with the number pad: the extended bit picks the right name.
+  switch (key) {
+    case VK_INSERT: case VK_DELETE: case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT:
+    case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN: case VK_DIVIDE: case VK_NUMLOCK: case VK_RCONTROL: case VK_RMENU:
+      scan |= 0x100;
+      break;
+    default:
+      break;
+  }
+  char name[32] = {};
+  if (scan != 0 && GetKeyNameTextA(scan << 16, name, static_cast<int>(sizeof(name))) > 0) {
+    size_t i = 0;
+    for (; name[i] != '\0' && i + 1 < size; ++i) text[i] = static_cast<char>(std::toupper(static_cast<unsigned char>(name[i])));
+    text[i] = '\0';
+    return;
+  }
+  std::snprintf(text, size, "KEY %u", key);
+}
+
+// A KEYBINDS row: the key as a button. Click it, then press a key; ESC keeps the old key, BACKSPACE sets none. A key another HSF hotkey
+// had is taken from it, so one press never does two things.
+bool KeyBind(effect_runtime* runtime, const char* id, uint32_t* key) {
+  namespace ui = hsf::ui;
+  static uint32_t* s_listening = nullptr;
+  const bool listening = s_listening == key;
+  char text[64];
+  if (listening) std::snprintf(text, sizeof(text), "PRESS A KEY // ESC CANCELS // BACKSPACE = NONE");
+  else if (*key != 0) KeyName(*key, text, sizeof(text));
+  else std::snprintf(text, sizeof(text), "NONE");
+  if (ui::LitButton(id, text, listening)) {
+    s_listening = listening ? nullptr : key;
+    return false;
+  }
+  if (!listening) return false;
+  for (uint32_t vk = VK_BACK; vk < 255; ++vk) {
+    // Modifiers alone and the Windows keys are no use as a hotkey.
+    if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || (vk >= VK_LSHIFT && vk <= VK_RMENU) || vk == VK_LWIN || vk == VK_RWIN) continue;
+    if (!runtime->is_key_pressed(vk)) continue;
+    s_listening = nullptr;
+    if (vk == VK_ESCAPE) return false;
+    *key = vk == VK_BACK ? 0 : vk;
+    if (*key != 0) {
+      uint32_t* const others[] = {&g_mfg_key, &g_fg_key, &g_osd_key, &g_view_key, &g_input_key, &g_depth_key, &g_record_key,
+#ifdef HSF_SL_GAME
+                                  &g_sl_camera_key,
+#endif
+      };
+      for (uint32_t* other : others)
+        if (other != key && *other == *key) *other = 0;
+    }
+    char name[32], line[96];
+    if (*key != 0) KeyName(*key, name, sizeof(name));
+    std::snprintf(line, sizeof(line), "KEYBINDS: %s set to %s", id + 2, *key != 0 ? name : "none");
+    Log(line);
+    return true;
+  }
+  return false;
 }
 
 // Every setting the menu shows, back to HSF's defaults. Route switches (InGameDlssg, SlBringIn and the like) and hotkeys stay as they are.
@@ -6414,6 +6510,11 @@ void DrawPanel(effect_runtime* runtime) {
   // ---- Frame generation on or off.
   ui::RowLabel("FRAME GEN", c::GREEN);
   if (ui::Toggle("##fg", &g_extra_enabled)) changed = true;
+  if (g_fg_key != 0) {
+    char key[32];
+    KeyName(g_fg_key, key, sizeof(key));
+    ui::KeyChip(key);
+  }
   // OFF keeps the helper for a quick ON; the red CLOSE HELPER box beside OFF stops it, so the game shows its own fps again (StopHelperWhileOff).
   if (!g_extra_enabled && !g_helper_closed && hsf::dlssg::Running()) {
     ImGui::SameLine();
@@ -6771,6 +6872,11 @@ void DrawPanel(effect_runtime* runtime) {
   // ---- The overlay on screen: off, simple or advanced.
   ui::RowLabel("OVERLAY", c::AMBER);
   if (ui::Choice("##overlay", OVERLAY_NAMES, 3, &g_overlay_mode)) changed = true;
+  if (g_osd_key != 0) {
+    char key[32];
+    KeyName(g_osd_key, key, sizeof(key));
+    ui::KeyChip(key);
+  }
 
   // ---- Status: the route, and a plain verdict.
   ImGui::Dummy(ImVec2(1.f, ImGui::GetFontSize() * 0.2f));
@@ -6802,7 +6908,7 @@ void DrawPanel(effect_runtime* runtime) {
   }
 
   // ---- Advanced.
-  static bool advanced = false, debug = false, details = false, overlay = false;
+  static bool advanced = false, debug = false, details = false, overlay = false, keybinds = false;
   if (ui::Section("##advanced", "ADVANCED", "", &advanced)) {
     if (const HudSetting hud = HudSettingNow(now); hud.setting != nullptr) {
       ui::SettingLabel("PROTECT GAME HUD");
@@ -6813,17 +6919,6 @@ void DrawPanel(effect_runtime* runtime) {
       ui::SettingLabel("KEEP OVERLAYS OUT");
       if (ui::Toggle("##overlays", &g_keep_overlays_out)) changed = true;
       ui::RightNote("RTSS / STEAM / DISCORD", c::FAINT);
-    }
-    ui::SettingLabel("HOTKEYS");
-    {
-      char keys[96], a[16], b[16];
-      KeyName(g_mfg_key, a, sizeof(a));
-      KeyName(g_view_key, b, sizeof(b));
-      std::snprintf(keys, sizeof(keys), "%s MULTIPLIER%s%s%s", g_mfg_key != 0 ? a : "NONE", g_view_key != 0 && !now.d3d12 ? " // " : "",
-                    g_view_key != 0 && !now.d3d12 ? b : "", g_view_key != 0 && !now.d3d12 ? " VIEW" : "");
-      const float y = ImGui::GetCursorScreenPos().y;
-      ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x, y + (ImGui::GetFrameHeight() - ImGui::GetFontSize() * 0.8f) * 0.5f));
-      ui::Caps(keys, c::TEXT, 0.8f);
     }
     ui::SettingLabel("GPU RESERVE");
     if (ImGui::IsItemHovered())
@@ -6924,6 +7019,21 @@ void DrawPanel(effect_runtime* runtime) {
 
   // ---- Overlay: size, opacity, place.
   if (ui::Section("##overlaylook", "OVERLAY", "// SIZE, OPACITY, POSITION", &overlay)) changed |= DrawOverlaySettings();
+
+  // ---- Keybinds: the in-game hotkeys, set by clicking a key and pressing the new one.
+  if (ui::Section("##keybinds", "KEYBINDS", "// CLICK, THEN PRESS A KEY", &keybinds)) {
+    ui::SettingLabel("FRAME GEN ON / OFF");
+    if (KeyBind(runtime, "##FrameGenKey", &g_fg_key)) changed = true;
+    ui::SettingLabel("MULTIPLIER");
+    if (KeyBind(runtime, "##MfgKey", &g_mfg_key)) changed = true;
+    if (mod_sets_multiplier) ui::RightNote("> SET BY MFG-UNLOCKER", c::FAINT);
+    ui::SettingLabel("OVERLAY ON / OFF");
+    if (KeyBind(runtime, "##OsdKey", &g_osd_key)) changed = true;
+    if (!now.d3d12) {
+      ui::SettingLabel("DEBUG VIEW");
+      if (KeyBind(runtime, "##ViewKey", &g_view_key)) changed = true;
+    }
+  }
 
   // ---- Debug, for testers.
   if (ui::Section("##debug", "DEBUG", "// FOR TESTERS", &debug)) {
