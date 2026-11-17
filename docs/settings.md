@@ -24,6 +24,8 @@ Older files may still have `Presenter`, `Generated` and `Pacing`. They belonged 
 | `FrameGenKey` | `0` (none) | key code, 0 = none | Live | All | Turns frame generation (`Extra`) on and off in game. Set in KEYBINDS. |
 | `OsdKey` | `0` (none) | key code, 0 = none | Live | All | Turns the on-screen overlay off, and back to the look it had (`Overlay` 1 or 2). Set in KEYBINDS. |
 | `Overlay` | `1` | 0 off, 1 simple, 2 advanced | Live | All | The on-screen overlay. |
+| `UiPanel` | `141C17` | RRGGBB in hex | Live | All | The menu's and overlay's panel colour; its border and lines follow it. Set in the menu's COLOURS section. |
+| `UiAccent` | `FF6E28` | RRGGBB in hex | Live | All | The corner mark's colour. Set in COLOURS. |
 | `OverlaySimple`, `OverlayAdvanced` | `100,59,0,28,28` and `100,96,0,28,28` | size %, opacity %, corner (0 top left, 1 top right, 2 bottom left, 3 bottom right), x, y | Live | All | Each overlay's look. The offsets are pixels at 1440 lines, scaled to the frame. |
 | `GameFgWarningOk` | `0` | 0, 1 | HSF writes | D3D12-G | 1 after you pressed OK on "THIS GAME HAS ITS OWN FRAME GENERATION". |
 | `VkOverlayWindow` | `1` | 0, 1 | Start | Vulkan | DLSS-G shows its frames in a click-through window of its own over the game. 0 puts them in a child window of the game's window, as before, which made the mouse choppy with the pointer inside the window. |
@@ -84,16 +86,16 @@ Older files may still have `Presenter`, `Generated` and `Pacing`. They belonged 
 
 | Key | Default | Values | When | Route | What it does |
 |---|---|---|---|---|---|
-| `Dx9Ex` | `1` | 0, 1 | Start | DX9 | Asks ReShade (6.5+, create_device event 96) to make the game's device Direct3D 9Ex. The bridge can then share textures on the GPU (about 0.01 ms a frame). 0 means plain D3D9 and CPU copies. The menu (ADVANCED, DX9 GPU ROUTE) switches it for the next launch. |
+| `Dx9Ex` | `1` | 0, 1 | Start | DX9 | Asks ReShade (6.5+, create_device event 96) to make the game's device Direct3D 9Ex. The bridge can then share textures on the GPU (about 0.01 ms a frame). 0 means plain D3D9 and CPU copies. The menu (ADVANCED > CRASH PROTECTION, DX9 9EX) switches it for the next launch. |
 | `Dx9HalfInputs` | `1` | 0, 1 | Start | DX9 | Flow and depth go to DLSS-G at half width and height. |
 | `Dx9GpuFence` | `1` | 0, 1 | Start | DX9 | On a Direct3D 9Ex device the bridge hands DLSS-G this frame's copies in the same frame, behind GPU fences, and the game thread does not wait. 0, or a device or driver that cannot, means one frame behind with event queries. The log line of the DX9 bridge says which. |
 | `FlowEngine` | `shader` | `shader`, `nvof` | Live | all | Who works out the optical flow. `shader`: the ReShade effect picked in FLOW FROM. `nvof`: NVIDIA Optical Flow, the graphics card's own engine (RTX 20 and newer, from the driver), run on HSF's Direct3D 12 work in the same frame. The effect must still be loaded: its texture gives the size, format and scale. The menu's FLOW ENGINE row switches it in play; the note beside it says what the last frame used. If the engine fails, the effect's flow is used and the log says why. |
 | `NvofSize` | `360` | 0 to 2160 | Start | all | Height of the grey image NVIDIA Optical Flow gets; the width keeps the picture's shape. 0 means the picture's own size. Larger is finer and slower (offline at 1080p: about 2 ms at 180, 3.5 ms at 360, 10 ms at 720, on the GPU). |
 | `Dx9ExRun` | none | `ex`, `plain` | HSF writes | DX9 | Marks a launch that has not reached its first frame yet. Cleared at the first frame and at a normal exit. |
-| `Dx9ExCrash` | `0` | 0, 1 | HSF writes | DX9 | 1 once a 9Ex launch died before its first frame, or the game faulted later on 9Ex where a texture or buffer it asked for was not made. Later launches then use plain D3D9. It goes back to 0 if a plain launch also dies early, or from the menu's TRY AGAIN. |
+| `Dx9ExCrash` | `0` | 0, 1 | HSF writes | DX9 | 1 once a 9Ex launch died before its first frame, or the game faulted later on 9Ex where a texture or buffer it asked for was not made. Later launches then use plain D3D9. It goes back to 0 if a plain launch also dies early, or when DX9 9EX is switched back ON in the menu (ADVANCED > CRASH PROTECTION). |
 | `Borderless` | `1` | 0, 1 | Start | DX9 | Turns exclusive fullscreen into a borderless window. DLSS-G needs a window. |
 | `ForceBorderless` | `0` | 0, 1 | Live | DX9, D3D11, D3D12 | Makes a game that chose windowed mode borderless fullscreen. Turning it off puts the window back as it was. The menu has it under ADVANCED > WINDOW. |
-| `BorderlessCrash` | `0` | 0, 1 | HSF writes | DX9, D3D11, D3D12 | 1 once a game died right after HSF resized its window. `ForceBorderless` then stays off at the next launch, and the menu says GAME CRASHED ON RESIZE: KEPT WINDOWED. |
+| `BorderlessCrash` | `0` | 0, 1 | HSF writes | DX9, D3D11, D3D12 | 1 once a game died right after HSF resized its window. `ForceBorderless` then stays off at the next launch, and the menu shows BORDERLESS as OFF AFTER A CRASH in ADVANCED > CRASH PROTECTION. |
 | `GpuReserve` | `1` | 0, 1 | Live | All | The menu's GPU RESERVE. Only when the card is at 95% load or more and the game's real frames stutter, HSF lowers the FPS cap a step at a time, then gives the frames back once the game stays smooth. Never above your own cap, never under 30 real fps. |
 | `VkDeviceHook` | `1` | 0, 1 | Start | Vulkan | HSF hooks `vkCreateDevice` to add shared semaphores and memory to the game's device, so frames reach DLSS-G in the same frame on the GPU. 0, or RTSS in the game, means the bridge waits for its copies on the CPU instead. |
 | `LaunchPadQuality` | `auto` | auto, low, medium, high, off | Live | All | LaunchPad's Flow Quality, from the menu's LAUNCHPAD row. `auto` picks from the game's resolution (high up to 1920x1200, medium up to 3440x1440, low above) and also keeps LaunchPad first and its depth settings matched, by itself. `low`, `medium` and `high` are set once, on the click. `off` leaves LaunchPad alone; UNDO sets it. |
@@ -106,6 +108,7 @@ Older files may still have `Presenter`, `Generated` and `Pacing`. They belonged 
 | `ViewKey` | `119` (F8) | key code | Live | All | Cycles the debug view. |
 | `InputKey` | `120` (F9) | key code | Live | D3D11, DX9 | Test: DLSS-G's motion input cycles through each source, then zero motion. It is not saved. |
 | `DepthKey` | `121` (F10) | key code | Live | D3D11, DX9 | Test: real depth, or a constant. It is not saved. |
+| `StackIgnore` | empty | file names, split by commas | Live | All | Files MOD STACK leaves out (`foo.dll, bar.asi`). Files made by Microsoft, NVIDIA, Intel or AMD, and NVIDIA's DLSS models from the driver, are always left out. |
 | `RecordKey` | `117` (F6) | key code | Live | D3D11 | Records 30 s of camera data (camera_record.h). |
 
 ## 7. Other sections and files

@@ -135,19 +135,67 @@ void TurnBackOn(const char* name) {
   Say("safe try: %s turned back on for this game from the panel", name);
 }
 
+void TurnOff(const char* name) {
+  Lock lock;
+  if (g_file[0] == 0) return;
+  wchar_t key[64];
+  Key(name, L"off", key, 64);
+  WritePrivateProfileStringW(g_section, key, L"2", g_file);
+  Say("safe try: %s turned off for this game from the panel", name);
+}
+
+int State(const char* name) {
+  Lock lock;
+  if (g_file[0] == 0) return ON;
+  wchar_t key[64];
+  Key(name, L"off", key, 64);
+  const UINT value = GetPrivateProfileIntW(g_section, key, 0, g_file);
+  return value == 0 ? ON : value == 2 ? OFF_BY_PLAYER : OFF_AFTER_CRASH;
+}
+
+namespace {
+const Step STEPS[] = {
+    {"T2_ngx_game_streamline", "NGX MOTION",
+     "Games with their own Streamline (the in-game route).\n\n"
+     "ON: HSF also reads the game's DLSS upscaler calls (NGX) and takes the motion vectors,\n"
+     "depth and jitter from there. DLSS-G then gets the game's real motion even when\n"
+     "the game does not hand it to frame generation itself.\n\n"
+     "OFF: HSF uses only what the game sends its Streamline. Games that send their own\n"
+     "motion lose nothing; others fall back to HSF's flow.\n\n"
+     "Applies after a game restart."},
+    {"H1_plugin", "PLUGIN HOOK",
+     "Games with their own Streamline.\n\n"
+     "ON: HSF takes DLSS-G's settings call where Streamline asks DLSS-G's plugin\n"
+     "(sl.dlss_g.dll, or NVIDIA's copy from the driver) for it. DLSS-G's own code is\n"
+     "never changed, so mods that patch it (MFG-Unlocker and others) keep working.\n\n"
+     "OFF: HSF patches DLSS-G's settings call directly, the older way. This can clash\n"
+     "with a mod that patches the same place.\n\n"
+     "Applies after a game restart."},
+    {"H2_load_notify", "LOAD WATCH",
+     "All routes that use Streamline.\n\n"
+     "ON: Windows tells HSF the moment a Streamline file loads, so HSF hooks it before\n"
+     "the game makes its first call. Needed by games that start Streamline early.\n\n"
+     "OFF: HSF looks for Streamline once a second instead. It still finds it, but a\n"
+     "game may make its first calls before HSF is in.\n\n"
+     "Applies after a game restart."},
+    {"H3_decoder", "HOOK DECODER",
+     "All routes.\n\n"
+     "ON: when HSF meets a function start it does not know, a full instruction decoder\n"
+     "works out how many bytes to move, so the hook can still go in.\n\n"
+     "OFF: HSF hooks only function starts on its own short list. Unknown ones are left\n"
+     "alone, and the feature that needed that hook may not work in this game.\n\n"
+     "Applies after a game restart."},
+};
+}  // namespace
+
+int Steps(const Step** out) {
+  *out = STEPS;
+  return static_cast<int>(std::size(STEPS));
+}
+
 const char* Describe(const char* name) {
-  struct Known {
-    const char* path;
-    const char* text;
-  };
-  static const Known KNOWN[] = {
-      {"T2_ngx_game_streamline", "NGX MOTION (GAME'S STREAMLINE)"},
-      {"H1_plugin", "STREAMLINE PLUGIN HOOK"},
-      {"H2_load_notify", "STREAMLINE LOAD WATCH"},
-      {"H3_decoder", "HOOK DECODER"},
-  };
-  for (const Known& k : KNOWN)
-    if (std::strcmp(k.path, name) == 0) return k.text;
+  for (const Step& s : STEPS)
+    if (std::strcmp(s.path, name) == 0) return s.label;
   return name;
 }
 
@@ -173,7 +221,11 @@ bool Allowed(const char* name) {
       Say("safe try: the last launch of %ls ended while trying %s, so %s stays off for this game from now on (the old way is used)", g_section, name, name);
     }
   }
-  if (!p->allowed) Say("safe try: %s is off for this game (an earlier launch ended while trying it): the old way is used", name);
+  if (!p->allowed) {
+    Key(name, L"off", key, 64);
+    if (GetPrivateProfileIntW(g_section, key, 0, g_file) == 2) Say("safe try: %s is off for this game (turned off in the panel): the old way is used", name);
+    else Say("safe try: %s is off for this game (an earlier launch ended while trying it): the old way is used", name);
+  }
   return p->allowed;
 }
 

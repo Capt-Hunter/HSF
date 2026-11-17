@@ -3,9 +3,13 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <intrin.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <cstdarg>
+#include <cwchar>
+#include <iterator>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -35,6 +39,38 @@ void Line(const char* format, ...) {
   va_end(args);
   g_log(text);
 }
+
+}  // namespace
+
+// Each DLSS feature made through the hooks, with the module that called (for the menu's MOD STACK). Its own lock: it is written from the
+// create hooks only, which are rare.
+SRWLOCK g_made_lock = SRWLOCK_INIT;
+MadeFeature g_made[8];
+int g_made_count = 0;
+void NoteMade(int feature, int api, void* caller) {
+  wchar_t module[64] = L"?";
+  wchar_t path[MAX_PATH] = {};
+  HMODULE handle = nullptr;
+  if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(caller), &handle)) {
+    if (GetModuleFileNameW(handle, path, MAX_PATH) != 0) {
+      const wchar_t* const slash = wcsrchr(path, L'\\');
+      wcsncpy_s(module, slash != nullptr ? slash + 1 : path, _TRUNCATE);
+    }
+  }
+  AcquireSRWLockExclusive(&g_made_lock);
+  int i = 0;
+  while (i < g_made_count && !(g_made[i].feature == feature && g_made[i].api == api && _wcsicmp(g_made[i].path, path) == 0)) ++i;
+  if (i == g_made_count && g_made_count < static_cast<int>(std::size(g_made))) {
+    g_made[i] = MadeFeature{feature, api, 0, {}, {}};
+    wcsncpy_s(g_made[i].caller, module, _TRUNCATE);
+    wcsncpy_s(g_made[i].path, path, _TRUNCATE);
+    ++g_made_count;
+  }
+  if (i < g_made_count) ++g_made[i].count;
+  ReleaseSRWLockExclusive(&g_made_lock);
+}
+
+namespace {
 
 using EvaluateFn = int(__cdecl*)(ID3D12GraphicsCommandList*, const void*, const Parameter*, void*);
 using CreateFn = int(__cdecl*)(ID3D12GraphicsCommandList*, int, const Parameter*, void**);
@@ -147,6 +183,7 @@ void CopyOn(ID3D12GraphicsCommandList* list, ID3D12Resource* source, ID3D12Resou
 
 int __cdecl HookCreate(ID3D12GraphicsCommandList* list, int feature, const Parameter* parameters, void** handle) {
   const int result = g_real_create(list, feature, parameters, handle);
+  if (result == NGX_SUCCESS) NoteMade(feature, MADE_D3D12, _ReturnAddress());
   if (result == NGX_SUCCESS) {
     Lock lock;
     if (call::ReadCreate(parameters, feature, g_created))
@@ -175,6 +212,18 @@ int __cdecl HookEvaluateC(ID3D12GraphicsCommandList* list, const void* handle, c
   if (taken && result == NGX_SUCCESS) Publish(f);
   return result;
 }
+
+}  // namespace
+
+int MadeFeatures(MadeFeature* out, int max) {
+  AcquireSRWLockShared(&g_made_lock);
+  const int n = std::min(g_made_count, max);
+  for (int i = 0; i < n; ++i) out[i] = g_made[i];
+  ReleaseSRWLockShared(&g_made_lock);
+  return n;
+}
+
+namespace {
 
 int g_hooked = 0;
 int g_found = 0;  // of the three calls, how many this driver's _nvngx.dll has
@@ -479,6 +528,7 @@ void After11(const Call11& c, int result, bool taken, Frame11& f) {
 
 int __cdecl HookCreate11(ID3D11DeviceContext* context, int feature, const Parameter* parameters, void** handle) {
   const int result = g_real_create11(context, feature, parameters, handle);
+  if (result == NGX_SUCCESS) NoteMade(feature, MADE_D3D11, _ReturnAddress());
   if (parameters != nullptr) {
     int flags = -1;
     if (parameters->Get("DLSS.Feature.Create.Flags", &flags) != NGX_SUCCESS) flags = -1;

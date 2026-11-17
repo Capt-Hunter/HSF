@@ -40,6 +40,8 @@
 
 #include <d3d11.h>
 #include <dxgi1_5.h>
+#include <objbase.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #include <wrl/client.h>
 
@@ -56,6 +58,7 @@
 #include <new>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -165,6 +168,8 @@ uint32_t g_mfg_key = VK_F7;   // HSF.ini MfgKey: virtual-key code that cycles Dl
 uint32_t g_fg_key = 0;        // HSF.ini FrameGenKey: turns frame generation (Extra) on and off in game (0 = none)
 uint32_t g_osd_key = 0;       // HSF.ini OsdKey: turns the on-screen overlay off, and back to the look it had (0 = none)
 int g_overlay_last = 1;       // the overlay's look (1 simple, 2 advanced) to come back to when OsdKey turns it on again
+uint32_t g_ui_panel_rgb = hsf::ui::DEFAULT_PANEL_RGB;    // HSF.ini UiPanel: the menu and overlay panel colour, RRGGBB in hex
+uint32_t g_ui_accent_rgb = hsf::ui::DEFAULT_ACCENT_RGB;  // HSF.ini UiAccent: the corner bracket's colour, RRGGBB in hex
 // HSF.ini FpsCap: frames on screen per second (real + generated; 0 = no cap). With DLSS-G it is Reflex's FPS cap, applied where the game
 // thread sleeps on Reflex; otherwise HSF's own limiter holds the game thread after its Present.
 uint32_t g_fps_cap = 0;
@@ -453,6 +458,11 @@ void SaveIni() {
   WritePrivateProfileStringW(L"HSF", L"FrameGenKey", key, g_ini_path);
   swprintf(key, std::size(key), L"%u", g_osd_key);
   WritePrivateProfileStringW(L"HSF", L"OsdKey", key, g_ini_path);
+  wchar_t rgb[8];
+  swprintf(rgb, std::size(rgb), L"%06X", g_ui_panel_rgb & 0xFFFFFF);
+  WritePrivateProfileStringW(L"HSF", L"UiPanel", rgb, g_ini_path);
+  swprintf(rgb, std::size(rgb), L"%06X", g_ui_accent_rgb & 0xFFFFFF);
+  WritePrivateProfileStringW(L"HSF", L"UiAccent", rgb, g_ini_path);
 #ifdef HSF_SL_GAME
   if (g_sl_drive) {
     WritePrivateProfileStringW(L"HSF", L"DlssgRebuildCamera", g_sl_camera_rebuild ? L"1" : L"0", g_ini_path);
@@ -553,6 +563,19 @@ void PollIni() {
   g_mfg_key = std::min<UINT>(GetPrivateProfileIntW(L"HSF", L"MfgKey", VK_F7, g_ini_path), 255);
   g_fg_key = std::min<UINT>(GetPrivateProfileIntW(L"HSF", L"FrameGenKey", 0, g_ini_path), 255);
   g_osd_key = std::min<UINT>(GetPrivateProfileIntW(L"HSF", L"OsdKey", 0, g_ini_path), 255);
+  {
+    // UiPanel and UiAccent: RRGGBB in hex; anything else is the default colour.
+    const auto read_rgb = [](const wchar_t* name, uint32_t fallback) {
+      wchar_t text[16] = {};
+      GetPrivateProfileStringW(L"HSF", name, L"", text, static_cast<DWORD>(std::size(text)), g_ini_path);
+      wchar_t* end = nullptr;
+      const unsigned long v = wcstoul(text, &end, 16);
+      return end == text + 6 && *end == L'\0' ? static_cast<uint32_t>(v) : fallback;
+    };
+    g_ui_panel_rgb = read_rgb(L"UiPanel", hsf::ui::DEFAULT_PANEL_RGB);
+    g_ui_accent_rgb = read_rgb(L"UiAccent", hsf::ui::DEFAULT_ACCENT_RGB);
+    hsf::ui::SetTheme(g_ui_panel_rgb, g_ui_accent_rgb);
+  }
 #ifdef HSF_SL_GAME
   g_sl_camera_rebuild = GetPrivateProfileIntW(L"HSF", L"DlssgRebuildCamera", 1, g_ini_path) != 0;
   g_sl_camera_key = std::min<UINT>(GetPrivateProfileIntW(L"HSF", L"DlssgCameraKey", VK_F11, g_ini_path), 255);
@@ -4372,7 +4395,7 @@ bool OnCreateSwapchain65(device_api api, swapchain_desc& desc, void* hwnd) {
 // too. (AC Revelations did this 22 s in with a 2x16 DXT5 texture; OnCreateResource9 now makes such textures as whole blocks.) The menu shows the state and can switch either way.
 bool g_dx9_run_marked = false;  // this process wrote Dx9ExRun (a second device in the same launch is not a crash)
 bool g_dx9_ex_crash = false;     // Dx9ExCrash as read at device creation
-// Dx9ExCrash as HSF.ini holds it now, for the menu's DX9 GPU ROUTE row without a file read each frame. Every write below sets it too; the fault handler writes from
+// Dx9ExCrash as HSF.ini holds it now, for the menu's DX9 rows without a file read each frame. Every write below sets it too; the fault handler writes from
 // another thread, hence atomic.
 std::atomic<bool> g_dx9_ex_crash_saved{false};
 void SaveDx9ExCrash(bool on) {
@@ -4404,7 +4427,7 @@ bool OnCreateDevice65(device_api api, uint32_t& api_version) {
     if (std::wcscmp(run, L"ex") == 0 && !g_dx9_ex_crash) {
       g_dx9_ex_crash = true;
       SaveDx9ExCrash(true);
-      Log("9Ex crash rule: the last launch ended before its first frame on Direct3D 9Ex: this launch uses plain D3D9 (slower copies). The menu (ADVANCED, DX9 GPU ROUTE) can try 9Ex again.");
+      Log("9Ex crash rule: the last launch ended before its first frame on Direct3D 9Ex: this launch uses plain D3D9 (slower copies). The menu (ADVANCED > CRASH PROTECTION, DX9 9EX) can turn 9Ex back on.");
     } else if (std::wcscmp(run, L"plain") == 0 && g_dx9_ex_crash) {
       g_dx9_ex_crash = false;
       SaveDx9ExCrash(false);
@@ -4556,7 +4579,7 @@ LONG CALLBACK OnFault9(EXCEPTION_POINTERS* info) {
   static std::atomic<bool> marked{false};
   if (g_dx9_ex_asked && t_create9_pending && !marked.exchange(true)) {
     SaveDx9ExCrash(true);
-    Log("9Ex crash rule: the game faulted on Direct3D 9Ex where a texture or buffer it asked for was not made: the next launch uses plain D3D9 (slower copies). The menu (ADVANCED, DX9 GPU ROUTE) can try 9Ex again.");
+    Log("9Ex crash rule: the game faulted on Direct3D 9Ex where a texture or buffer it asked for was not made: the next launch uses plain D3D9 (slower copies). The menu (ADVANCED > CRASH PROTECTION, DX9 9EX) can turn 9Ex back on.");
   }
   return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -6104,6 +6127,486 @@ void DrawFinder() {
   }
 }
 
+// ---- Mod stack ----
+// The menu's MOD STACK, under ADVANCED and closed until clicked: what each tool in the game is doing, as far as HSF can see it. Info
+// only: nothing here changes a setting. While the menu is open, the loaded modules are looked at every 2 seconds, so a mod known to break HSF
+// shows in the status box even with MOD STACK closed.
+struct StackModule {
+  wchar_t name[64] = L"";
+  wchar_t path[MAX_PATH] = L"";
+  uint32_t version[4] = {};
+  bool has_version = false;
+};
+
+// What HSF knows of a mod with frame generation or swap chain work of its own. A mod gets a line in KNOWN_MODS once it has been tried with HSF.
+enum class ModVerdict { Works, Untested, Breaks };
+struct KnownMod {
+  const wchar_t* match;  // lower case, found in the file's product name, description or file name
+  bool name_start;       // match only the start of the file name
+  const char* label;
+  ModVerdict verdict;
+};
+constexpr KnownMod KNOWN_MODS[] = {
+    {L"optiscaler", false, "OPTISCALER", ModVerdict::Breaks},
+    {L"special k", false, "SPECIAL K", ModVerdict::Untested},
+    {L"specialk", false, "SPECIAL K", ModVerdict::Untested},
+    {L"dlssg_to_fsr3", false, "DLSSG-TO-FSR3", ModVerdict::Untested},
+    {L"dlss enabler", false, "DLSS ENABLER", ModVerdict::Untested},
+    {L"dlss-enabler", false, "DLSS ENABLER", ModVerdict::Untested},
+    {L"asi loader", false, "ASI LOADER", ModVerdict::Untested},
+    {L"luma", true, "LUMA", ModVerdict::Works},
+};
+// Windows DLL names that mods take, so the game loads the mod from its own folder instead of the real one from System32.
+constexpr const wchar_t* PROXY_NAMES[] = {L"dxgi.dll",     L"d3d12.dll",   L"d3d11.dll",    L"d3d9.dll",       L"opengl32.dll", L"version.dll",
+                                          L"winmm.dll",    L"dinput8.dll", L"winhttp.dll",  L"wininet.dll",    L"dsound.dll",   L"xinput1_3.dll",
+                                          L"xinput1_4.dll", L"dbghelp.dll", L"nvngx.dll",   L"_nvngx.dll"};
+// The ignore list: makers whose files games ship next to the exe (Microsoft's dbghelp.dll, NVIDIA's DLSS models from the driver's NGX folder).
+// No mod gives itself one of these names in its version resource, and a mod in KNOWN_MODS is never ignored. Matched in CompanyName, lower case.
+constexpr const wchar_t* IGNORE_COMPANIES[] = {L"microsoft", L"nvidia", L"intel", L"advanced micro devices"};
+// Files the player wants left out too: HSF.ini [HSF] StackIgnore, file names split by commas ("foo.dll, bar.asi").
+bool StackIgnored(const wchar_t* module_name) {
+  wchar_t list[512] = L"";
+  GetPrivateProfileStringW(L"HSF", L"StackIgnore", L"", list, static_cast<DWORD>(std::size(list)), g_ini_path);
+  for (wchar_t *next = nullptr, *item = wcstok_s(list, L",", &next); item != nullptr; item = wcstok_s(nullptr, L",", &next)) {
+    while (*item == L' ') ++item;
+    for (size_t n = wcslen(item); n != 0 && item[n - 1] == L' '; --n) item[n - 1] = L'\0';
+    if (*item != L'\0' && _wcsicmp(item, module_name) == 0) return true;
+  }
+  return false;
+}
+
+struct FoundMod {
+  StackModule module;
+  char label[64] = "";
+  char how[96] = "";  // why HSF counts it as a mod
+  ModVerdict verdict = ModVerdict::Untested;
+};
+struct StackScan {
+  StackModule uplift[3];
+  int uplift_count = 0;
+  StackModule renodx[6];
+  int renodx_count = 0;
+  StackModule others[6];  // other ReShade add-ons
+  int other_count = 0;
+  FoundMod mods[8];       // other mods, found by what they are
+  int mod_count = 0;
+  const FoundMod* breaks = nullptr;  // the first one known to break HSF
+};
+
+// The file version from the module's own version resource, as sl_game's ModuleVersion (not through version.dll, which may be MFG-Unlocker).
+bool StackVersion(HMODULE module, uint32_t out[4]) {
+  const HRSRC found = FindResourceW(module, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16));  // RT_VERSION
+  if (found == nullptr) return false;
+  const HGLOBAL loaded = LoadResource(module, found);
+  const DWORD size = SizeofResource(module, found);
+  const auto* const bytes = static_cast<const uint8_t*>(loaded != nullptr ? LockResource(loaded) : nullptr);
+  if (bytes == nullptr) return false;
+  for (DWORD at = 0; at + sizeof(VS_FIXEDFILEINFO) <= size; at += 4) {
+    VS_FIXEDFILEINFO info;
+    std::memcpy(&info, bytes + at, sizeof(info));
+    if (info.dwSignature != 0xFEEF04BD) continue;
+    out[0] = HIWORD(info.dwFileVersionMS);
+    out[1] = LOWORD(info.dwFileVersionMS);
+    out[2] = HIWORD(info.dwFileVersionLS);
+    out[3] = LOWORD(info.dwFileVersionLS);
+    return true;
+  }
+  return false;
+}
+
+// A string such as ProductName from the module's version resource, read by hand for the same reason: in the resource each string is its key, a
+// 0, padding to 4 bytes from the resource's start, then the value. The first language's copy wins. Empty when there is none.
+void StackString(HMODULE module, const wchar_t* key, wchar_t* out, size_t size) {
+  out[0] = L'\0';
+  const HRSRC found = FindResourceW(module, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16));
+  if (found == nullptr) return;
+  const HGLOBAL loaded = LoadResource(module, found);
+  const DWORD bytes = SizeofResource(module, found);
+  const auto* const base = static_cast<const uint8_t*>(loaded != nullptr ? LockResource(loaded) : nullptr);
+  if (base == nullptr) return;
+  const size_t key_bytes = (wcslen(key) + 1) * sizeof(wchar_t);
+  for (size_t at = 0; at + key_bytes + 2 <= bytes; at += 2) {
+    if (std::memcmp(base + at, key, key_bytes) != 0) continue;
+    size_t v = (at + key_bytes + 3) & ~static_cast<size_t>(3);
+    size_t n = 0;
+    while (v + 2 <= bytes && n + 1 < size) {
+      wchar_t ch;
+      std::memcpy(&ch, base + v, sizeof(ch));
+      if (ch == L'\0') break;
+      out[n++] = ch;
+      v += 2;
+    }
+    out[n] = L'\0';
+    return;
+  }
+}
+
+bool StartsWithI(const wchar_t* text, const wchar_t* start) { return _wcsnicmp(text, start, wcslen(start)) == 0; }
+bool EndsWithI(const wchar_t* text, const wchar_t* end) {
+  const size_t n = wcslen(text), m = wcslen(end);
+  return n >= m && _wcsicmp(text + n - m, end) == 0;
+}
+void LowerCopy(const wchar_t* text, wchar_t* out, size_t size) {
+  wcsncpy_s(out, size, text, _TRUNCATE);
+  for (wchar_t* p = out; *p != L'\0'; ++p) *p = static_cast<wchar_t>(towlower(*p));
+}
+
+void ScanStack(StackScan& s) {
+  s = StackScan{};
+  wchar_t windows[MAX_PATH] = L"";
+  const UINT windows_length = GetSystemWindowsDirectoryW(windows, MAX_PATH);
+  wchar_t exe[MAX_PATH] = L"";
+  GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+  if (snap == INVALID_HANDLE_VALUE) return;
+  MODULEENTRY32W e{};
+  e.dwSize = sizeof(e);
+  for (BOOL ok = Module32FirstW(snap, &e); ok; ok = Module32NextW(snap, &e)) {
+    const auto fill = [&e](StackModule& m) {
+      wcsncpy_s(m.name, e.szModule, _TRUNCATE);
+      wcsncpy_s(m.path, e.szExePath, _TRUNCATE);
+      m.has_version = StackVersion(e.hModule, m.version);
+    };
+    const auto add = [&fill](StackModule* list, int& count, int max) {
+      if (count == max) return;
+      fill(list[count++]);
+    };
+    const bool addon = EndsWithI(e.szModule, L".addon") || EndsWithI(e.szModule, L".addon32") || EndsWithI(e.szModule, L".addon64");
+    if (StartsWithI(e.szModule, L"gitc-uplift")) {
+      add(s.uplift, s.uplift_count, 3);
+      continue;
+    }
+    if (StartsWithI(e.szModule, L"renodx")) {
+      add(s.renodx, s.renodx_count, 6);
+      continue;
+    }
+    // Windows' own files (System32, the driver store), the game's exe, HSF's own, the game's Streamline and DLSS files: not mods.
+    if (windows_length != 0 && _wcsnicmp(e.szExePath, windows, windows_length) == 0) continue;
+    if (_wcsicmp(e.szExePath, exe) == 0 || StartsWithI(e.szModule, L"hsf.") || StartsWithI(e.szModule, L"hsf_")) continue;
+    wchar_t lower_path[MAX_PATH];
+    LowerCopy(e.szExePath, lower_path, MAX_PATH);
+    if (std::wcsstr(lower_path, L"\\hsf_streamline\\") != nullptr) continue;
+    if (StartsWithI(e.szModule, L"sl.") || StartsWithI(e.szModule, L"nvngx_")) continue;
+    if (std::wcsstr(lower_path, L"\\nvidia\\ngx\\") != nullptr || StackIgnored(e.szModule)) continue;  // the driver's DLSS models; the player's list
+
+    wchar_t product[96], description[96], lower_name[64];
+    StackString(e.hModule, L"ProductName", product, std::size(product));
+    StackString(e.hModule, L"FileDescription", description, std::size(description));
+    if (_wcsicmp(product, L"ReShade") == 0 || _wcsicmp(product, L"MFG Unlocker") == 0) continue;  // ReShade itself; MFG-Unlocker has its own row
+    LowerCopy(e.szModule, lower_name, std::size(lower_name));
+    wchar_t lower_product[96], lower_description[96];
+    LowerCopy(product, lower_product, std::size(lower_product));
+    LowerCopy(description, lower_description, std::size(lower_description));
+
+    const KnownMod* known = nullptr;
+    for (const KnownMod& k : KNOWN_MODS) {
+      const bool hit = k.name_start ? StartsWithI(lower_name, k.match)
+                                    : std::wcsstr(lower_product, k.match) != nullptr || std::wcsstr(lower_description, k.match) != nullptr ||
+                                          std::wcsstr(lower_name, k.match) != nullptr;
+      if (hit) {
+        known = &k;
+        break;
+      }
+    }
+    char how[96] = "";
+    if (known == nullptr) {
+      wchar_t company[96], lower_company[96];
+      StackString(e.hModule, L"CompanyName", company, std::size(company));
+      LowerCopy(company, lower_company, std::size(lower_company));
+      bool ignored = false;
+      for (const wchar_t* maker : IGNORE_COMPANIES) ignored = ignored || std::wcsstr(lower_company, maker) != nullptr;
+      if (ignored) continue;
+      bool proxy = false;
+      for (const wchar_t* name : PROXY_NAMES) proxy = proxy || _wcsicmp(e.szModule, name) == 0;
+      if (proxy) std::snprintf(how, sizeof(how), "loads as %ls from the game's folder", e.szModule);
+      else if (EndsWithI(e.szModule, L".asi")) std::snprintf(how, sizeof(how), "an ASI plugin");
+      else if (GetProcAddress(e.hModule, "NVSDK_NGX_D3D12_Init") != nullptr || GetProcAddress(e.hModule, "NVSDK_NGX_D3D11_Init") != nullptr)
+        std::snprintf(how, sizeof(how), "answers the game's DLSS calls (NGX)");
+      else if (GetProcAddress(e.hModule, "slInit") != nullptr) std::snprintf(how, sizeof(how), "answers the game's Streamline calls");
+      else if (addon) {
+        add(s.others, s.other_count, 6);
+        continue;
+      } else continue;  // one of the game's own DLLs
+    } else if (addon) {
+      std::snprintf(how, sizeof(how), "a ReShade add-on");
+    } else {
+      std::snprintf(how, sizeof(how), "loads as %ls", e.szModule);
+    }
+    if (s.mod_count == static_cast<int>(std::size(s.mods))) continue;
+    FoundMod& m = s.mods[s.mod_count++];
+    fill(m.module);
+    std::snprintf(m.how, sizeof(m.how), "%s", how);
+    if (known != nullptr) {
+      std::snprintf(m.label, sizeof(m.label), "%s", known->label);
+      m.verdict = known->verdict;
+    } else {
+      // Plain ASCII only: ReShade's font has no "®", which showed as "?".
+      const wchar_t* from = product[0] != L'\0' ? product : description[0] != L'\0' ? description : e.szModule;
+      size_t n = 0;
+      for (; *from != L'\0' && n + 1 < sizeof(m.label); ++from)
+        if (*from >= 32 && *from < 127) m.label[n++] = static_cast<char>(std::toupper(static_cast<int>(*from)));
+      m.label[n] = '\0';
+    }
+  }
+  CloseHandle(snap);
+  for (int i = 0; i < s.mod_count && s.breaks == nullptr; ++i)
+    if (s.mods[i].verdict == ModVerdict::Breaks) s.breaks = &s.mods[i];
+}
+
+// The latest scan, every 2 seconds while the menu is drawn. Each mod found is logged once per run.
+const StackScan& StackNow() {
+  static StackScan scan;
+  static ULONGLONG scanned_at = 0;
+  if (scanned_at != 0 && GetTickCount64() - scanned_at < 2000) return scan;
+  ScanStack(scan);
+  scanned_at = GetTickCount64();
+  static std::vector<std::wstring> logged;
+  for (int i = 0; i < scan.mod_count; ++i) {
+    const FoundMod& m = scan.mods[i];
+    if (std::find(logged.begin(), logged.end(), m.module.path) != logged.end()) continue;
+    logged.emplace_back(m.module.path);
+    const char* verdict = m.verdict == ModVerdict::Breaks ? "KNOWN TO BREAK HSF FRAME GEN" : m.verdict == ModVerdict::Works ? "works with HSF" : "not tested with HSF";
+    char line[600];
+    std::snprintf(line, sizeof(line), "mod stack: found %s (%s): %s, %ls", m.label, m.how, verdict, m.module.path);
+    Log(line);
+  }
+  return scan;
+}
+
+// The API a DLSS feature was made on (hsf::ngx::MadeApi), as MOD STACK names it.
+const char* MadeApiName(int api) { return api == 2 ? "Vulkan" : api == 1 ? "D3D11" : "D3D12"; }
+
+// "1.2.3.4", or nothing when the file has no version.
+void StackVersionText(const StackModule& m, char* out, size_t size) {
+  if (m.has_version) std::snprintf(out, size, "%u.%u.%u.%u", m.version[0], m.version[1], m.version[2], m.version[3]);
+  else out[0] = '\0';
+}
+
+void DrawModStack(const MenuView& now, const StackScan& scan) {
+  namespace ui = hsf::ui;
+  namespace c = hsf::ui::colour;
+  static bool open = false;
+  if (!ui::Section("##modstack", "MOD STACK", "// WHAT EACH ADD-ON IS DOING", &open)) return;
+  // ReShade.ini sits next to HSF.ini: RenoDX and Uplift keep their settings in it.
+  std::wstring reshade_ini = g_ini_path;
+  reshade_ini.resize(reshade_ini.find_last_of(L'\\') + 1);
+  reshade_ini += L"ReShade.ini";
+  const auto detail = [](ImU32 colour, const char* tip, const char* format, ...) {
+    char text[300];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(text, sizeof(text), format, args);
+    va_end(args);
+    if (ui::StackDetail(text, colour) && tip != nullptr && tip[0] != '\0') ImGui::SetTooltip("%s", tip);
+  };
+
+  // DLSS features made through HSF's NGX hooks (D3D12, D3D11 and Vulkan; 64-bit only), each under the tool whose module made it: 0 HSF,
+  // 1 Uplift, 2 RenoDX, 3 the game, 4 + i the other mod scan.mods[i] (Luma, OptiScaler).
+  struct Made {
+    int owner;
+    int feature;
+    int api;  // hsf::ngx::MadeApi
+    char tip[400];
+  };
+  Made made[8];
+  int made_count = 0;
+#ifdef HSF_SL_GAME
+  {
+    // DLSS frame generation from NVIDIA's driver plugin is HSF's (its own Streamline, or the game's driven by HSF), unless the game has its own
+    // frame generation on.
+    const bool game_fg = (hsf::slgame::GameDlss() & hsf::slgame::GAME_DLSS_FG) != 0;
+    hsf::ngx::MadeFeature features[8];
+    const int n = hsf::ngx::MadeFeatures(features, 8);
+    for (int i = 0; i < n; ++i) {
+      const hsf::ngx::MadeFeature& f = features[i];
+      Made& m = made[made_count++];
+      m.feature = f.feature;
+      m.api = f.api;
+      wchar_t lower[MAX_PATH] = L"";
+      LowerCopy(f.path, lower, MAX_PATH);
+      // Streamline loads NVIDIA's updated DLSS plugins from the driver's NGX folder under a numbered name (1B0_E658700.dll): named for what it is.
+      const bool ngx_copy = std::wcsstr(lower, L"\\ngx\\models\\") != nullptr;
+      const bool hsf_streamline = std::wcsstr(lower, L"\\hsf_streamline\\") != nullptr;
+      int mod = -1;
+      for (int k = 0; k < scan.mod_count && mod < 0; ++k)
+        if (_wcsicmp(scan.mods[k].module.path, f.path) == 0) mod = k;
+      if (StartsWithI(f.caller, L"hsf") || hsf_streamline || (ngx_copy && f.feature == 11 && !game_fg)) m.owner = 0;
+      else if (StartsWithI(f.caller, L"gitc-uplift")) m.owner = 1;
+      else if (StartsWithI(f.caller, L"renodx")) m.owner = 2;
+      else if (mod >= 0) m.owner = 4 + mod;
+      else m.owner = 3;
+      if (ngx_copy)
+        std::snprintf(m.tip, sizeof(m.tip), "Made on %s by NVIDIA's DLSS plugin from the driver's NGX folder (%ls), %u times", MadeApiName(f.api), f.caller, f.count);
+      else std::snprintf(m.tip, sizeof(m.tip), "Made on %s by %ls, %u times\n%ls", MadeApiName(f.api), f.caller, f.count, f.path);
+    }
+  }
+#endif
+  const auto feature_name = [](int feature) {
+    return feature == 1 ? "DLSS super resolution" : feature == 11 ? "DLSS frame generation" : feature == 13 ? "DLSS ray reconstruction" : "another DLSS feature";
+  };
+  const auto made_details = [&](int owner) {
+    for (int i = 0; i < made_count; ++i)
+      if (made[i].owner == owner) detail(c::DIM, made[i].tip, "makes %s on %s", feature_name(made[i].feature), MadeApiName(made[i].api));
+  };
+  char version[48];
+
+  // HSF.
+  if (!g_extra_enabled) ui::StackRow("HSF", c::TEXT, "FRAME GEN OFF", c::DIM);
+  else if (now.generating) {
+    char status[48];
+    std::snprintf(status, sizeof(status), "GENERATING %uX", g_dlssg_frames + 1);
+    ui::StackRow("HSF", c::TEXT, status, c::GREEN);
+  } else if (now.problem != nullptr) ui::StackRow("HSF", c::TEXT, "PROBLEM", c::RED);
+  else ui::StackRow("HSF", c::TEXT, "WAITING", c::AMBER);
+  if (g_extra_enabled && !now.generating && (now.problem != nullptr || now.waiting != nullptr))
+    detail(now.problem != nullptr ? c::RED : c::AMBER, nullptr, "%s", now.problem != nullptr ? now.problem : now.waiting);
+  detail(c::DIM, nullptr, "route: %s%s%s", now.api, now.api[0] != '\0' && now.route[0] != '\0' ? " // " : "", now.route[0] != '\0' ? now.route : "not picked yet");
+  {
+    const Finder& f = ReadFinder();
+    for (int i = 0; i < f.count; ++i)
+      if (std::strcmp(f.steps[i].name, "MOTION") == 0) detail(c::DIM, nullptr, "motion %s", f.steps[i].detail);
+  }
+  made_details(0);
+
+  // RenoDX: every renodx add-on, and RenoDX DLSS's hook stage.
+  for (int i = 0; i < scan.renodx_count; ++i) {
+    const StackModule& m = scan.renodx[i];
+    StackVersionText(m, version, sizeof(version));
+    char status[120];
+    std::snprintf(status, sizeof(status), "%ls %s", m.name, version);
+    if (ui::StackRow(i == 0 ? "RENODX" : "", c::TEXT, status, c::GREEN)) ImGui::SetTooltip("%ls", m.path);
+    if (StartsWithI(m.name, L"renodx-dlss")) {
+      const int stage = static_cast<int>(GetPrivateProfileIntW(L"RENODX-DLSS", L"DirectNeuralRenderingHookStage", -1, reshade_ini.c_str()));
+      if (stage == 2) detail(c::DIM, nullptr, "hooks DLSS after upscaling");
+      else if (stage == 3) detail(c::DIM, nullptr, "hooks DLSS at present");
+      else if (stage >= 0) detail(c::DIM, nullptr, "hooks DLSS at stage %d", stage);
+    }
+  }
+  if (scan.renodx_count != 0) made_details(2);
+
+  // Uplift.
+  for (int i = 0; i < scan.uplift_count; ++i) {
+    const StackModule& m = scan.uplift[i];
+    const int enabled = static_cast<int>(GetPrivateProfileIntW(L"Uplift", L"Enabled", -1, reshade_ini.c_str()));
+    StackVersionText(m, version, sizeof(version));
+    char status[120];
+    std::snprintf(status, sizeof(status), "%s %s", enabled == 0 ? "OFF" : "ON", version);
+    if (ui::StackRow(i == 0 ? "UPLIFT" : "", c::TEXT, status, enabled == 0 ? c::DIM : c::GREEN)) ImGui::SetTooltip("%ls", m.path);
+  }
+  if (scan.uplift_count != 0) {
+    const int with_fg = static_cast<int>(GetPrivateProfileIntW(L"Uplift", L"PresentWithFrameGen", -1, reshade_ini.c_str()));
+    if (with_fg >= 0) detail(c::DIM, nullptr, "present with frame gen: %s", with_fg != 0 ? "on" : "off");
+    made_details(1);
+  }
+
+  // MFG-Unlocker (RTX 40, 30, 20): its own status file.
+  const OlderCardMod& older = OlderCardModNow();
+  if (older.live) {
+    ui::StackRow("MFG-UNLOCKER", c::TEXT, older.ready ? "RUNNING" : "RUNNING, NO DLSS-G YET", older.ready ? c::GREEN : c::AMBER);
+    detail(c::DIM, nullptr, "%s", older.where);
+    if (older.fg_on && older.applied != 0) detail(c::DIM, nullptr, "frame generation %ux", older.applied);
+  }
+
+  // Other mods, found by what they are.
+  for (int i = 0; i < scan.mod_count; ++i) {
+    const FoundMod& m = scan.mods[i];
+    const char* status = m.verdict == ModVerdict::Breaks ? "KNOWN TO BREAK HSF FRAME GEN" : m.verdict == ModVerdict::Works ? "LOADED" : "NOT TESTED WITH HSF";
+    const ImU32 colour = m.verdict == ModVerdict::Breaks ? c::RED : m.verdict == ModVerdict::Works ? c::GREEN : c::AMBER;
+    ui::StackRow(m.label, c::TEXT, status, colour);
+    StackVersionText(m.module, version, sizeof(version));
+    char tip[MAX_PATH + 8];
+    std::snprintf(tip, sizeof(tip), "%ls", m.module.path);
+    detail(c::DIM, tip, "%ls%s%s, %s", m.module.name, version[0] != '\0' ? " " : "", version, m.how);
+    made_details(4 + i);
+  }
+
+  // The game itself: the DLSS it makes, and its Streamline copies.
+  {
+    bool sr = false, fg = false, rr = false;
+    for (int i = 0; i < made_count; ++i)
+      if (made[i].owner == 3) {
+        sr = sr || made[i].feature == 1;
+        fg = fg || made[i].feature == 11;
+        rr = rr || made[i].feature == 13;
+      }
+    // A game on its own Streamline asks it for DLSS: seen at its Streamline calls, which works even when the NGX hooks are off (a game-Streamline
+    // route, or NGX MOTION turned off after a crash). Each feature only once: the NGX lines name it already when they saw it.
+    bool sl_sr = false, sl_fg = false, sl_rr = false;
+#ifdef HSF_SL_GAME
+    const uint32_t asked = hsf::slgame::GameDlss();
+    sl_sr = !sr && (asked & hsf::slgame::GAME_DLSS_SR) != 0;
+    sl_fg = !fg && (asked & hsf::slgame::GAME_DLSS_FG) != 0;
+    sl_rr = !rr && (asked & hsf::slgame::GAME_DLSS_RR) != 0;
+    sr = sr || sl_sr;
+    fg = fg || sl_fg;
+    rr = rr || sl_rr;
+#endif
+    char status[64] = "";
+    const auto add = [&status](const char* part) {
+      if (status[0] != '\0') strcat_s(status, " + ");
+      strcat_s(status, part);
+    };
+    if (sr) add("DLSS SR");
+    if (fg) add("FRAME GEN");
+    if (rr) add("RAY RECON");
+    if (status[0] != '\0') {
+      ui::StackRow("GAME", c::TEXT, status, c::GREEN);
+      made_details(3);
+      if (sl_sr) detail(c::DIM, nullptr, "asks its Streamline for DLSS super resolution");
+      if (sl_rr) detail(c::DIM, nullptr, "asks its Streamline for DLSS ray reconstruction");
+      if (sl_fg) detail(c::AMBER, nullptr, "has its own DLSS frame generation on");
+    } else {
+      // Why no DLSS shows, in the words that fit this game: DLSS runs only in 64-bit D3D12, D3D11 and Vulkan games.
+#ifdef HSF_SL_GAME
+      const bool dx9 = std::strcmp(now.api, "DX9") == 0;
+      ui::StackRow("GAME", c::TEXT, dx9 ? "NO DLSS" : "NO DLSS SEEN YET", c::DIM);
+      detail(c::FAINT, nullptr, "%s", dx9 ? "DX9 games have no DLSS" : "shows here once the game or a mod makes DLSS");
+#else
+      ui::StackRow("GAME", c::TEXT, "NO DLSS", c::DIM);
+      detail(c::FAINT, nullptr, "32-bit games have no DLSS");
+#endif
+    }
+  }
+#ifdef HSF_SL_GAME
+  {
+    hsf::slgame::Interposer copies[4];
+    const int count = hsf::slgame::ListInterposers(copies, 4);
+    bool game_copy_in_use = false;
+    for (int i = 0; i < count; ++i) game_copy_in_use = game_copy_in_use || (copies[i].in_use && !copies[i].hsf_own);
+    for (int i = 0; i < count; ++i) {
+      const hsf::slgame::Interposer& s = copies[i];
+      const bool stray = !s.hsf_own && !s.in_use && game_copy_in_use;
+      const char* state = s.hsf_own ? "HSF's own copy" : s.in_use ? "the game's copy, in use" : stray ? "not used: another mod's or a leftover copy" : "loaded";
+      char tip[MAX_PATH + 8];
+      std::snprintf(tip, sizeof(tip), "%ls", s.path);
+      detail(stray ? c::AMBER : c::DIM, tip, "Streamline %u.%u.%u, %s", s.version[0], s.version[1], s.version[2], state);
+    }
+  }
+#endif
+
+  // Other ReShade add-ons, and what is not here, one line each.
+  if (scan.other_count != 0) {
+    char names[300] = "";
+    for (int i = 0; i < scan.other_count; ++i) {
+      char one[80];
+      std::snprintf(one, sizeof(one), "%s%ls", i != 0 ? ", " : "", scan.others[i].name);
+      strcat_s(names, one);
+    }
+    ui::StackRow("OTHER ADD-ONS", c::DIM, "LOADED", c::DIM);
+    detail(c::DIM, nullptr, "%s", names);
+  }
+  char missing[96] = "";
+  const auto miss = [&missing](bool here, const char* name) {
+    if (here) return;
+    if (missing[0] != '\0') strcat_s(missing, ", ");
+    strcat_s(missing, name);
+  };
+  miss(scan.renodx_count != 0, "RENODX");
+  miss(scan.uplift_count != 0, "UPLIFT");
+  miss(older.live, "MFG-UNLOCKER");
+  if (missing[0] != '\0') ui::StackRow("NOT LOADED", c::FAINT, missing, c::FAINT);
+}
+
 // The first step that stops frame generation, as the WAITING line: never WAITING with no reason.
 const char* FinderReason() {
   static char text[260];
@@ -6253,6 +6756,41 @@ void KeyName(uint32_t key, char* text, size_t size) {
   std::snprintf(text, size, "KEY %u", key);
 }
 
+// A COLOURS row: a swatch that opens ImGui's colour picker, and RESET back to `fallback`. The menu shows the new colour while it is picked;
+// true (save HSF.ini) once a pick is let go or RESET is clicked, so a drag across the picker is not saved every frame.
+bool ColourRow(const char* id, uint32_t* rgb, uint32_t fallback) {
+  namespace ui = hsf::ui;
+  static const uint32_t* s_editing = nullptr;  // the row being picked and not saved yet
+  float col[3] = {static_cast<float>((*rgb >> 16) & 0xFF) / 255.f, static_cast<float>((*rgb >> 8) & 0xFF) / 255.f,
+                  static_cast<float>(*rgb & 0xFF) / 255.f};
+  bool save = false;
+  if (ImGui::ColorEdit3(id, col, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel)) {
+    const auto byte = [](float v) { return static_cast<uint32_t>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f); };
+    *rgb = (byte(col[0]) << 16) | (byte(col[1]) << 8) | byte(col[2]);
+    s_editing = rgb;
+  }
+  if (*rgb != fallback) {
+    ImGui::SameLine();
+    char reset_id[32];
+    std::snprintf(reset_id, sizeof(reset_id), "%s_reset", id);
+    if (ui::Button(reset_id, "RESET", hsf::ui::colour::DIM)) {
+      *rgb = fallback;
+      save = true;
+    }
+  }
+  if (s_editing == rgb && !ImGui::IsAnyItemActive()) {
+    s_editing = nullptr;
+    save = true;
+  }
+  ui::SetTheme(g_ui_panel_rgb, g_ui_accent_rgb);
+  if (save) {
+    char line[64];
+    std::snprintf(line, sizeof(line), "COLOURS: %s set to %06X", id + 2, *rgb);
+    Log(line);
+  }
+  return save;
+}
+
 // A KEYBINDS row: the key as a button. Click it, then press a key; ESC keeps the old key, BACKSPACE sets none. A key another HSF hotkey
 // had is taken from it, so one press never does two things.
 bool KeyBind(effect_runtime* runtime, const char* id, uint32_t* key) {
@@ -6391,42 +6929,133 @@ void CopyLog(const MenuView& view) {
 
 // A setting read only when the game starts, as a toggle that writes HSF.ini straight away.
 // Each key is read from the file once and kept here after that, so a menu frame reads no file.
-void StartupToggle(const char* label, const wchar_t* key, int fallback);
+void StartupToggle(const char* label, const wchar_t* key, int fallback, const char* tip = nullptr);
 
-// Safe try (safe_try.h): its switch and the ways it turned off for this game after a crash, each with a button that turns it back on. Both apply at the next launch.
+// The WINDOW choice: ForceBorderless, saved per game, live both ways. Asking for borderless again clears the borderless crash rule.
+void SetForceBorderless(bool on) {
+  g_force_borderless = on;
+  WritePrivateProfileStringW(L"HSF", L"ForceBorderless", on ? L"1" : L"0", g_ini_path);
+  if (on && g_borderless_crash) {
+    g_borderless_crash = false;
+    WritePrivateProfileStringW(L"HSF", L"BorderlessCrash", L"0", g_ini_path);
+  }
+  Log(on ? "window: borderless fullscreen asked from the menu (ForceBorderless=1); if the game crashes when its window changes size, set it back"
+         : "window: back to the game's own windowed mode, from the menu (ForceBorderless=0)");
+}
+
+// Crash protection: every rule that switches something off by itself after a crash, in one list, and only the rows that apply to this game.
+// The SAFE TRY switch and its steps (safe_try.h), then the DX9 9Ex rule (Dx9ExCrash) and the borderless rule (BorderlessCrash), which keep their own
+// HSF.ini keys. Each row is an ON / OFF switch; a crash turns it OFF by itself (the row says so), and the player can turn it off or back on.
 void DrawSafeTry() {
   namespace ui = hsf::ui;
   namespace c = hsf::ui::colour;
   ui::Rule();
-  ui::Caps("SAFE TRY // APPLIES AFTER A GAME RESTART", c::DIM, 0.8f);
-  StartupToggle("SAFE TRY", L"SafeTry", 1);
+  ui::Caps("CRASH PROTECTION // APPLIES AFTER A GAME RESTART", c::DIM, 0.8f);
+  StartupToggle("SAFE TRY", L"SafeTry", 1,
+                "ON: before HSF uses one of its hook steps (NGX MOTION, PLUGIN HOOK, LOAD WATCH,\n"
+                "HOOK DECODER), it notes it. If the game then crashes, that step is switched OFF\n"
+                "for this game at the next launch, and HSF uses the older, safer way instead.\n"
+                "The game starts again without you changing anything.\n\n"
+                "OFF: every hook step is used, even after a crash, and none is switched off.\n"
+                "Only for testing a step again and again.\n\n"
+                "DX9 9EX and BORDERLESS have their own crash rules and stay on either way.\n\n"
+                "Applies after a game restart.");
   if (!hsf::safetry::Enabled()) ui::RightNote("OFF NOW: NOTHING IS TURNED OFF", c::AMBER);
-  // The file is read a few times a second at most.
-  static char s_names[8][32];
-  static int s_count = 0;
+  const hsf::safetry::Step* steps = nullptr;
+  const int count = std::min(hsf::safetry::Steps(&steps), 8);
+  // The file, and whether the game started its own Streamline, are read a few times a second at most.
+  static int s_state[8];
+  static bool s_game_sl = false;
   static ULONGLONG s_read = 0;
   const ULONGLONG now_ms = GetTickCount64();
   if (s_read == 0 || now_ms - s_read > 500) {
-    s_count = hsf::safetry::ListOff(s_names, 8);
+    for (int i = 0; i < count; ++i) s_state[i] = hsf::safetry::State(steps[i].path);
+#ifdef HSF_SL_GAME
+    s_game_sl = g_sl_game && GameStreamlineStarted();
+#endif
     s_read = now_ms;
   }
-  if (s_count == 0) {
-    ui::Note("NOTHING TURNED OFF AFTER A CRASH", c::FAINT);
-    return;
-  }
-  ui::Note("TURNED OFF AFTER A CRASH:", c::AMBER);
-  for (int i = 0; i < s_count; ++i) {
-    ui::SettingLabel(hsf::safetry::Describe(s_names[i]));
+  // Which steps can happen in this game. NGX MOTION and PLUGIN HOOK need the game's own Streamline; LOAD WATCH any Streamline in the game's process
+  // (64-bit, not DX9); HOOK DECODER every route. A step that is off is always shown, so it can be turned back on.
+  const auto applies = [&](const char* path) {
+    if (std::strcmp(path, "H3_decoder") == 0) return true;
+#ifdef HSF_SL_GAME
+    if (std::strcmp(path, "H2_load_notify") == 0) return g_sl_game && g_native9 == nullptr;
+    return s_game_sl;
+#else
+    return false;
+#endif
+  };
+  int hidden = 0;
+  for (int i = 0; i < count; ++i) {
+    if (s_state[i] == hsf::safetry::ON && !applies(steps[i].path)) {
+      ++hidden;
+      continue;
+    }
+    if (ui::SettingLabel(steps[i].label)) ImGui::SetTooltip("%s", steps[i].tip);
     char id[48];
-    std::snprintf(id, sizeof(id), "##safeon%d", i);
-    if (ui::Button(id, "TURN BACK ON", c::GREEN)) {
-      hsf::safetry::TurnBackOn(s_names[i]);
+    std::snprintf(id, sizeof(id), "##safe%d", i);
+    bool on = s_state[i] == hsf::safetry::ON;
+    if (ui::Toggle(id, &on, steps[i].tip)) {
+      if (on) hsf::safetry::TurnBackOn(steps[i].path);
+      else hsf::safetry::TurnOff(steps[i].path);
       s_read = 0;
     }
+    if (s_state[i] == hsf::safetry::OFF_AFTER_CRASH) ui::RightNote("> OFF AFTER A CRASH", c::AMBER);
+    else if (s_state[i] == hsf::safetry::OFF_BY_PLAYER) ui::RightNote("> OFF BY YOU", c::FAINT);
+  }
+
+  // DX9 9EX: whether the next launch asks for a Direct3D 9Ex device (GPU copies) or plain D3D9 (CPU copies). A game that makes its own 9Ex device has no row:
+  // HSF does not choose there. The rule itself is at device creation: a 9Ex launch that dies before its first frame, or a fault on 9Ex where something the game
+  // asked for was not made, sets Dx9ExCrash; a plain launch that dies early too clears it again (9Ex was not the cause).
+  if (g_native9 != nullptr && !(g_dx9_device_ex && !g_dx9_ex_asked)) {
+    static const char* const DX9_TIP =
+        "DirectX 9 games only.\n\n"
+        "ON: HSF asks for a Direct3D 9Ex device, so frames reach DLSS-G on the GPU,\n"
+        "at almost no cost.\n\n"
+        "OFF: a plain Direct3D 9 device, and frames go through CPU copies (slower).\n\n"
+        "Some games crash on 9Ex. If the game crashes while loading, or faults on 9Ex,\n"
+        "this switches OFF by itself for this game. If the game then crashes on plain\n"
+        "D3D9 too, 9Ex was not the cause and it switches back ON.\n\n"
+        "Applies after a game restart.";
+    const bool crashed = g_dx9_ex_crash_saved.load();
+    if (ui::SettingLabel("DX9 9EX")) ImGui::SetTooltip("%s", DX9_TIP);
+    bool on = g_dx9_ex && !crashed;
+    if (ui::Toggle("##safedx9", &on, DX9_TIP)) {
+      g_dx9_ex = on;
+      WritePrivateProfileStringW(L"HSF", L"Dx9Ex", on ? L"1" : L"0", g_ini_path);
+      if (on && crashed) SaveDx9ExCrash(false);
+      Log(on ? "DX9 9Ex: turned on from the menu, the next launch asks for 9Ex" : "DX9 9Ex: turned off from the menu, the next launch uses plain D3D9 (CPU copies)");
+    }
+    if (crashed) ui::RightNote("> OFF AFTER A CRASH", c::AMBER);
+    else if (!g_dx9_ex) ui::RightNote("> OFF BY YOU", c::FAINT);
+  }
+
+  // BORDERLESS: only for a game HSF makes borderless itself (WINDOW = BORDERLESS, or the rule turned it off). The same setting as ADVANCED > WINDOW.
+  if (g_force_borderless || g_borderless_crash) {
+    static const char* const BORDERLESS_TIP =
+        "Games that run in a window, with ADVANCED > WINDOW set to BORDERLESS.\n\n"
+        "ON: HSF makes the game's window borderless fullscreen over its monitor.\n\n"
+        "OFF: the game keeps its own window.\n\n"
+        "Some games crash when their window changes size. If the game crashes right\n"
+        "after HSF resized its window, this switches OFF by itself, so the game can\n"
+        "start again. Tip: set the game's own resolution to your monitor's size;\n"
+        "then borderless has nothing to resize.\n\n"
+        "This one applies at once, no restart.";
+    if (ui::SettingLabel("BORDERLESS")) ImGui::SetTooltip("%s", BORDERLESS_TIP);
+    bool on = g_force_borderless;
+    if (ui::Toggle("##safeborderless", &on, BORDERLESS_TIP)) SetForceBorderless(on);
+    if (g_borderless_crash && !g_force_borderless) ui::RightNote("> OFF AFTER A CRASH", c::AMBER);
+  }
+
+  if (hidden > 0) {
+    char note[96];
+    std::snprintf(note, sizeof(note), "%d MORE STEP%s NOT USED IN THIS GAME", hidden, hidden == 1 ? "" : "S");
+    ui::Caps(note, c::FAINT, 0.7f);
   }
 }
 
-void StartupToggle(const char* label, const wchar_t* key, int fallback) {
+void StartupToggle(const char* label, const wchar_t* key, int fallback, const char* tip) {
   namespace ui = hsf::ui;
   struct Kept {
     const wchar_t* key;
@@ -6444,9 +7073,9 @@ void StartupToggle(const char* label, const wchar_t* key, int fallback) {
     read = true;
   }
   bool on = kept != nullptr && !read ? kept->on : GetPrivateProfileIntW(L"HSF", key, fallback, g_ini_path) != 0;
-  ui::SettingLabel(label);
+  if (ui::SettingLabel(label) && tip != nullptr) ImGui::SetTooltip("%s", tip);
   ImGui::PushID(label);
-  if (ui::Toggle("##t", &on)) WritePrivateProfileStringW(L"HSF", key, on ? L"1" : L"0", g_ini_path);
+  if (ui::Toggle("##t", &on, tip)) WritePrivateProfileStringW(L"HSF", key, on ? L"1" : L"0", g_ini_path);
   ImGui::PopID();
   if (kept != nullptr) kept->on = on;
 }
@@ -6476,6 +7105,26 @@ void DockMenuWithReShade() {
   Log("menu: HSF's menu docked as a tab next to ReShade's Home and Add-ons");
 }
 
+// The footer's Discord logo: opens HSF's forum channel on the RenoDX Discord server (a public server, so the link works without an invite) in
+// the default browser. Nothing is sent but the link. On its own thread, as the shell may take a moment and must not hold up the frame.
+void OpenDiscordForum() {
+  Log("menu: Discord logo clicked, opening the HSF forum in the browser");
+  std::thread([] {
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    ShellExecuteW(nullptr, L"open", L"https://discord.com/channels/1408098019194310818/1569830264635523164", nullptr, nullptr, SW_SHOWNORMAL);
+    if (SUCCEEDED(com)) CoUninitialize();
+  }).detach();
+}
+
+// The header's colour presets: a panel colour and an accent each. The first is HSF's default look.
+constexpr hsf::ui::Preset COLOUR_PRESETS[] = {
+    {"Default: green-grey and orange", hsf::ui::DEFAULT_PANEL_RGB, hsf::ui::DEFAULT_ACCENT_RGB},
+    {"Crimson: dark red and amber", 0x2A0F10, 0xFF9A3C},
+    {"Navy: dark blue and cyan", 0x0E1626, 0x3CC8FF},
+    {"Violet: dark purple and pink", 0x1B1226, 0xE46CFF},
+    {"Mono: black and white", 0x111111, 0xE8E8E8},
+};
+
 void DrawPanel(effect_runtime* runtime) {
   namespace ui = hsf::ui;
   namespace c = hsf::ui::colour;
@@ -6486,7 +7135,17 @@ void DrawPanel(effect_runtime* runtime) {
   ui::BeginPanel("##hsf_menu");
   char right[96];
   std::snprintf(right, sizeof(right), "%s%s%s", GpuName(), now.api[0] != '\0' ? " // " : "", now.api);
-  ui::Header("HSF // FRAME GEN", right);
+  const int preset = ui::Header("HSF // FRAME GEN", right, COLOUR_PRESETS, static_cast<int>(std::size(COLOUR_PRESETS)), g_ui_panel_rgb, g_ui_accent_rgb);
+  if (preset >= 0) {
+    g_ui_panel_rgb = COLOUR_PRESETS[preset].panel_rgb;
+    g_ui_accent_rgb = COLOUR_PRESETS[preset].accent_rgb;
+    ui::SetTheme(g_ui_panel_rgb, g_ui_accent_rgb);
+    char line[160];
+    std::snprintf(line, sizeof(line), "COLOURS: preset \"%s\" picked (panel %06X, accent %06X)", COLOUR_PRESETS[preset].name, g_ui_panel_rgb, g_ui_accent_rgb);
+    Log(line);
+    changed = true;
+  }
+  const StackScan& stack = StackNow();
   // A game with its own DLSS frame generation (HSF drives the game's own Streamline). HSF can't reliably tell whether the game's FG setting is on (Shadows sets it before
   // HSF's hook is in), so this is advice on every such game until the player presses OK, which HSF.ini keeps for this game.
   if (now.drive && !g_game_fg_ok) {
@@ -6897,6 +7556,14 @@ void DrawPanel(effect_runtime* runtime) {
     verdict_colour = c::AMBER;
     reason = shown.waiting;
   }
+  // A mod known to break HSF's frame generation (MOD STACK's red rows) comes first: it is the likeliest cause of anything else here.
+  char conflict[160];
+  if (g_extra_enabled && stack.breaks != nullptr) {
+    std::snprintf(conflict, sizeof(conflict), "%s IS LOADED (%ls): IT IS KNOWN TO BREAK HSF FRAME GEN", stack.breaks->label, stack.breaks->module.name);
+    verdict = "CONFLICT";
+    verdict_colour = c::RED;
+    reason = conflict;
+  }
   ui::StatusBox(route, verdict, verdict_colour);
   if (reason != nullptr) ui::Note(reason, verdict_colour);
   if (verdict_colour != c::GREEN) DrawFinder();
@@ -6906,9 +7573,8 @@ void DrawPanel(effect_runtime* runtime) {
     for (size_t i = 0; i < count; ++i) frames[i] = g_menu_ms[(g_menu_write - count + i) % MENU_HISTORY];
     ui::Sparkline(frames, count, ImGui::GetFontSize() * 1.6f);
   }
-
-  // ---- Advanced.
-  static bool advanced = false, debug = false, details = false, overlay = false, keybinds = false;
+  // ---- Advanced, first of the sections; MOD STACK follows it.
+  static bool advanced = false, debug = false, details = false, overlay = false, keybinds = false, colours = false;
   if (ui::Section("##advanced", "ADVANCED", "", &advanced)) {
     if (const HudSetting hud = HudSettingNow(now); hud.setting != nullptr) {
       ui::SettingLabel("PROTECT GAME HUD");
@@ -6936,44 +7602,16 @@ void DrawPanel(effect_runtime* runtime) {
       ui::RightNote("> WATCHING FOR STUTTER", c::FAINT);
     }
     if (g_native9 != nullptr) {
-      // DX9 games: whether frames reach DLSS-G on the GPU (9Ex) or through CPU copies, and why; the 9Ex crash rule can be undone here.
+      // DX9 games: whether frames reach DLSS-G on the GPU (9Ex) or through CPU copies in this launch. The switch, and the 9Ex crash rule, are in CRASH PROTECTION (DX9 9EX).
       ui::SettingLabel("DX9 GPU ROUTE");
-      const bool crash_now = g_dx9_ex_crash_saved.load();
-      const float y = ImGui::GetCursorScreenPos().y;
-      // Either way takes effect at the next launch (the device is made once), and is saved per game in HSF.ini.
-      const auto set_ex = [](bool on) {
-        g_dx9_ex = on;
-        WritePrivateProfileStringW(L"HSF", L"Dx9Ex", on ? L"1" : L"0", g_ini_path);
-        Log(on ? "DX9 GPU route: turned on from the menu, the next launch asks for 9Ex" : "DX9 GPU route: turned off from the menu, the next launch uses plain D3D9 (CPU copies)");
-      };
-      if (g_dx9_device_ex && !g_dx9_ex_asked) {
-        ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x, y + (ImGui::GetFrameHeight() - ImGui::GetFontSize() * 0.8f) * 0.5f));
-        ui::Caps("ON (THE GAME'S OWN D3D9EX)", c::GREEN, 0.8f);
-      } else if (g_dx9_device_ex && crash_now) {
-        if (ui::Button("##dx9ex", "ON // GAME FAULTED WITH IT: OFF AT NEXT LAUNCH // KEEP ON", c::AMBER)) {
-          SaveDx9ExCrash(false);
-          Log("9Ex crash rule: cleared from the menu, the next launch stays on 9Ex");
-        }
-      } else if (g_dx9_device_ex && g_dx9_ex) {
-        if (ui::Button("##dx9ex", "ON (D3D9EX) // TURN OFF (NEXT LAUNCH)", c::GREEN)) set_ex(false);
-      } else if (g_dx9_device_ex) {
-        if (ui::Button("##dx9ex", "ON // OFF AT NEXT LAUNCH // KEEP ON", c::AMBER)) set_ex(true);
-      } else if (g_dx9_ex_crash && crash_now) {
-        if (ui::Button("##dx9ex", "OFF: GAME CRASHED WITH IT // TRY AGAIN", c::AMBER)) {
-          SaveDx9ExCrash(false);
-          Log("9Ex crash rule: cleared from the menu, the next launch tries 9Ex again");
-        }
-      } else if (g_dx9_ex_crash) {
-        ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x, y + (ImGui::GetFrameHeight() - ImGui::GetFontSize() * 0.8f) * 0.5f));
-        ui::Caps("OFF // TRIES 9EX AT NEXT LAUNCH", c::TEXT, 0.8f);
-      } else if (!g_dx9_ex) {
-        if (ui::Button("##dx9ex", "OFF // CPU COPIES // TURN ON (NEXT LAUNCH)", c::TEXT)) set_ex(true);
-      } else if (!g_dx9_ex_at_launch) {
-        if (ui::Button("##dx9ex", "OFF // ON AT NEXT LAUNCH // KEEP OFF", c::AMBER)) set_ex(false);
-      } else {
-        ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x, y + (ImGui::GetFrameHeight() - ImGui::GetFontSize() * 0.8f) * 0.5f));
-        ui::Caps("OFF // CPU COPIES", c::TEXT, 0.8f);
-      }
+      const bool next_ex = g_dx9_ex && !g_dx9_ex_crash_saved.load();
+      const char* text = "OFF // CPU COPIES";
+      if (g_dx9_device_ex && !g_dx9_ex_asked) text = "ON (THE GAME'S OWN D3D9EX)";
+      else if (g_dx9_device_ex) text = next_ex ? "ON (D3D9EX)" : "ON (D3D9EX) // OFF AT NEXT LAUNCH";
+      else if (next_ex) text = "OFF // CPU COPIES // ON AT NEXT LAUNCH";
+      ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x, ImGui::GetCursorScreenPos().y + (ImGui::GetFrameHeight() - ImGui::GetFontSize() * 0.8f) * 0.5f));
+      ui::Caps(text, g_dx9_device_ex ? c::GREEN : c::TEXT, 0.8f);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Whether frames reach DLSS-G on the GPU (D3D9Ex, almost no cost)\nor through CPU copies, in this launch.\n\nThe switch is in CRASH PROTECTION below (DX9 9EX).");
     }
     // A game that chose windowed mode keeps its window unless the player asks for borderless fullscreen here (saved per game, live both ways;
     // WINDOWED puts back the game's own style and size).
@@ -6986,22 +7624,7 @@ void DrawPanel(effect_runtime* runtime) {
       static const char* const WINDOW_TIPS[] = {"The game's own window, as the game made it.",
                                                 "Borderless fullscreen over the game's monitor, live, no restart.\nFor games running in a window. Some games crash when their window changes size."};
       int box = g_force_borderless ? 1 : 0;
-      if (ui::Choice("##winmode", WINDOW_BOXES, 2, &box, 0, WINDOW_TIPS)) {
-        g_force_borderless = box == 1;
-        WritePrivateProfileStringW(L"HSF", L"ForceBorderless", g_force_borderless ? L"1" : L"0", g_ini_path);
-        if (g_force_borderless && g_borderless_crash) {
-          g_borderless_crash = false;
-          WritePrivateProfileStringW(L"HSF", L"BorderlessCrash", L"0", g_ini_path);
-        }
-        Log(g_force_borderless ? "window: borderless fullscreen asked from the menu (ForceBorderless=1); if the game crashes when its window changes size, set it back"
-                               : "window: back to the game's own windowed mode, from the menu (ForceBorderless=0)");
-      }
-      if (g_borderless_crash && !g_force_borderless) {
-        ui::RightNote("> GAME CRASHED ON RESIZE: KEPT WINDOWED", c::AMBER);
-        if (ImGui::IsItemHovered())
-          ImGui::SetTooltip("This game crashed right after HSF made its window borderless,\nso HSF turned borderless off to let the game start again.\n\n"
-                            "Tip: set the game's own resolution to your monitor's size;\nthen borderless has nothing to resize.");
-      }
+      if (ui::Choice("##winmode", WINDOW_BOXES, 2, &box, 0, WINDOW_TIPS)) SetForceBorderless(box == 1);
     }
     ui::SettingLabel("SETTINGS");
     static ULONGLONG armed = 0;
@@ -7015,7 +7638,10 @@ void DrawPanel(effect_runtime* runtime) {
         armed = tick;
       }
     }
+    DrawSafeTry();  // crash protection, with the rest of the player's settings
   }
+
+  DrawModStack(now, stack);
 
   // ---- Overlay: size, opacity, place.
   if (ui::Section("##overlaylook", "OVERLAY", "// SIZE, OPACITY, POSITION", &overlay)) changed |= DrawOverlaySettings();
@@ -7033,6 +7659,34 @@ void DrawPanel(effect_runtime* runtime) {
       ui::SettingLabel("DEBUG VIEW");
       if (KeyBind(runtime, "##ViewKey", &g_view_key)) changed = true;
     }
+  }
+
+  // ---- Colours: the panel and the accent, for the menu and the overlay. Green, red and amber carry meaning and stay as they are.
+  if (ui::Section("##colours", "COLOURS", "// MENU AND OVERLAY", &colours)) {
+    // The header's swatches again, as named boxes; none lit while the colours are the player's own.
+    static constexpr const char* PRESET_NAMES[] = {"DEFAULT", "CRIMSON", "NAVY", "VIOLET", "MONO"};
+    static_assert(std::size(PRESET_NAMES) == std::size(COLOUR_PRESETS));
+    const char* tips[std::size(COLOUR_PRESETS)];
+    int current = -1;
+    for (size_t i = 0; i < std::size(COLOUR_PRESETS); ++i) {
+      tips[i] = COLOUR_PRESETS[i].name;
+      if (COLOUR_PRESETS[i].panel_rgb == g_ui_panel_rgb && COLOUR_PRESETS[i].accent_rgb == g_ui_accent_rgb) current = static_cast<int>(i);
+    }
+    ui::SettingLabel("PRESET");
+    int picked = current;
+    if (ui::Choice("##uipreset", PRESET_NAMES, static_cast<int>(std::size(PRESET_NAMES)), &picked, 0, tips) && picked >= 0 && picked != current) {
+      g_ui_panel_rgb = COLOUR_PRESETS[picked].panel_rgb;
+      g_ui_accent_rgb = COLOUR_PRESETS[picked].accent_rgb;
+      ui::SetTheme(g_ui_panel_rgb, g_ui_accent_rgb);
+      char line[160];
+      std::snprintf(line, sizeof(line), "COLOURS: preset \"%s\" picked (panel %06X, accent %06X)", COLOUR_PRESETS[picked].name, g_ui_panel_rgb, g_ui_accent_rgb);
+      Log(line);
+      changed = true;
+    }
+    ui::SettingLabel("PANEL");
+    if (ColourRow("##uipanel", &g_ui_panel_rgb, hsf::ui::DEFAULT_PANEL_RGB)) changed = true;
+    ui::SettingLabel("ACCENT");
+    if (ColourRow("##uiaccent", &g_ui_accent_rgb, hsf::ui::DEFAULT_ACCENT_RGB)) changed = true;
   }
 
   // ---- Debug, for testers.
@@ -7127,7 +7781,6 @@ void DrawPanel(effect_runtime* runtime) {
       StartupToggle("NGX INPUT", L"NgxInput", 1);
     }
 #endif
-    DrawSafeTry();
     ui::Rule();
     static ULONGLONG copied = 0;
     if (ui::Button("##copylog", "COPY LOG TO CLIPBOARD", c::TEXT)) {
@@ -7143,6 +7796,7 @@ void DrawPanel(effect_runtime* runtime) {
   }
   ui::Rule();
   ui::Caps("HSF " HSF_VERSION " // BY CAPT-HUNTER", c::FAINT, 0.75f);
+  if (ui::DiscordButton("HSF forum on Discord (opens in your browser)")) OpenDiscordForum();
   ui::EndPanel();
   // The wheel moved the FPS cap: undo the scroll ImGui gave the window for it. Otherwise remember where the window is scrolled to.
   static float s_scroll = 0.f;
@@ -7356,6 +8010,7 @@ void FrameGraph(ImDrawList* draw, ImVec2 at, float width, float height, float te
 
 void DrawOverlay(bool advanced) {
   namespace c = hsf::ui::colour;
+  hsf::ui::ThemeTick();
   const MenuView v = ReadMenuView();
   ImDrawList* const draw = ImGui::GetForegroundDrawList();
   const OverlayLook& look = g_overlay_look[advanced ? 1 : 0];
@@ -7403,8 +8058,9 @@ void DrawOverlay(bool advanced) {
   if (panel.x > 0.f) {
     // The simple one see-through by default, as a typical RTSS overlay; the advanced one near solid, for a lot of small text.
     const int alpha = look.opacity * 255 / 100;
-    draw->AddRectFilled(at, end, advanced ? IM_COL32(20, 28, 23, alpha) : IM_COL32(12, 18, 14, alpha));
-    if (advanced && look.opacity > 0) draw->AddRect(at, end, IM_COL32(74, 90, 79, std::min(alpha, 220)));
+    // Both follow the panel colour of the menu's COLOURS section; the simple one a darker shade of it.
+    draw->AddRectFilled(at, end, hsf::ui::WithAlpha(advanced ? c::PANEL : hsf::ui::Darker(c::PANEL, 0.63f), alpha));
+    if (advanced && look.opacity > 0) draw->AddRect(at, end, hsf::ui::WithAlpha(c::BORDER, std::min(alpha, 220)));
     const float b = 16.f * unit, t = std::max(2.f, 2.5f * unit);
     draw->AddRectFilled(at, ImVec2(at.x + b, at.y + t), c::BRACKET);
     draw->AddRectFilled(at, ImVec2(at.x + t, at.y + b), c::BRACKET);

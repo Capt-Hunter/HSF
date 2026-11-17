@@ -65,6 +65,20 @@ bool Loaded();
 // Try the hooks that did not go in again on the next Poll (RESCAN). Hooks already in stay.
 void Rescan();
 
+// Each DLSS feature made through HSF's hooks this run (NGX feature number: 1 DLSS super resolution, 11 frame generation, 13 ray
+// reconstruction), with the file name of the module that called, and how often. For the menu's MOD STACK.
+enum MadeApi { MADE_D3D12 = 0, MADE_D3D11 = 1, MADE_VULKAN = 2 };
+struct MadeFeature {
+  int feature;
+  int api;  // MadeApi
+  uint32_t count;
+  wchar_t caller[64];
+  wchar_t path[260];  // the calling module's full path, empty when unknown
+};
+int MadeFeatures(MadeFeature* out, int max);
+// Notes one feature made, from a create hook (D3D12, D3D11 and Vulkan's, ngx_vk.cpp). `caller`: an address in the calling module.
+void NoteMade(int feature, int api, void* caller);
+
 // Direct3D 11: a mod that adds DLSS to a D3D11 game (Luma) calls NGX's D3D11 functions. HSF hooks them the same way, always calls through, and
 // copies the vectors and depth on the same context just before each call goes on.
 void Start11(LogFunction log);

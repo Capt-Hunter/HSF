@@ -29,7 +29,19 @@ bool Enabled();
 int ListOff(char (*names)[32], int max);
 // Turns a way back on for this game (its off and trying keys go). Ways read at start-up take it at the next launch.
 void TurnBackOn(const char* path);
-// A short plain name for the panel ("NGX MOTION (GAME'S STREAMLINE)"); the path itself when unknown.
+// The player turns a way off for this game from the panel (its off key is 2, where a crash writes 1). Takes effect at the next launch.
+void TurnOff(const char* path);
+// A way's state in the file: 0 on, 1 off after a crash, 2 turned off by the player.
+enum OffState { ON = 0, OFF_AFTER_CRASH = 1, OFF_BY_PLAYER = 2 };
+int State(const char* path);
+// The ways HSF tries this way, for the panel: a short name and what it does, in plain words.
+struct Step {
+  const char* path;
+  const char* label;
+  const char* tip;
+};
+int Steps(const Step** out);
+// A short plain name for the panel ("NGX MOTION"); the path itself when unknown.
 const char* Describe(const char* path);
 
 // For the test: as Init, with the process id the marks carry, and the clock Begin uses.

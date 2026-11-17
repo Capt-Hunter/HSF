@@ -12,11 +12,13 @@
 namespace hsf::ui {
 
 namespace colour {
-// Dark green-grey, as a typical RTSS overlay.
-constexpr ImU32 PANEL = IM_COL32(20, 28, 23, 244);
-constexpr ImU32 BORDER = IM_COL32(74, 90, 79, 220);
-constexpr ImU32 LINE = IM_COL32(50, 64, 55, 220);
-constexpr ImU32 BRACKET = IM_COL32(255, 110, 40, 255);
+// The player's two colours (HSF.ini UiPanel and UiAccent, the menu's COLOURS section), set by SetTheme. By default a dark green-grey, as a
+// typical RTSS overlay, with an orange accent. BORDER and LINE follow the panel's colour.
+inline ImU32 PANEL = IM_COL32(20, 28, 23, 244);
+inline ImU32 BORDER = IM_COL32(74, 90, 79, 220);
+inline ImU32 LINE = IM_COL32(50, 64, 55, 220);
+inline ImU32 BRACKET = IM_COL32(255, 110, 40, 255);
+// The status colours below carry meaning (green good, red error, amber warning), so the player cannot change them.
 constexpr ImU32 TEXT = IM_COL32(232, 236, 230, 255);
 constexpr ImU32 DIM = IM_COL32(136, 150, 141, 255);
 constexpr ImU32 FAINT = IM_COL32(72, 86, 77, 255);
@@ -28,12 +30,34 @@ constexpr ImU32 AMBER = IM_COL32(255, 180, 40, 255);
 constexpr ImU32 WHITE = IM_COL32(255, 255, 255, 255);
 }  // namespace colour
 
+// The default colours as 0xRRGGBB, as HSF.ini writes them.
+constexpr uint32_t DEFAULT_PANEL_RGB = 0x141C17;
+constexpr uint32_t DEFAULT_ACCENT_RGB = 0xFF6E28;
+// Sets the panel colour (BORDER and LINE lighter than it, by the same steps as the default look) and the accent, both 0xRRGGBB. The first call
+// sets them at once; after that the colours fade from what is on screen to the new ones over FADE_MS, as ThemeTick moves them.
+void SetTheme(uint32_t panel_rgb, uint32_t accent_rgb);
+// Moves the colours along their fade. Call once a frame before drawing (BeginPanel and the overlay do).
+void ThemeTick();
+constexpr int FADE_MS = 300;
+// `rgba` with its alpha replaced by `alpha` (0-255).
+ImU32 WithAlpha(ImU32 rgba, int alpha);
+// `rgba` with its red, green and blue times `scale` (0-1), alpha kept.
+ImU32 Darker(ImU32 rgba, float scale);
+
 // The whole menu sits in one panel. Always call EndPanel after BeginPanel.
 void BeginPanel(const char* id);
 void EndPanel();
 
-// "HSF // FRAME GEN" on the left, `right` (card, API) on the right, a thin line under both.
-void Header(const char* left, const char* right);
+// One colour preset for the header's swatches, both 0xRRGGBB.
+struct Preset {
+  const char* name;
+  uint32_t panel_rgb, accent_rgb;
+};
+// "HSF // FRAME GEN" on the left, `right` (card, API) on the right, a thin line under both. With `presets`, a small swatch for each left of
+// `right` (the one matching `panel_rgb` and `accent_rgb` outlined): returns the index of the swatch clicked this frame, or -1.
+int Header(const char* left, const char* right, const Preset* presets = nullptr, int count = 0, uint32_t panel_rgb = 0, uint32_t accent_rgb = 0);
+// Discord's logo at the right edge of the last item's row, as a button with tooltip `tip`: true the frame it is clicked.
+bool DiscordButton(const char* tip);
 // A thin line across the panel.
 void Rule();
 
@@ -57,8 +81,8 @@ float ControlX();
 // Outlined boxes, one per name; true when the choice changed. Bit i of `disabled` greys out and blocks box i;
 // `tips`, if given, holds each box's tooltip for when the mouse is over it.
 bool Choice(const char* id, const char* const* names, int count, int* value, uint32_t disabled = 0, const char* const* tips = nullptr);
-// ON / OFF as two boxes.
-bool Toggle(const char* id, bool* value);
+// ON / OFF as two boxes. `tip`, if given, shows while the mouse is over either.
+bool Toggle(const char* id, bool* value, const char* tip = nullptr);
 // An outlined button; true when clicked. `accent` colours its border and text.
 bool Button(const char* id, const char* text, ImU32 accent = colour::TEXT);
 // One line of small capitals in `colour`, cut at the panel's edge.
@@ -88,7 +112,12 @@ void Sparkline(const float* values, size_t count, float height);
 // "[-] ADVANCED" / "[+] ADVANCED" with `note` dim after it; clicking flips `open`. Returns `open`.
 bool Section(const char* id, const char* title, const char* note, bool* open);
 
-// A row for Advanced and Debug: a dim label, the control at the control column.
-void SettingLabel(const char* text);
+// A MOD STACK row: `name` on the left in `name_colour`, a dot and `status` at the control column in `status_colour`. True while the mouse is over it.
+bool StackRow(const char* name, ImU32 name_colour, const char* status, ImU32 status_colour);
+// A short line under a MOD STACK row, indented at the control column and wrapped at the panel's edge. True while the mouse is over it.
+bool StackDetail(const char* text, ImU32 colour = colour::DIM);
+
+// A row for Advanced and Debug: a dim label (cut short of the control column), the control at the control column. True while the mouse is over the label.
+bool SettingLabel(const char* text);
 
 }  // namespace hsf::ui
