@@ -2,6 +2,7 @@
 
 #include "dlssg_core.h"
 #include "hsf_log.h"
+#include "xmx.h"
 
 #include <sl_consts.h>
 #include <sl_pcl.h>
@@ -537,6 +538,8 @@ void RecordFrame(Presenter& p, const FrameInputs& in, bool motion, bool reset, b
                               sl::ResourceTag(&mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent),
                               sl::ResourceTag(ui ? &hudless : nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &frame_extent),
                               sl::ResourceTag(ui ? &ui_alpha : nullptr, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent, &frame_extent)};
+    // Valid until present: DLSS-G hands these to NGX as they are, in the state given here (xmx.h, for XeMFG's copies).
+    for (const sl::Resource* r : {&depth, &mvec, &hudless, &ui_alpha}) hsf::xmx::tagstates::Record(r->native, r->state);
     slSetTagForFrame(token, VIEWPORT, tags, static_cast<uint32_t>(std::size(tags)), reinterpret_cast<sl::CommandBuffer*>(p.list.Get()));
   } else {
     p.compose.ForgetHistory();
@@ -1020,6 +1023,8 @@ void Run(Presenter& p, Host& host) {
         continue;
       }
     }
+    // XeMFG's hook on DLSS-G's generator in this process (xmx.h): looked for at most once a second.
+    hsf::xmx::Poll();
     FrameInputs in = host.Inputs(id);
     // No flow effect, NVOF on: NVOF makes the flow alone, in a texture of HSF's choosing. Once DLSS-G's inputs exist they set the size, as for an effect's flow.
     const bool nvof_alone = in.motion == nullptr && in.nvof;

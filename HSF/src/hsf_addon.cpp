@@ -37,6 +37,7 @@
 #include "ngx_input.h"
 #include "frame_checks.h"
 #include "sl_game.h"
+#include "xmx.h"
 #include <sl_core_types.h>  // Streamline's feature and result numbers (GameStreamlineStarted)
 #endif
 
@@ -1131,6 +1132,10 @@ bool StopHelperWhileOff() {
 std::atomic<uint32_t> g_game_color_space{DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
 
 void OnPresentColorSpace(command_queue*, swapchain* swap, const rect*, const rect*, uint32_t, const rect*) {
+#ifdef HSF_SL_GAME
+  // XeMFG's hook on DLSS-G's generator in this process (the in-game and bring-in routes): looked for at most once a second.
+  hsf::xmx::Poll();
+#endif
   if (swap == nullptr) return;
   uint32_t space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
   switch (swap->get_color_space()) {
@@ -8685,6 +8690,14 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         log_path.resize(log_path.find_last_of(L'\\') + 1);
         hsf::hsflog::Open((log_path + L"HSF.log").c_str());
       }
+#ifdef HSF_SL_GAME
+      // FgEngine (EXPERIMENTAL XeMFG, xmx.h): read once, a change needs a restart. The Intel files are looked for next to HSF.ini.
+      if (g_ini_path[0] != L'\0') {
+        std::wstring folder = g_ini_path;
+        folder.resize(folder.find_last_of(L'\\'));
+        hsf::xmx::Configure(hsf::xmx::WantedFromIni(g_ini_path), folder.c_str(), &Log);
+      }
+#endif
       {
         // New ways of hooking are tried with the old kept as the backup (safe_try.h); HSF keeps its marks in HSF_safe_try.ini next to HSF.ini.
         std::wstring safe_try = g_ini_path;

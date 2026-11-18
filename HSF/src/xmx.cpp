@@ -1,0 +1,807 @@
+// See xmx.h. Ported from MFGAdaUnlock-RenoDx by ImDreamt (MIT, Copyright (c) 2026 ImDreamt), commit 8b854ff: the hook from
+// xmx_hook.hpp, the generator from xmx_generator.hpp, the decisions from xmx_policy.hpp. HSF's changes: HSF's own hook patcher
+// (hook_patch.h) in place of Detours, HSF.log in place of ReShade's log, the Intel files next to HSF.ini, and the modules found by a poll
+// from the frame loop (the add-on is resident by then, which is what their 1.8.3 install-at-first-Present does). Not ported yet: the
+// multi-frame model (3x to 6x, plan step 3, so this runs Intel's own 2x model), the HUD composition (step 6), the panel and support report.
+#include "xmx.h"
+
+#include <windows.h>
+#include <d3d11.h>
+#include <d3d12.h>
+#include <psapi.h>
+#include <wrl/client.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cstdarg>
+#include <cstddef>
+#include <cstdio>
+#include <cstring>
+#include <cwchar>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "hook_patch.h"
+#include "ngx_input.h"
+
+using Microsoft::WRL::ComPtr;
+
+namespace hsf::xmx {
+namespace {
+
+using Parameter = hsf::ngx::Parameter;
+constexpr int NGX_SUCCESS = 0x1;
+constexpr int NGX_FAIL = static_cast<int>(0xBAD00000);
+
+LogFunction g_log = nullptr;
+std::atomic<uint32_t> g_lines{0};
+// At most 64 lines a process from XeMFG, as theirs keeps to 48: a fault that repeats every frame must not fill HSF.log.
+void Line(const char* format, ...) {
+  if (g_log == nullptr || g_lines.fetch_add(1, std::memory_order_relaxed) >= 64) return;
+  char text[512] = "XeMFG: ";
+  va_list args;
+  va_start(args, format);
+  vsnprintf(text + 7, sizeof(text) - 7, format, args);
+  va_end(args);
+  g_log(text);
+}
+
+// ---- Decisions (xmx_policy.hpp) ----
+namespace policy {
+// EvaluateFeature has no queue to wait on, so age stands in for a fence: far more real frames than any game keeps in flight.
+constexpr uint64_t kRetireAfterPairs = 16;
+// XeFG's contexts are not destroyed (the function's contract is unverified), so a game that keeps resizing stops generating instead of
+// filling the VRAM.
+constexpr uint32_t kMaxContexts = 16;
+// A longer gap between real frames is a pause, not a pair to interpolate.
+constexpr uint64_t kStalePairMs = 500;
+
+// Keeps resources alive until the commands that used them have finished.
+template <class T>
+class RetireQueue {
+  struct Entry {
+    T item;
+    uint64_t due;
+  };
+  std::vector<Entry> entries;
+
+ public:
+  void Push(T item, uint64_t pair) { entries.push_back({std::move(item), pair + kRetireAfterPairs}); }
+  void Collect(uint64_t pair) {
+    entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const Entry& entry) { return entry.due <= pair; }), entries.end());
+  }
+};
+
+struct ContextShape {
+  const void* device;
+  uint32_t width, height, format, flags;
+  friend constexpr bool operator==(const ContextShape&, const ContextShape&) = default;
+};
+
+constexpr bool PairIsStale(uint64_t lastCaptureMs, uint64_t nowMs) { return lastCaptureMs != 0 && nowMs - lastCaptureMs > kStalePairMs; }
+
+// DLSS-G's frames of one pair mapped onto what the model can produce. Frames past the model's limit show the last one generated.
+struct FramePlan {
+  uint32_t count, index;
+  bool repeat, limited;
+};
+constexpr FramePlan PlanFrames(uint32_t requested, uint32_t index, uint32_t maxFrames) {
+  const uint32_t wanted = requested ? requested : 1;
+  const uint32_t count = wanted < maxFrames ? wanted : maxFrames;
+  const uint32_t position = index < 1 ? 1 : index > wanted ? wanted : index;
+  return {count, position < count ? position : count, position > count, wanted > count};
+}
+
+// CopyResource needs the same dimensions and the same typeless family.
+constexpr int CopyFamily(DXGI_FORMAT format) {
+  switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R8G8B8A8_SINT:
+      return 1;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+      return 2;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+      return 3;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_UINT:
+      return 4;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R16G16B16A16_SINT:
+      return 5;
+    default:
+      return 0;
+  }
+}
+constexpr bool CanCopy(uint64_t targetWidth, uint32_t targetHeight, DXGI_FORMAT target, uint64_t sourceWidth, uint32_t sourceHeight, DXGI_FORMAT source) {
+  if (targetWidth != sourceWidth || targetHeight != sourceHeight) return false;
+  return target == source || (CopyFamily(target) != 0 && CopyFamily(target) == CopyFamily(source));
+}
+
+// The part of a texture a game declares valid; a declaration that is absent or falls outside the texture means all of it.
+struct Area {
+  uint32_t x, y, width, height;
+};
+constexpr Area InputArea(uint32_t textureWidth, uint32_t textureHeight, Area declared) {
+  const bool fits = declared.width != 0 && declared.height != 0 && uint64_t{declared.x} + declared.width <= textureWidth &&
+                    uint64_t{declared.y} + declared.height <= textureHeight;
+  return fits ? declared : Area{0, 0, textureWidth, textureHeight};
+}
+// XeFG answers -4 when depth and motion differ in size (Phantom Blade Zero: 1488x836 and 1485x836), so both describe the area they share.
+constexpr std::pair<Area, Area> SharedArea(Area depth, Area motion) {
+  const uint32_t width = depth.width < motion.width ? depth.width : motion.width;
+  const uint32_t height = depth.height < motion.height ? depth.height : motion.height;
+  return {Area{depth.x, depth.y, width, height}, Area{motion.x, motion.y, width, height}};
+}
+
+// Why the last evaluation produced no generated frame.
+enum class Idle : int { None, MissingInputs, NoPair, GameReset, HudlessChanged, ExecuteError, NoOutput, CopyMismatch, Count };
+constexpr const char* IdleText(Idle idle) {
+  switch (idle) {
+    case Idle::MissingInputs: return "the game sent no color, depth or motion input";
+    case Idle::NoPair: return "waiting for two real frames in a row";
+    case Idle::GameReset: return "the game reset its history";
+    case Idle::HudlessChanged: return "the game's HUD-less input came and went";
+    case Idle::ExecuteError: return "XeFG returned an error";
+    case Idle::NoOutput: return "XeFG produced no frame";
+    case Idle::CopyMismatch: return "the game's textures do not match in size or format";
+    default: return "";
+  }
+}
+}  // namespace policy
+
+// ---- The generator (xmx_generator.hpp) ----
+// Offsets are for libxess_fg.dll 1.3.1.78 (their docs/research/xemfg-modo-xmx-2026-11-01.md); any other build is refused.
+constexpr DWORD kKnownTimestamp = 0x69CB0F4D;
+constexpr uintptr_t kFactoryRva = 0x1853B0;
+constexpr uintptr_t kContextVtableRva = 0xF45D48;
+constexpr uintptr_t kInitRva = 0x1871C0;
+constexpr uintptr_t kExecuteRva = 0x185800;
+constexpr auto kBackbufferState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+constexpr auto kInputState = D3D12_RESOURCE_STATE_COPY_DEST;
+constexpr auto kOutputState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+constexpr auto kXefgInputState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+#pragma pack(push, 8)
+struct InitParams {
+  uint32_t width, height, format, flags, maxFrames, creationMask, visibleMask, reserved;
+  void* tempBufferHeap;
+  uint64_t bufferOffset;
+  void* tempTextureHeap;
+  uint64_t textureOffset;
+  void* pipelineLibrary;
+  uint32_t uiMode, reserved2;
+};
+struct Input {
+  ID3D12Resource* resource;
+  uint32_t baseX, baseY, width, height;
+};
+struct FrameData {
+  Input backbuffer, depth, motion, ui, hudless;
+  float view[16], projection[16], resolution[2], jitter[2], motionScale[2];
+  uint32_t reset;
+  float renderTimeMs;
+};
+struct ExecuteParams {
+  FrameData previous, next;
+  ID3D12Resource* const* outputs;
+  const uint32_t* outputBases;
+  uint8_t outputCount;
+  uint8_t reserved[3];
+  uint32_t networkScales;  // 0: the default
+  void* descriptorHeap;    // null: XeFG's own
+  uint32_t heapOffset, uiComposition;
+  // The per-pair work runs in the call starting at 0; later calls reuse it.
+  uint32_t firstFrame, frameCount;
+};
+#pragma pack(pop)
+static_assert(sizeof(InitParams) == 80 && sizeof(Input) == 24 && sizeof(FrameData) == 0x118);
+static_assert(offsetof(FrameData, view) == 0x78 && offsetof(FrameData, reset) == 0x110);
+static_assert(offsetof(ExecuteParams, next) == 0x118 && offsetof(ExecuteParams, outputs) == 0x230);
+static_assert(offsetof(ExecuteParams, outputCount) == 0x240 && offsetof(ExecuteParams, descriptorHeap) == 0x248);
+static_assert(offsetof(ExecuteParams, firstFrame) == 0x258 && sizeof(ExecuteParams) == 0x260);
+constexpr uint32_t kMaxFrames = 5;
+
+struct Copies {
+  ComPtr<ID3D12Resource> backbuffer, depth, motion, hudless;
+  FrameData data{};
+  bool valid{};
+};
+struct State {
+  ComPtr<ID3D12Device> device;
+  void* context{};  // the C functions' handle: { 'DX12', XefgContext* }
+  HMODULE fg{};
+  uint32_t width{}, height{}, flags{};
+  DXGI_FORMAT format{};
+  std::array<Copies, 2> frames;
+  uint32_t current{};
+  std::array<ComPtr<ID3D12Resource>, kMaxFrames> outputs;
+  // Resources replaced while earlier commands may still be using them.
+  policy::RetireQueue<ComPtr<ID3D12Resource>> retired;
+  uint64_t pairs{};
+  uint64_t lastCaptureMs{};
+  bool lastGenerated{};
+  uint32_t contexts{};
+  uint32_t maxFrames{1};
+  D3D12_RESOURCE_DESC outputDesc{};
+  bool published{};
+  bool failed{};
+  // The last shape XeFG's Init refused, retried only once the shape changes.
+  bool refused{};
+  policy::ContextShape refusedShape{};
+};
+// Never destroyed: XeFG's contexts and the hooks outlive any clean-up order at exit.
+State& Get() {
+  static auto* state = new State;
+  return *state;
+}
+
+bool g_wanted = false;
+bool g_configured = false;
+wchar_t g_folder[MAX_PATH] = L"";
+std::atomic<uint64_t> g_last_generated_tick{0};
+std::atomic<uint64_t> g_last_evaluate_tick{0};
+std::atomic<int> g_evaluations_logged{0};
+std::atomic<int> g_hooks_installed{0}, g_hooks_failed{0};
+std::atomic<uint32_t> g_frames_limit{0};
+std::atomic<uint32_t> g_max_frames{1};
+std::atomic<uint32_t> g_idle_logged{0};
+std::mutex g_failure_lock;
+std::string g_failure;
+bool g_preflight_passed = false;
+
+void Fail(const std::string& reason) {
+  {
+    std::lock_guard guard(g_failure_lock);
+    g_failure = reason;
+  }
+  Line("failed: %s", reason.c_str());
+}
+void ClearFailure() {
+  std::lock_guard guard(g_failure_lock);
+  g_failure.clear();
+}
+// One log line per reason, however often the state flips.
+void NoteIdle(policy::Idle idle) {
+  if (idle == policy::Idle::None) return;
+  const uint32_t bit = 1u << static_cast<int>(idle);
+  if ((g_idle_logged.fetch_or(bit, std::memory_order_relaxed) & bit) == 0) Line("not generating: %s", policy::IdleText(idle));
+}
+
+std::wstring IntelPath(const wchar_t* file) { return std::wstring(g_folder) + L"\\" + file; }
+
+DWORD FileTimestamp(const std::wstring& path) {
+  const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return 0;
+  IMAGE_DOS_HEADER dos{};
+  IMAGE_NT_HEADERS nt{};
+  DWORD read = 0;
+  DWORD stamp = 0;
+  if (ReadFile(file, &dos, sizeof(dos), &read, nullptr) && read == sizeof(dos) && dos.e_magic == IMAGE_DOS_SIGNATURE &&
+      SetFilePointer(file, dos.e_lfanew, nullptr, FILE_BEGIN) != INVALID_SET_FILE_POINTER && ReadFile(file, &nt, sizeof(nt), &read, nullptr) &&
+      read == sizeof(nt) && nt.Signature == IMAGE_NT_SIGNATURE)
+    stamp = nt.FileHeader.TimeDateStamp;
+  CloseHandle(file);
+  return stamp;
+}
+bool Exists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+// Before any hook: hooking stops NVIDIA's generation, so a mode that cannot run must leave it alone. Reads the files without loading them.
+bool Preflight() {
+  static const bool passed = [] {
+    if (!Exists(IntelPath(L"libxess_fg.dll"))) {
+      Fail("libxess_fg.dll not found next to HSF.ini");
+      return false;
+    }
+    if (FileTimestamp(IntelPath(L"libxess_fg.dll")) != kKnownTimestamp) {
+      Fail("libxess_fg.dll is not the supported 1.3.1.78");
+      return false;
+    }
+    if (!Exists(IntelPath(L"libxell.dll"))) {
+      Fail("libxell.dll not found next to HSF.ini");
+      return false;
+    }
+    Line("preflight passed: libxess_fg.dll 1.3.1.78 and libxell.dll in %ls", g_folder);
+    return true;
+  }();
+  g_preflight_passed = passed;
+  return passed;
+}
+
+// XeFG's own functions, called by address: a fault inside them is caught, and the engine stops instead of the game.
+int Guarded(void* function, void* context, void* a, void* b) noexcept {
+  using Call = int(__cdecl*)(void*, void*, void*);
+  __try {
+    return reinterpret_cast<Call>(function)(context, a, b);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return -100000;
+  }
+}
+
+std::string ModulePath(HMODULE module) {
+  char text[MAX_PATH] = "";
+  return module != nullptr && GetModuleFileNameA(module, text, MAX_PATH) ? std::string(text) : std::string("not loaded");
+}
+
+bool LoadContext(ID3D12Device* device) {
+  auto& state = Get();
+  state.fg = GetModuleHandleW(L"libxess_fg.dll");
+  if (state.fg == nullptr) state.fg = LoadLibraryExW(IntelPath(L"libxess_fg.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+  if (state.fg == nullptr) {
+    Fail("libxess_fg.dll could not be loaded");
+    return false;
+  }
+  auto* base = reinterpret_cast<unsigned char*>(state.fg);
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+  // A copy the game loaded itself wins over HSF's folder, and may be another build.
+  if (nt->FileHeader.TimeDateStamp != kKnownTimestamp) {
+    Fail("the libxess_fg.dll in use (" + ModulePath(state.fg) + ") is not 1.3.1.78");
+    return false;
+  }
+  if (!state.published) {
+    state.published = true;
+    HMODULE ll = GetModuleHandleW(L"libxell.dll");
+    if (ll == nullptr) ll = LoadLibraryExW(IntelPath(L"libxell.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    Line("runtime %s and %s; Intel's own 2x model (3x to 6x not in this build yet)", ModulePath(state.fg).c_str(), ModulePath(ll).c_str());
+  }
+  void** wrapper = nullptr;
+  const auto created = Guarded(base + kFactoryRva, device, &wrapper, nullptr);
+  if (created != 0 || wrapper == nullptr) {
+    Fail("XeFG's factory returned " + std::to_string(created));
+    return false;
+  }
+  // { 'DX12' magic, XefgContext* }
+  if (wrapper[1] == nullptr || reinterpret_cast<uintptr_t>(*static_cast<void***>(wrapper[1])) - reinterpret_cast<uintptr_t>(base) != kContextVtableRva) {
+    Fail("unexpected XeFG context layout");
+    return false;
+  }
+  state.context = wrapper;
+  return true;
+}
+
+ComPtr<ID3D12Resource> Texture(ID3D12Device* device, D3D12_RESOURCE_DESC desc, D3D12_RESOURCE_STATES initial, D3D12_RESOURCE_FLAGS flags) {
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  desc.Flags = flags;
+  desc.MipLevels = 1;
+  desc.DepthOrArraySize = 1;
+  desc.SampleDesc = {1, 0};
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  desc.Alignment = 0;
+  ComPtr<ID3D12Resource> resource;
+  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, initial, nullptr, IID_PPV_ARGS(&resource)))) return nullptr;
+  return resource;
+}
+void Barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+  if (from == to) return;
+  D3D12_RESOURCE_BARRIER barrier{};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = resource;
+  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  barrier.Transition.StateBefore = from;
+  barrier.Transition.StateAfter = to;
+  list->ResourceBarrier(1, &barrier);
+}
+// Copies between resources left in their original states. A mismatch would be undefined on the GPU: the target keeps what it had.
+void Copy(ID3D12GraphicsCommandList* list, ID3D12Resource* target, D3D12_RESOURCE_STATES targetState, ID3D12Resource* source, D3D12_RESOURCE_STATES sourceState) {
+  const auto to = target->GetDesc(), from = source->GetDesc();
+  if (!policy::CanCopy(to.Width, to.Height, to.Format, from.Width, from.Height, from.Format)) {
+    NoteIdle(policy::Idle::CopyMismatch);
+    return;
+  }
+  Barrier(list, target, targetState, D3D12_RESOURCE_STATE_COPY_DEST);
+  Barrier(list, source, sourceState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  list->CopyResource(target, source);
+  Barrier(list, source, D3D12_RESOURCE_STATE_COPY_SOURCE, sourceState);
+  Barrier(list, target, D3D12_RESOURCE_STATE_COPY_DEST, targetState);
+}
+ID3D12Resource* Resource(const Parameter* params, const char* name) {
+  ID3D12Resource* value = nullptr;
+  return params->Get(name, &value) == NGX_SUCCESS ? value : nullptr;
+}
+template <class T>
+T Value(const Parameter* params, const char* name, T fallback) {
+  T value{};
+  return params->Get(name, &value) == NGX_SUCCESS ? value : fallback;
+}
+// Each copy has a shape to follow. The old one may be in a command list still on the GPU (dynamic resolution, a DLSS mode change), so
+// it is retired, not released.
+bool Capture(ID3D12Device* device, ID3D12GraphicsCommandList* list, ComPtr<ID3D12Resource>& copy, ID3D12Resource* source, D3D12_RESOURCE_STATES sourceState) {
+  auto& state = Get();
+  if (source == nullptr) {
+    if (copy) state.retired.Push(std::move(copy), state.pairs);
+    copy.Reset();
+    return true;
+  }
+  const auto desc = source->GetDesc();
+  if (!copy || copy->GetDesc().Width != desc.Width || copy->GetDesc().Height != desc.Height || copy->GetDesc().Format != desc.Format) {
+    if (copy) state.retired.Push(std::move(copy), state.pairs);
+    copy = Texture(device, desc, kXefgInputState, D3D12_RESOURCE_FLAG_NONE);
+    if (!copy) return false;
+  }
+  // The tagged resource arrives in its tagged state, which a direct list can leave and restore. Streamline 2.14 evaluates on a compute
+  // list, where graphics states (render target, depth) cannot be named, and hands NGX its inputs as non-pixel shader resources.
+  auto from = static_cast<D3D12_RESOURCE_STATES>(tagstates::StateOf(source, sourceState));
+  constexpr auto kGraphicsOnly =
+      D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  if (list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE && (from & kGraphicsOnly) != 0) from = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  Copy(list, copy.Get(), kXefgInputState, source, from);
+  return true;
+}
+Input Describe(ID3D12Resource* copy) {
+  Input input{};
+  input.resource = copy;
+  if (copy != nullptr) {
+    const auto desc = copy->GetDesc();
+    input.width = static_cast<uint32_t>(desc.Width);
+    input.height = desc.Height;
+  }
+  return input;
+}
+policy::Area DeclaredArea(const Parameter* params, const std::string& name, const Input& input) {
+  return policy::InputArea(input.width, input.height,
+                           {Value<unsigned int>(params, (name + "SubrectBaseX").c_str(), 0u), Value<unsigned int>(params, (name + "SubrectBaseY").c_str(), 0u),
+                            Value<unsigned int>(params, (name + "SubrectWidth").c_str(), 0u), Value<unsigned int>(params, (name + "SubrectHeight").c_str(), 0u)});
+}
+void Assign(Input& input, const policy::Area& area) {
+  input.baseX = area.x;
+  input.baseY = area.y;
+  input.width = area.width;
+  input.height = area.height;
+}
+// XeFG compares these fields, not the textures, so the copies can keep their shape.
+void MatchDepthAndMotion(const Parameter* params, FrameData& data) {
+  if (data.depth.width == data.motion.width && data.depth.height == data.motion.height) return;
+  const auto [depth, motion] = policy::SharedArea(DeclaredArea(params, "DLSSG.Depth", data.depth), DeclaredArea(params, "DLSSG.MVecs", data.motion));
+  static std::atomic_bool logged{false};
+  if (!logged.exchange(true))
+    Line("depth %ux%u and motion %ux%u differ, using %ux%u at depth %u,%u motion %u,%u", data.depth.width, data.depth.height, data.motion.width, data.motion.height,
+         depth.width, depth.height, depth.x, depth.y, motion.x, motion.y);
+  Assign(data.depth, depth);
+  Assign(data.motion, motion);
+}
+constexpr uint32_t kFlagDepthInverted = 1u << 0;
+constexpr uint32_t kFlagMotionJittered = 1u << 4;
+
+bool Prepare(ID3D12GraphicsCommandList* list, const Parameter* params, const D3D12_RESOURCE_DESC& output) {
+  auto& state = Get();
+  uint32_t flags = 0;
+  if (Value<int>(params, "DLSSG.DepthInverted", 0) != 0) flags |= kFlagDepthInverted;
+  if (Value<int>(params, "DLSSG.MvecJittered", 0) != 0) flags |= kFlagMotionJittered;
+  const auto width = static_cast<uint32_t>(output.Width);
+  ComPtr<ID3D12Device> device;
+  if (FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return false;
+  const policy::ContextShape wanted{device.Get(), width, output.Height, static_cast<uint32_t>(output.Format), flags};
+  if (state.context != nullptr && wanted == policy::ContextShape{state.device.Get(), state.width, state.height, static_cast<uint32_t>(state.format), state.flags}) return true;
+  // A shape XeFG refused is not retried every frame, but another shape (a resolution or HDR change) is.
+  if (state.refused && wanted == state.refusedShape) return false;
+  if (state.contexts >= policy::kMaxContexts) {
+    Fail("the game changed its output size too many times; restart the game");
+    state.failed = true;
+    return false;
+  }
+  if (state.context != nullptr) {
+    const auto retire = [&](ComPtr<ID3D12Resource>& resource) {
+      if (resource) state.retired.Push(std::move(resource), state.pairs);
+      resource.Reset();
+    };
+    for (auto& frame : state.frames) {
+      retire(frame.backbuffer);
+      retire(frame.depth);
+      retire(frame.motion);
+      retire(frame.hudless);
+      frame = {};
+    }
+    for (auto& texture : state.outputs) retire(texture);
+    state.context = nullptr;  // its commands may be in flight, so it stays alive
+    state.lastGenerated = false;
+  }
+  state.device = device;
+  ++state.contexts;
+  if (!LoadContext(state.device.Get())) {
+    state.failed = true;
+    return false;
+  }
+  InitParams init{};
+  init.width = width;
+  init.height = output.Height;
+  init.format = output.Format;
+  init.flags = flags;
+  init.maxFrames = state.maxFrames;
+  init.creationMask = 1;
+  init.visibleMask = 1;
+  init.uiMode = 0;  // AUTO
+  const auto result = Guarded(reinterpret_cast<unsigned char*>(state.fg) + kInitRva, state.context, &init, nullptr);
+  Line("init %ux%u format %d flags %u frames %u result %d", width, output.Height, static_cast<int>(output.Format), init.flags, init.maxFrames, result);
+  if (result != 0) {
+    // Found out only here: the hook goes in long before the game's output format exists, so NVIDIA's generator is already gone.
+    Fail(output.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? "XeFG cannot use this game's scRGB HDR output (result " + std::to_string(result) + ")"
+                                                         : "XeFG initialization returned " + std::to_string(result));
+    state.context = nullptr;
+    state.refused = true;
+    state.refusedShape = wanted;
+    return false;
+  }
+  if (state.refused) {
+    state.refused = false;
+    ClearFailure();
+  }
+  state.outputDesc = output;
+  state.width = width;
+  state.height = output.Height;
+  state.format = output.Format;
+  state.flags = flags;
+  return true;
+}
+
+// True when this call produced what NGX expects.
+bool Generate(ID3D12GraphicsCommandList* list, const Parameter* params) {
+  auto& state = Get();
+  if (state.failed) return false;
+  auto* backbuffer = Resource(params, "DLSSG.Backbuffer");
+  auto* interpolated = Resource(params, "DLSSG.OutputInterpolated");
+  auto* real = Resource(params, "DLSSG.OutputReal");
+  auto* depth = Resource(params, "DLSSG.Depth");
+  auto* motion = Resource(params, "DLSSG.MVecs");
+  if (backbuffer == nullptr || interpolated == nullptr || depth == nullptr || motion == nullptr) {
+    NoteIdle(policy::Idle::MissingInputs);
+    return false;
+  }
+  const auto requested = (std::max)(Value<unsigned int>(params, "DLSSG.MultiFrameCount", 1), 1u);
+  const auto requestedIndex = std::clamp(Value<unsigned int>(params, "DLSSG.MultiFrameIndex", 1), 1u, requested);
+  // Prepare sets `failed` itself when retrying cannot help.
+  if (!Prepare(list, params, interpolated->GetDesc())) return false;
+  const auto plan = policy::PlanFrames(requested, requestedIndex, state.maxFrames);
+  const auto frameCount = plan.count, frameIndex = plan.index;
+  if (plan.limited && g_frames_limit.exchange(state.maxFrames) == 0)
+    Line("%u generated frames asked for, this model produces %u; the rest repeat the last one", requested, state.maxFrames);
+  if (real != nullptr) Copy(list, real, kOutputState, backbuffer, kBackbufferState);
+  // Past the model's limit: the last generated frame again, no new work.
+  if (plan.repeat) {
+    if (state.lastGenerated) Copy(list, interpolated, kOutputState, state.outputs[frameIndex - 1].Get(), kOutputState);
+    else Copy(list, interpolated, kOutputState, backbuffer, kBackbufferState);
+    return true;
+  }
+  auto* device = state.device.Get();
+  // The real frame is captured once per pair; each generated frame only reads it.
+  if (requestedIndex == 1) {
+    state.retired.Collect(++state.pairs);
+    const auto now = GetTickCount64();
+    // After a pause the two real frames show unrelated moments.
+    if (policy::PairIsStale(state.lastCaptureMs, now)) state.frames[state.current].valid = false;
+    state.lastCaptureMs = now;
+    state.current ^= 1;
+    auto& next = state.frames[state.current];
+    if (!Capture(device, list, next.backbuffer, backbuffer, kBackbufferState) || !Capture(device, list, next.depth, depth, kInputState) ||
+        !Capture(device, list, next.motion, motion, kInputState) || !Capture(device, list, next.hudless, Resource(params, "DLSSG.HUDLess"), kInputState)) {
+      Fail("input copies");
+      state.failed = true;
+      return false;
+    }
+    auto& data = next.data;
+    data = {};
+    data.backbuffer = Describe(next.backbuffer.Get());
+    data.depth = Describe(next.depth.Get());
+    data.motion = Describe(next.motion.Get());
+    MatchDepthAndMotion(params, data);
+    data.hudless = Describe(next.hudless.Get());
+    void* projection = nullptr;
+    if (params->Get("DLSSG.CameraViewToClip", &projection) == NGX_SUCCESS && projection != nullptr) std::memcpy(data.projection, projection, sizeof(data.projection));
+    data.resolution[0] = static_cast<float>(state.width);
+    data.resolution[1] = static_cast<float>(state.height);
+    data.jitter[0] = Value<float>(params, "DLSSG.JitterOffsetX", 0.f);
+    data.jitter[1] = Value<float>(params, "DLSSG.JitterOffsetY", 0.f);
+    data.motionScale[0] = Value<float>(params, "DLSSG.MvecScaleX", 1.f);
+    data.motionScale[1] = Value<float>(params, "DLSSG.MvecScaleY", 1.f);
+    data.reset = Value<unsigned int>(params, "DLSSG.Reset", 0) != 0 ? 1 : 0;
+    next.valid = true;
+  }
+  auto& next = state.frames[state.current];
+  auto& previous = state.frames[state.current ^ 1];
+  // Without a pair the real frame is shown again.
+  bool generated = false;
+  auto idle = policy::Idle::None;
+  if (!previous.valid) idle = policy::Idle::NoPair;
+  else if (next.data.reset != 0) idle = policy::Idle::GameReset;
+  else if ((next.hudless != nullptr) != (previous.hudless != nullptr)) idle = policy::Idle::HudlessChanged;
+  else {
+    ExecuteParams execute{};
+    execute.previous = previous.data;
+    execute.next = next.data;
+    ID3D12Resource* outputs[kMaxFrames]{};
+    for (uint32_t i = 0; i < frameCount; ++i) {
+      if (!state.outputs[i]) state.outputs[i] = Texture(device, state.outputDesc, kOutputState, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+      if (!state.outputs[i]) {
+        Fail("output texture");
+        state.failed = true;
+        return false;
+      }
+      outputs[i] = state.outputs[i].Get();
+    }
+    const uint32_t bases[kMaxFrames * 2]{};
+    execute.outputs = outputs;
+    execute.outputBases = bases;
+    execute.outputCount = static_cast<uint8_t>(frameCount);
+    execute.uiComposition = 0;  // the back buffer alone; HSF's HUD handling is plan step 6
+    execute.firstFrame = frameIndex - 1;
+    execute.frameCount = 1;
+    const auto result = Guarded(reinterpret_cast<unsigned char*>(state.fg) + kExecuteRva, state.context, list, &execute);
+    if (result < 0) {
+      idle = policy::Idle::ExecuteError;
+      Line("execute failed: %d", result);
+      if (result == -100000) {
+        Fail("XeFG crashed while generating a frame");
+        state.failed = true;
+      }
+    } else {
+      generated = result == 0;
+      if (!generated) idle = policy::Idle::NoOutput;
+      if (generated) g_last_generated_tick.store(GetTickCount64(), std::memory_order_relaxed);
+      static std::atomic<int> logged{0};
+      if (logged.fetch_add(1) < 4) Line("execute result %d", result);
+    }
+  }
+  state.lastGenerated = generated;
+  NoteIdle(idle);
+  if (generated) Copy(list, interpolated, kOutputState, state.outputs[frameIndex - 1].Get(), kOutputState);
+  else Copy(list, interpolated, kOutputState, backbuffer, kBackbufferState);
+  return true;
+}
+
+// NVIDIA's path cannot take over once hooked, so a failure repeats the real frame: less smooth, never black.
+bool Evaluate(ID3D12GraphicsCommandList* list, const Parameter* params) {
+  if (list == nullptr || params == nullptr) return false;
+  if (Generate(list, params)) return true;
+  auto* backbuffer = Resource(params, "DLSSG.Backbuffer");
+  auto* interpolated = Resource(params, "DLSSG.OutputInterpolated");
+  if (backbuffer == nullptr || interpolated == nullptr) return false;
+  if (auto* real = Resource(params, "DLSSG.OutputReal")) Copy(list, real, kOutputState, backbuffer, kBackbufferState);
+  Copy(list, interpolated, kOutputState, backbuffer, kBackbufferState);
+  return true;
+}
+
+// ---- The hook (xmx_hook.hpp) ----
+void LogParameters(const Parameter* params) {
+  std::string text = "evaluate";
+  for (const char* name : {"DLSSG.Backbuffer", "DLSSG.Depth", "DLSSG.MVecs", "DLSSG.HUDLess", "DLSSG.OutputInterpolated", "DLSSG.OutputReal"}) {
+    ID3D12Resource* resource = Resource(params, name);
+    if (resource == nullptr) {
+      text += std::string(" ") + name + "=none";
+      continue;
+    }
+    const auto desc = resource->GetDesc();
+    text += std::string(" ") + name + "=" + std::to_string(desc.Width) + "x" + std::to_string(desc.Height) + "/" + std::to_string(static_cast<int>(desc.Format));
+  }
+  for (const char* name : {"DLSSG.MultiFrameIndex", "DLSSG.MultiFrameCount", "DLSSG.Reset"}) {
+    unsigned int value = 0;
+    if (params->Get(name, &value) == NGX_SUCCESS) text += std::string(" ") + name + "=" + std::to_string(value);
+  }
+  for (const char* name : {"DLSSG.MvecScaleX", "DLSSG.MvecScaleY", "DLSSG.JitterOffsetX", "DLSSG.JitterOffsetY"}) {
+    float value = 0.f;
+    if (params->Get(name, &value) == NGX_SUCCESS) text += std::string(" ") + name + "=" + std::to_string(value);
+  }
+  Line("%s", text.c_str());
+}
+
+using EvaluateFeatureFn = int(__cdecl*)(ID3D12GraphicsCommandList*, const void*, const Parameter*, void*);
+constexpr int kSlots = 4;
+hookpatch::HookSet g_hooks;  // one hook per nvngx_dlssg.dll copy, kept for the process
+std::mutex g_poll_lock;
+std::vector<HMODULE> g_seen;
+uint64_t g_last_poll = 0;
+
+int OnEvaluate(EvaluateFeatureFn real, ID3D12GraphicsCommandList* list, const void* handle, const Parameter* params, void* callback) {
+  if (params != nullptr && g_evaluations_logged.fetch_add(1, std::memory_order_relaxed) < 4) LogParameters(params);
+  g_last_evaluate_tick.store(GetTickCount64(), std::memory_order_relaxed);
+  if (Evaluate(list, params)) return NGX_SUCCESS;
+  // Only for a call with no list or parameters: a pass-through here would leave a black image.
+  return real != nullptr ? real(list, handle, params, callback) : NGX_FAIL;
+}
+// A process maps one nvngx_dlssg per location (game folder, DriverStore), and NGX may use any of them, so each module gets its own slot.
+template <int N>
+struct Slot {
+  static inline EvaluateFeatureFn real = nullptr;
+  static int __cdecl Hook(ID3D12GraphicsCommandList* list, const void* handle, const Parameter* params, void* callback) {
+    return OnEvaluate(real, list, handle, params, callback);
+  }
+};
+void* SlotHook(int slot) {
+  switch (slot) {
+    case 0: return reinterpret_cast<void*>(&Slot<0>::Hook);
+    case 1: return reinterpret_cast<void*>(&Slot<1>::Hook);
+    case 2: return reinterpret_cast<void*>(&Slot<2>::Hook);
+    case 3: return reinterpret_cast<void*>(&Slot<3>::Hook);
+    default: return nullptr;
+  }
+}
+void** SlotReal(int slot) {
+  switch (slot) {
+    case 0: return reinterpret_cast<void**>(&Slot<0>::real);
+    case 1: return reinterpret_cast<void**>(&Slot<1>::real);
+    case 2: return reinterpret_cast<void**>(&Slot<2>::real);
+    case 3: return reinterpret_cast<void**>(&Slot<3>::real);
+    default: return nullptr;
+  }
+}
+
+void HookLog(const char* text) { Line("%s", text); }
+
+// Call with g_poll_lock held.
+void Attach(HMODULE module) {
+  if (std::find(g_seen.begin(), g_seen.end(), module) != g_seen.end()) return;
+  // A renamed Vulkan provider has no D3D12 entry and takes no slot.
+  void* const entry = reinterpret_cast<void*>(GetProcAddress(module, "NVSDK_NGX_D3D12_EvaluateFeature"));
+  if (entry == nullptr) return;
+  g_seen.push_back(module);
+  const std::string where = ModulePath(module);
+  const int slot = static_cast<int>(g_seen.size()) - 1;
+  if (slot >= kSlots) {
+    g_hooks_failed.fetch_add(1);
+    Line("no free slot for another copy of DLSS-G's generator: %s", where.c_str());
+    return;
+  }
+  // NGX may unload a fallback copy; the hook's module stays mapped for the process.
+  HMODULE pinned = nullptr;
+  GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(module), &pinned);
+  const bool hooked = g_hooks.Add("NVSDK_NGX_D3D12_EvaluateFeature", entry, SlotHook(slot), SlotReal(slot), &HookLog);
+  (hooked ? g_hooks_installed : g_hooks_failed).fetch_add(1);
+  Line("slot %d %s %s", slot, hooked ? "hooked" : "could not hook", where.c_str());
+}
+
+}  // namespace
+
+bool WantedFromIni(const wchar_t* ini_path) {
+  wchar_t value[32] = L"";
+  GetPrivateProfileStringW(L"HSF", L"FgEngine", L"dlssg", value, static_cast<DWORD>(std::size(value)), ini_path);
+  return _wcsicmp(value, L"xemfg") == 0;
+}
+
+void Configure(bool wanted, const wchar_t* intel_folder, LogFunction log) {
+  std::lock_guard guard(g_poll_lock);
+  if (g_configured) return;
+  g_configured = true;
+  g_log = log;
+  g_wanted = wanted;
+  if (intel_folder != nullptr) wcsncpy_s(g_folder, intel_folder, _TRUNCATE);
+  if (!wanted) return;
+  Line("FgEngine=xemfg (EXPERIMENTAL): Intel's XeSS frame generation in place of NVIDIA's, inside DLSS-G");
+  if (!Preflight()) Line("plain DLSS-G for this run");
+}
+
+void Poll() {
+  if (!g_wanted || !g_preflight_passed) return;
+  const uint64_t now = GetTickCount64();
+  std::lock_guard guard(g_poll_lock);
+  if (now - g_last_poll < 1000) return;
+  g_last_poll = now;
+  HMODULE modules[1024];
+  DWORD bytes = 0;
+  if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes)) return;
+  const DWORD count = (std::min)(bytes / static_cast<DWORD>(sizeof(HMODULE)), static_cast<DWORD>(std::size(modules)));
+  for (DWORD i = 0; i < count; ++i) {
+    wchar_t name[MAX_PATH] = L"";
+    if (GetModuleBaseNameW(GetCurrentProcess(), modules[i], name, MAX_PATH) == 0) continue;
+    if (_wcsicmp(name, L"nvngx_dlssg.dll") == 0) Attach(modules[i]);
+  }
+}
+
+Status Snapshot() {
+  Status s;
+  s.wanted = g_wanted;
+  s.preflight = g_preflight_passed;
+  s.hooked = g_hooks_installed.load();
+  const uint64_t tick = g_last_generated_tick.load(std::memory_order_relaxed);
+  s.generating = tick != 0 && GetTickCount64() - tick < 2000;
+  s.max_frames = g_max_frames.load(std::memory_order_relaxed);
+  std::string failure;
+  {
+    std::lock_guard guard(g_failure_lock);
+    failure = g_failure;
+  }
+  // Only with no hook at all is this a failure to start; one hooked copy still generates.
+  if (failure.empty() && s.hooked == 0 && g_hooks_failed.load() > 0) failure = "the hook on DLSS-G's generator could not be installed";
+  strncpy_s(s.failure, failure.c_str(), _TRUNCATE);
+  return s;
+}
+
+}  // namespace hsf::xmx

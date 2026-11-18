@@ -1,6 +1,7 @@
 // See sl_game.h. Hooks are written here, in HSF's own code: a 5-byte jump at the start of each function goes to a relay in a page HSF allocates near the module, which
 // jumps to the hook; the hook calls a trampoline holding the moved prologue, which jumps back. Anything unexpected at a function's start means no hook there, only a log line.
 #include "sl_game.h"
+#include "xmx.h"
 #include "hsf_log.h"
 #include "version.h"
 #include "motion_timing.h"
@@ -313,6 +314,8 @@ void SeeTag(Kind kind, uint32_t viewport, const sl::ResourceTag* tag_address, bo
   seen->extent_width = tag.extent.width;
   seen->extent_height = tag.extent.height;
   seen->has_cmd = has_cmd;
+  // The state the game tagged it in, for XeMFG's copies (xmx.h).
+  hsf::xmx::tagstates::Record(res.native, res.state);
 }
 
 void LogMatrix(const char* name, const sl::float4x4& m) {

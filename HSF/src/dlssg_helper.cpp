@@ -12,6 +12,7 @@
 #include "dlssg_link.h"
 #include "hsf_log.h"
 #include "version.h"
+#include "xmx.h"
 
 #include <windows.h>
 
@@ -367,6 +368,11 @@ int wmain(int argc, wchar_t** argv) {
   const wchar_t* const game_log = hsf::hsflog::PathFromEnvironment(false);
   core::OpenLog(game_log != nullptr ? game_log : (g_folder.substr(0, g_folder.find_last_of(L'\\')) + L"\\HSF.log").c_str());
   Log("HSF DLSS-G helper " HSF_VERSION " (64-bit), pid %lu", GetCurrentProcessId());
+  {
+    // FgEngine (EXPERIMENTAL XeMFG, xmx.h) from the game's HSF.ini, beside this exe's folder; the Intel files are looked for there too.
+    const std::wstring game_folder = g_folder.substr(0, g_folder.find_last_of(L'\\'));
+    hsf::xmx::Configure(hsf::xmx::WantedFromIni((game_folder + L"\\HSF.ini").c_str()), game_folder.c_str(), [](const char* text) { Log("%s", text); });
+  }
   const bool system_dxgi = LoadSystemGraphicsDlls();
   if (argc < 2) {
     Log("no shared block named on the command line");
