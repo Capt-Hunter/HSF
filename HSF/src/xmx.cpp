@@ -1,8 +1,8 @@
 // See xmx.h. Ported from MFGAdaUnlock-RenoDx by ImDreamt (MIT, Copyright (c) 2026 ImDreamt), commit 8b854ff: the hook from
 // xmx_hook.hpp, the generator from xmx_generator.hpp, the decisions from xmx_policy.hpp. HSF's changes: HSF's own hook patcher
 // (hook_patch.h) in place of Detours, HSF.log in place of ReShade's log, the Intel files next to HSF.ini, and the modules found by a poll
-// from the frame loop (the add-on is resident by then, which is what their 1.8.3 install-at-first-Present does). Not ported yet: the
-// multi-frame model (3x to 6x, plan step 3, so this runs Intel's own 2x model), the HUD composition (step 6), the panel and support report.
+// from the frame loop (the add-on is resident by then, which is what their 1.8.3 install-at-first-Present does). The multi-frame model
+// (3x to 6x) is in xmx_model.cpp. Not ported yet: the HUD composition (step 6), the panel and support report.
 #include "xmx.h"
 
 #include <windows.h>
@@ -25,6 +25,7 @@
 
 #include "hook_patch.h"
 #include "ngx_input.h"
+#include "xmx_model.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -369,7 +370,13 @@ bool LoadContext(ID3D12Device* device) {
     state.published = true;
     HMODULE ll = GetModuleHandleW(L"libxell.dll");
     if (ll == nullptr) ll = LoadLibraryExW(IntelPath(L"libxell.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    Line("runtime %s and %s; Intel's own 2x model (3x to 6x not in this build yet)", ModulePath(state.fg).c_str(), ModulePath(ll).c_str());
+    Line("runtime %s and %s", ModulePath(state.fg).c_str(), ModulePath(ll).c_str());
+    // Before XeFG's first context: its pipelines and frame limits are fixed when a context is made.
+    const auto model = model::Publish(state.fg, ll, g_folder);
+    state.maxFrames = model.max_frames;
+    g_max_frames.store(model.max_frames, std::memory_order_relaxed);
+    if (model.max_frames > 1) Line("3x to %ux ready (multi-frame model, programs from %s)", model.max_frames + 1, model.source.c_str());
+    else Line("Intel's own 2x model only: %s", model.why.c_str());
   }
   void** wrapper = nullptr;
   const auto created = Guarded(base + kFactoryRva, device, &wrapper, nullptr);
@@ -539,7 +546,8 @@ bool Prepare(ID3D12GraphicsCommandList* list, const Parameter* params, const D3D
   init.visibleMask = 1;
   init.uiMode = 0;  // AUTO
   const auto result = Guarded(reinterpret_cast<unsigned char*>(state.fg) + kInitRva, state.context, &init, nullptr);
-  Line("init %ux%u format %d flags %u frames %u result %d", width, output.Height, static_cast<int>(output.Format), init.flags, init.maxFrames, result);
+  Line("init %ux%u format %d flags %u frames %u result %d, %u programs supplied", width, output.Height, static_cast<int>(output.Format), init.flags,
+       init.maxFrames, result, model::ProgramsSupplied());
   if (result != 0) {
     // Found out only here: the hook goes in long before the game's output format exists, so NVIDIA's generator is already gone.
     Fail(output.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? "XeFG cannot use this game's scRGB HDR output (result " + std::to_string(result) + ")"
