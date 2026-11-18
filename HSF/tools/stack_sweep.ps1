@@ -15,6 +15,8 @@
 #   -Clean    where the clean files are: ReShade's installer, renodx-dlss.addon64, nvngx_dlssnr.dll, GITC Uplift, Streamline 2.13. Read and copied, never changed.
 # Each case's folder stays in build\sweep\<case> with every log; results go to build\sweep\results.txt.
 # Keep the scene window in front while it runs: DLSS-G makes nothing without focus. Refuses while an anti-cheat game is up (guard.ps1).
+# To stop the whole sweep: press Esc in the scene window or close it, or run tools\stop_sweep.cmd (it writes build\sweep\STOP). The cases done so far
+# still go to results.txt.
 param([switch]$Full, [switch]$Quick, [switch]$DlssOnly, [string]$Only = "", [int]$Seconds = 20, [string]$Clean = "$env:USERPROFILE\Desktop\DLSS")
 powershell -NoProfile -File "$PSScriptRoot\guard.ps1"; if ($LASTEXITCODE) { exit 1 }
 $root = (Resolve-Path "$PSScriptRoot\..").Path
@@ -23,6 +25,10 @@ $files = "$sweep\_files"
 $scene = "$root\build\x64\d3d12_scene.exe"
 if (-not (Test-Path $scene)) { "build\x64\d3d12_scene.exe is missing: run tools\build.cmd x64"; exit 1 }
 New-Item -ItemType Directory -Force $sweep, $files | Out-Null
+# A STOP file left from an earlier stop would end this run at once.
+$stopFile = "$sweep\STOP"
+Remove-Item -Force $stopFile -ErrorAction SilentlyContinue
+$script:stopped = $false
 
 # ---- The parts, copied once from the clean folder and the build ----
 $reshade = "$files\ReShade64.dll"
@@ -143,14 +149,22 @@ function Launch-Case($case, $dir, $n) {
   $log = "$dir\scene_launch$n.log"
   $p = Start-Process "$dir\d3d12_scene.exe" -ArgumentList $sceneArgs -WorkingDirectory $dir -PassThru -RedirectStandardOutput "$dir\scene_stdout$n.txt" -RedirectStandardError "$dir\scene_stderr$n.txt"
   $null = $p.Handle
-  $hang = -not $p.WaitForExit(($Seconds + 40) * 1000)
-  if ($hang) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500 }
+  # Wait in half seconds so a STOP file (tools\stop_sweep.cmd) ends the scene at once.
+  $deadline = [DateTime]::Now.AddSeconds($Seconds + 40)
+  $hang = $false
+  while (-not $p.WaitForExit(500)) {
+    if (Test-Path $stopFile) { $script:stopped = $true; break }
+    if ([DateTime]::Now -gt $deadline) { $hang = $true; break }
+  }
+  if ($hang -or $script:stopped) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500 }
   # The helper and Uplift's helper go with the scene; any left over would hold the next launch's files.
   Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($dir + '\', [StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force -ErrorAction SilentlyContinue
   Start-Sleep -Milliseconds 500
   if (Test-Path "$dir\ReShade.log") { Copy-Item -Force "$dir\ReShade.log" "$dir\ReShade_launch$n.log" }
   $text = if (Test-Path $log) { Get-Content -Raw $log } else { '' }
-  $code = if ($hang) { 'hang' } else { $p.ExitCode }
+  $code = if ($hang) { 'hang' } elseif ($script:stopped) { 'stopped' } else { $p.ExitCode }
+  # Exit 5: the user closed the scene window or pressed Esc. That stops the whole sweep.
+  if ($code -eq 5) { $script:stopped = $true }
   $shown = 0
   foreach ($m in [regex]::Matches($text, 'presented (\d+)')) { $shown = [math]::Max($shown, [int]$m.Groups[1].Value) }
   $dlssOk = -1; $dlssFailed = 0
@@ -168,6 +182,7 @@ function Run-Case($case) {
   $last = $null
   foreach ($n in 1..$launches) {
     $l = Launch-Case $case $dir $n
+    if ($script:stopped) { return $null }
     if ($l.Hang) { $why += "launch ${n}: HANG (killed)" }
     elseif ($l.Code -ne 0) { $why += "launch ${n}: exit $($l.Code)" + $(if (-not $l.Ended) { ' before its end (crash)' } else { ' at quit' }) }
     if ($l.NoFocus -gt 0) { $why += "launch ${n}: no focus $($l.NoFocus) s" }
@@ -223,13 +238,17 @@ function Run-Case($case) {
 
 $results = foreach ($case in $cases) {
   $r = Run-Case $case
+  if ($script:stopped) { Write-Host "STOPPED by the user during $($case.Name): that case is not counted."; break }
   Write-Host ("{0}  {1,-34} {2}" -f $(if ($r.Ok) { 'PASS' } else { 'FAIL' }), $r.Name, $r.Detail)
   $r
 }
 $lines = @($results | ForEach-Object { "{0}  {1,-34} {2}" -f $(if ($_.Ok) { 'PASS' } else { 'FAIL' }), $_.Name, $_.Detail })
 $failed = @($results | Where-Object { -not $_.Ok })
 $total = "{0} passed, {1} failed" -f ($lines.Count - $failed.Count), $failed.Count
+if ($script:stopped) { $total += ", STOPPED by the user ($($cases.Count - $lines.Count) cases not run)" }
 $total
 [IO.File]::WriteAllLines("$sweep\results.txt", [string[]]($lines + $total))
+Remove-Item -Force $stopFile -ErrorAction SilentlyContinue
+if ($script:stopped) { exit 2 }
 if ($failed.Count -gt 0) { exit 1 }
 exit 0

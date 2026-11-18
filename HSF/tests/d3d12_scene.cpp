@@ -734,7 +734,8 @@ int wmain(int argc, wchar_t** argv) {
   queue->Signal(fence.Get(), fence_next);
   fence->SetEventOnCompletion(fence_next, fence_event);
   WaitForSingleObject(fence_event, 5000);
-  Line("end: %s, %llu real frames, most DLSS-G presented per frame %u", ok ? "ran to the end" : "stopped on an error", count, presented_seen);
+  Line("end: %s, %llu real frames, most DLSS-G presented per frame %u", g_quit ? "stopped by the user" : ok ? "ran to the end" : "stopped on an error", count,
+       presented_seen);
   if (dlss) Line("DLSS evaluated %llu ok, %llu failed", dlss_ok, dlss_failed);
   // A game lets go of NGX before it quits.
   if (ngx_handle != nullptr) Line("NGX ReleaseFeature: 0x%08x", static_cast<unsigned>(NVSDK_NGX_D3D12_ReleaseFeature(ngx_handle)));
@@ -751,5 +752,6 @@ int wmain(int argc, wchar_t** argv) {
   }
   Line("exit");
   if (g_log != nullptr) std::fclose(g_log);
-  ExitProcess(ok ? 0 : 4);
+  // 5: the user closed the window or pressed Esc, which stops a whole stack sweep (tools\stack_sweep.ps1), not only this case.
+  ExitProcess(g_quit ? 5 : ok ? 0 : 4);
 }
