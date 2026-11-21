@@ -8593,10 +8593,17 @@ void DrawOverlay(bool advanced) {
     if (const HudSetting hud = HudSettingNow(v); hud.setting != nullptr)
       line(x, w, y1, "HUD", c::DIM, *hud.setting ? "PROTECTED" : "NOT PROTECTED", *hud.setting ? c::TEXT : c::DIM);
     const OlderCardMod& older = OlderCardModNow();
+    // XeMFG took its 3x-6x programs from MFG-Unlocker's file (not from the RenoDX unlock add-on).
+    std::string model_lower = xmx.model;
+    for (char& ch : model_lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    const bool xmx_uses_mod = fg_engine.running && xmx.hooked > 0 && xmx.published && xmx.max_frames > 1 && model_lower.find("renodx") == std::string::npos;
     if (older.live && older.family != 5) {
       if (older.safe_max != 0) std::snprintf(value, sizeof(value), "UP TO %uX", older.safe_max);
       else std::snprintf(value, sizeof(value), "LOADED");
       line(x, w, y1, "MFG-UNLOCKER", c::DIM, value, c::AMBER);
+    } else if (older.live || xmx_uses_mod) {
+      // RTX 50 has MFG of its own, so MFG-Unlocker unlocks nothing there; it is loaded all the same, and XeMFG may run on its programs.
+      line(x, w, y1, "MFG-UNLOCKER", c::DIM, xmx_uses_mod ? "LOADED // XEMFG 3X-6X" : "LOADED // NOT NEEDED ON RTX 50", c::TEXT);
     } else {
       line(x, w, y1, "MFG-UNLOCKER", c::DIM, "NOT IN USE", c::DIM);
     }

@@ -774,6 +774,91 @@ void** SlotReal(int slot) {
 
 void HookLog(const char* text) { Line("%s", text); }
 
+// Hooking behind another tool's hot-patch hook. Its hook runs the function's first 2-byte instruction itself, then jumps 2 bytes in. So a hook there is
+// entered with that instruction done: for a push, one extra value sits above the return address. Two small stubs make up for it. entry: undo the
+// instruction (pop the same register), then on to the slot's hook. real: do it again, then the moved bytes (the trampoline). Only a push of one register,
+// or a 2-byte nop, is undone; anything else gives ok = false and XeMFG hooks in front as before. The instruction is read from the file on disk, since
+// the tool's jump now covers it in memory.
+struct BehindHotPatch {
+  bool ok = false;
+  uint8_t first[2] = {};
+  void* entry = nullptr;
+  void** real = nullptr;
+};
+// count bytes of a PE file at an RVA, through its section table.
+bool ReadFileBytesAtRva(const wchar_t* path, uint32_t rva, uint8_t* out, uint32_t count) {
+  const HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  const auto read_at = [file](uint32_t offset, void* to, uint32_t size) {
+    LARGE_INTEGER at;
+    at.QuadPart = offset;
+    DWORD got = 0;
+    return SetFilePointerEx(file, at, nullptr, FILE_BEGIN) && ReadFile(file, to, size, &got, nullptr) && got == size;
+  };
+  bool ok = false;
+  IMAGE_DOS_HEADER dos{};
+  IMAGE_NT_HEADERS64 nt{};
+  if (read_at(0, &dos, sizeof(dos)) && dos.e_magic == IMAGE_DOS_SIGNATURE && read_at(static_cast<uint32_t>(dos.e_lfanew), &nt, sizeof(nt)) &&
+      nt.Signature == IMAGE_NT_SIGNATURE) {
+    const uint32_t sections = static_cast<uint32_t>(dos.e_lfanew) + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) + nt.FileHeader.SizeOfOptionalHeader;
+    for (WORD i = 0; i < nt.FileHeader.NumberOfSections && !ok; ++i) {
+      IMAGE_SECTION_HEADER section{};
+      if (!read_at(sections + i * static_cast<uint32_t>(sizeof(section)), &section, sizeof(section))) break;
+      const uint32_t size = std::max<uint32_t>(section.Misc.VirtualSize, section.SizeOfRawData);
+      if (rva >= section.VirtualAddress && rva + count <= section.VirtualAddress + size)
+        ok = read_at(section.PointerToRawData + (rva - section.VirtualAddress), out, count);
+    }
+  }
+  CloseHandle(file);
+  return ok;
+}
+
+BehindHotPatch BehindHotPatchFor(HMODULE module, uint8_t* entry, int slot) {
+  BehindHotPatch out;
+  if (entry[0] != 0xEB || entry[1] != 0xF9 || entry[-5] != 0xE9) return out;
+  wchar_t path[MAX_PATH];
+  if (GetModuleFileNameW(module, path, MAX_PATH) == 0) return out;
+  // Straight from the file: LoadLibraryEx as a data file hands back the module already loaded, jump and all.
+  const uint32_t rva = static_cast<uint32_t>(entry - reinterpret_cast<uint8_t*>(module));
+  if (!ReadFileBytesAtRva(path, rva, out.first, 2)) {
+    Line("another tool's hot-patch hook is on the entry, but its first instruction could not be read from the file: XeMFG hooks in front of it");
+    return out;
+  }
+  // push r (50-57), with a REX prefix (40 or 41) making it 2 bytes; or a 2-byte nop (66 90).
+  uint8_t undo[2] = {};
+  size_t undo_length = 0;
+  if ((out.first[0] == 0x40 || out.first[0] == 0x41) && out.first[1] >= 0x50 && out.first[1] <= 0x57) {
+    undo[0] = out.first[0];
+    undo[1] = static_cast<uint8_t>(out.first[1] + 8);  // pop the same register
+    undo_length = 2;
+  } else if (!(out.first[0] == 0x66 && out.first[1] == 0x90)) {
+    Line("another tool's hot-patch hook is on the entry, but its first instruction (%02x %02x) is not one XeMFG can step around: XeMFG hooks in front of it",
+         out.first[0], out.first[1]);
+    return out;
+  }
+  // Two stubs of 32 bytes, kept for the process: [undo][jmp [rip+0]][the hook's address] and [the instruction][jmp [rip+0]][the trampoline's address].
+  // The hook patcher writes the trampoline's address straight into the second stub (`real`) before it patches the function.
+  uint8_t* const stubs = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+  if (stubs == nullptr) return out;
+  static const uint8_t JUMP[6] = {0xFF, 0x25, 0, 0, 0, 0};
+  uint8_t* p = stubs;
+  std::memcpy(p, undo, undo_length);
+  std::memcpy(p + undo_length, JUMP, 6);
+  void* const hook = SlotHook(slot);
+  std::memcpy(p + undo_length + 6, &hook, 8);
+  p = stubs + 32;
+  std::memcpy(p, out.first, 2);
+  std::memcpy(p + 2, JUMP, 6);
+  std::memset(p + 8, 0, 8);
+  // The slot's own `real` is where OnEvaluate looks for the way into DLSS-G: it becomes the second stub.
+  *SlotReal(slot) = p;
+  FlushInstructionCache(GetCurrentProcess(), stubs, 64);
+  out.entry = stubs;
+  out.real = reinterpret_cast<void**>(p + 8);
+  out.ok = true;
+  return out;
+}
+
 // Call with g_poll_lock held.
 void Attach(HMODULE module) {
   if (std::find(g_seen.begin(), g_seen.end(), module) != g_seen.end()) return;
@@ -791,7 +876,20 @@ void Attach(HMODULE module) {
   // NGX may unload a fallback copy; the hook's module stays mapped for the process.
   HMODULE pinned = nullptr;
   GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(module), &pinned);
-  const bool hooked = g_hooks.Add("NVSDK_NGX_D3D12_EvaluateFeature", entry, SlotHook(slot), SlotReal(slot), &HookLog);
+  // Another tool's hot-patch hook already on the entry ("eb f9", a short jump back to a 5-byte jump before the function: MFG-Unlocker's). Hooked in front
+  // of it (ChainHotPatch), XeMFG takes every call and that tool finds its jump changed, so MFG-Unlocker's menu waits for a DLSS-G pipeline for good. So XeMFG
+  // goes behind it, 2 bytes in, where that tool's hook comes back after running the function's first instruction itself. BehindHotPatch says how, or no.
+  void* target = entry;
+  void* hook_function = SlotHook(slot);
+  void** real = SlotReal(slot);
+  if (const BehindHotPatch behind = BehindHotPatchFor(module, static_cast<uint8_t*>(entry), slot); behind.ok) {
+    target = static_cast<uint8_t*>(entry) + 2;
+    hook_function = behind.entry;
+    real = behind.real;
+    Line("another tool's hot-patch hook is on %s's entry (first instruction %02x %02x): XeMFG hooks 2 bytes in, behind it, so that tool sees each call first",
+         where.c_str(), behind.first[0], behind.first[1]);
+  }
+  const bool hooked = g_hooks.Add("NVSDK_NGX_D3D12_EvaluateFeature", target, hook_function, real, &HookLog);
   (hooked ? g_hooks_installed : g_hooks_failed).fetch_add(1);
   Line("slot %d %s %s", slot, hooked ? "hooked" : "could not hook", where.c_str());
 }
