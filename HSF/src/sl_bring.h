@@ -70,6 +70,8 @@ void Stop(bool process_exiting);
 // The process is exiting and its threads still run: called from the add-on's exit hook, before Windows unloads any DLL. If HSF started Streamline in this
 // process, it is shut down now; left up, DLSS-G ends the process with a fail fast (0xC0000409) while the DLLs unload. Afterwards nothing more goes to
 // Streamline and Present on the game's swap chain does nothing. Once only.
+// True while ShutdownForExit still has a Streamline to shut down.
+bool NeedsExitShutdown();
 void ShutdownForExit();
 
 struct Stats {

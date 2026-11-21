@@ -392,8 +392,71 @@ bool g_sl_bring = false;  // SlBringIn=1: a D3D12 game with no Streamline gets i
 using ExitUserProcessFn = void(NTAPI*)(LONG);
 ExitUserProcessFn g_real_exit_user_process = nullptr;
 hsf::hookpatch::HookSet g_exit_hook;
+// ExitProcess comes after the game's own exit code has torn down its globals, and Windows then ends every other thread at once. slShutdown
+// takes a few hundred ms, and in that time the game's own threads ran on into the torn-down state (RE Village: a game thread faulted on a
+// destroyed lock, which MFG-Unlocker's crash dump then turned into a hang at quit). So the threads the game's exe started are paused first;
+// Streamline's, the driver's and other DLLs' threads keep running for slShutdown. The process heap is held while pausing, so no paused
+// thread is inside it. Windows ends the paused threads with the rest.
+uint32_t PauseGameThreads() {
+  using QueryThreadFn = LONG(NTAPI*)(HANDLE, int, void*, ULONG, ULONG*);
+  const auto query = reinterpret_cast<QueryThreadFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+  const auto exe = reinterpret_cast<const unsigned char*>(GetModuleHandleW(nullptr));
+  if (query == nullptr || exe == nullptr) return 0;
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(exe + reinterpret_cast<const IMAGE_DOS_HEADER*>(exe)->e_lfanew);
+  const uintptr_t begin = reinterpret_cast<uintptr_t>(exe), end = begin + nt->OptionalHeader.SizeOfImage;
+  const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) return 0;
+  const DWORD process = GetCurrentProcessId(), self = GetCurrentThreadId();
+  uint32_t paused = 0;
+  const HANDLE heap = GetProcessHeap();
+  const bool locked = HeapLock(heap) != FALSE;
+  THREADENTRY32 entry{sizeof(entry)};
+  for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+    if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
+    const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);  // the start address needs full query rights
+    if (thread == nullptr) continue;
+    uintptr_t start = 0;  // 9 = ThreadQuerySetWin32StartAddress
+    if (query(thread, 9, &start, sizeof(start), nullptr) >= 0 && start >= begin && start < end && SuspendThread(thread) != static_cast<DWORD>(-1)) ++paused;
+    CloseHandle(thread);
+  }
+  if (locked) HeapUnlock(heap);
+  CloseHandle(snapshot);
+  return paused;
+}
+
+// After slShutdown a DLL of HSF's Streamline can still be loaded, held by another mod's hooks (MFG-Unlocker keeps sl.dlss_g.dll), and its
+// global destructors then run while Windows unloads the DLLs, reading parts already freed (Village: a fault in sl.dlss_g.dll on the exiting
+// thread, which MFG-Unlocker logged as a crash and dumped on every quit). The game has already said how it exits, so a fault inside
+// HSF_streamline from then on ends the process at once with the game's exit code.
+LONG g_exit_code = 0;
+LONG CALLBACK OnFaultAfterShutdown(EXCEPTION_POINTERS* e) {
+  if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+  HMODULE module = nullptr;
+  wchar_t path[MAX_PATH] = L"";
+  const size_t folder = wcslen(g_sl_folder);
+  if (folder == 0 ||
+      !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          static_cast<LPCWSTR>(e->ExceptionRecord->ExceptionAddress), &module) ||
+      !GetModuleFileNameW(module, path, MAX_PATH) || _wcsnicmp(path, g_sl_folder, folder) != 0 || path[folder] != L'\\')
+    return EXCEPTION_CONTINUE_SEARCH;
+  Log("game is exiting: a DLL of HSF's Streamline faulted while Windows unloaded it, so the process ends now with the game's exit code");
+  TerminateProcess(GetCurrentProcess(), static_cast<UINT>(g_exit_code));
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
 void NTAPI OnExitUserProcess(LONG code) {
+  if (hsf::slbring::NeedsExitShutdown()) {
+    const uint32_t paused = PauseGameThreads();
+    char line[128];
+    snprintf(line, sizeof(line), "game is exiting: %u of its own threads paused before HSF's Streamline shuts down", paused);
+    Log(line);
+  }
+  const bool shut_down = hsf::slbring::NeedsExitShutdown();
   hsf::slbring::ShutdownForExit();
+  if (shut_down) {
+    g_exit_code = code;
+    AddVectoredExceptionHandler(1, &OnFaultAfterShutdown);
+  }
   g_real_exit_user_process(code);
 }
 bool g_ngx_input = true;  // NgxInput=0: flow even when the game's DLSS could give its vectors

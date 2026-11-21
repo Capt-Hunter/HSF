@@ -1683,6 +1683,8 @@ void Stop(bool process_exiting) {
   Line("=== stopped catching swap chains ===");
 }
 
+bool NeedsExitShutdown() { return g_sl_started.load() && g_sl_shutdown != nullptr && !g_shut.load(); }
+
 void ShutdownForExit() {
   if (!g_sl_started.load() || g_sl_shutdown == nullptr || g_shut.exchange(true)) return;
   Line("the game is exiting: shutting HSF's Streamline down while its threads still run");
