@@ -642,6 +642,19 @@ Stats TakeStats() {
     if (b->max_frames > 0) g_max_frames = static_cast<uint32_t>(b->max_frames);
     stats.nvof_state = b->nvof_state;
     stats.foreign_dxgi = b->foreign_dxgi != 0;
+    const int32_t xmx = b->xmx_flags;
+    stats.xmx_known = xmx != 0;
+    if (xmx != 0) {
+      stats.xmx.wanted = (xmx & 1) != 0;
+      stats.xmx.preflight = (xmx & 2) != 0;
+      stats.xmx.hooked = (xmx & 4) != 0 ? 1 : 0;
+      stats.xmx.generating = (xmx & 8) != 0;
+      stats.xmx.published = (xmx & 16) != 0;
+      stats.xmx.max_frames = static_cast<uint32_t>(std::max<int32_t>(1, static_cast<int32_t>(b->xmx_max_frames)));
+      memcpy(stats.xmx.failure, b->xmx_failure, sizeof(stats.xmx.failure));
+      memcpy(stats.xmx.model, b->xmx_model, sizeof(stats.xmx.model));
+      stats.xmx.failure[sizeof(stats.xmx.failure) - 1] = stats.xmx.model[sizeof(stats.xmx.model) - 1] = '\0';
+    }
     const uint32_t sleeps = take(b->sleeps), sleep_us = take(b->sleep_us);
     stats.reflex_game_paced = sleeps != 0;
     stats.reflex_sleep_ms = sleeps != 0 ? static_cast<float>(sleep_us) / 1000.f / static_cast<float>(sleeps) : 0.f;

@@ -7370,6 +7370,83 @@ void OpenDiscordForum() {
   }).detach();
 }
 
+// ---- FG ENGINE (HSF.ini FgEngine, xmx.h): DLSS-G or the EXPERIMENTAL XeMFG. The engine is read once at start, so the row's pick applies on the
+// next launch; `running` is what this run started with. HSF.ini is written only by this row, so its first read is this run's engine.
+struct FgEngineState {
+  bool read = false;
+  bool running = false;  // this run started with FgEngine=xemfg
+  int pick = 0;          // the row: 0 DLSS-G, 1 XeMFG
+};
+FgEngineState& FgEngine() {
+  static FgEngineState state;
+  if (!state.read && g_ini_path[0] != L'\0') {
+    wchar_t value[32] = L"";
+    GetPrivateProfileStringW(L"HSF", L"FgEngine", L"dlssg", value, static_cast<DWORD>(std::size(value)), g_ini_path);
+    state.read = true;
+    state.running = _wcsicmp(value, L"xemfg") == 0;
+    state.pick = state.running ? 1 : 0;
+  }
+  return state;
+}
+
+// XeMFG's state where DLSS-G runs: the helper's (D3D11, DX9, 32-bit, Vulkan) once it has written it, else this process's (D3D12 routes).
+hsf::xmx::Status XmxNow() {
+  if (hsf::dlssg::Running() && g_dlssg_stats.xmx_known) return g_dlssg_stats.xmx;
+#ifdef HSF_SL_GAME
+  return hsf::xmx::Snapshot();
+#else
+  return {};
+#endif
+}
+
+// `text` cut to `limit` characters with "..." for one menu line; a path keeps only its file name.
+std::string MenuShort(const char* text, size_t limit, bool file_name = false) {
+  std::string s = text;
+  if (file_name)
+    if (const size_t slash = s.find_last_of("\\/"); slash != std::string::npos) s = s.substr(slash + 1);
+  if (s.size() > limit) s = s.substr(0, limit - 3) + "...";
+  return s;
+}
+
+// XeMFG was asked for but runs no hook: plain DLSS-G this run.
+bool XmxFellBack(const FgEngineState& engine, const hsf::xmx::Status& xmx) { return engine.running && xmx.failure[0] != '\0' && xmx.hooked == 0; }
+
+// Who makes the generated frames this run, for the overlay: XeMFG once its hook is in, else DLSS-G.
+const char* FgEngineName(const FgEngineState& engine, const hsf::xmx::Status& xmx) { return engine.running && xmx.hooked > 0 ? "XEMFG" : "DLSS-G"; }
+
+// FG ENGINE's hover text: XeMFG's whole state, in sentences.
+std::string FgEngineReport(const FgEngineState& engine, const hsf::xmx::Status& xmx) {
+  std::string text = "Who makes the generated frames.\nDLSS-G: NVIDIA's own. The default.\nXEMFG (EXPERIMENTAL): Intel's XeSS frame generation, run inside DLSS-G.\n"
+                     "A change applies when the game starts again.";
+  if (!engine.running) {
+    if (engine.pick == 1) text += "\n\nXeMFG starts at the next launch. The Intel files and 3x to 6x are checked then.";
+    return text;
+  }
+  text += "\n\nXEMFG THIS RUN";
+  if (!xmx.preflight) {
+    text += std::string("\nIntel files: ") + (xmx.failure[0] != '\0' ? xmx.failure : "not checked yet") + ".";
+    text += "\nPut libxess_fg.dll 1.3.1.78 and libxell.dll next to HSF.ini.";
+    return text;
+  }
+  text += "\nIntel files: found (libxess_fg.dll 1.3.1.78, libxell.dll).";
+  if (!xmx.published) text += "\n3x to 6x: looked for when the first frame is generated.";
+  else if (xmx.max_frames > 1) text += std::string("\n3x to ") + std::to_string(xmx.max_frames + 1) + "x: programs from " + xmx.model + ".";
+  else text += std::string("\n2x only: ") + xmx.model + ".\nFor 3x to 6x add MFG-Unlocker or the RenoDX MFG unlock add-on.";
+  if (xmx.failure[0] != '\0') text += std::string(xmx.hooked == 0 ? "\nNot running, plain DLSS-G: " : "\nStopped: ") + xmx.failure + ".";
+  else if (xmx.generating) text += "\nGenerating frames.";
+  else text += "\nNo frames generated yet.";
+  return text;
+}
+
+// The one line under FG ENGINE, only when XeMFG runs and something is wrong; empty otherwise.
+std::string FgEngineProblem(const FgEngineState& engine, const hsf::xmx::Status& xmx) {
+  if (!engine.running || engine.pick != 1) return {};
+  if (!xmx.preflight) return "INTEL FILES: " + MenuShort(xmx.failure[0] != '\0' ? xmx.failure : "not checked yet", 60);
+  if (xmx.failure[0] != '\0') return (xmx.hooked == 0 ? "PLAIN DLSS-G: " : "STOPPED: ") + MenuShort(xmx.failure, 60);
+  if (xmx.published && xmx.max_frames == 1) return "2X ONLY: NO MFG-UNLOCKER OR RENODX MFG UNLOCK ADD-ON FOUND";
+  return {};
+}
+
 // The header's colour presets: a panel colour and an accent each. The first is HSF's default look.
 constexpr hsf::ui::Preset COLOUR_PRESETS[] = {
     {"Default: green-grey and orange", hsf::ui::DEFAULT_PANEL_RGB, hsf::ui::DEFAULT_ACCENT_RGB},
@@ -7439,6 +7516,48 @@ void DrawPanel(effect_runtime* runtime) {
       ImGui::SetTooltip("The DLSS-G helper is still running with frame gen off,\nso turning it back ON is instant.\n\nClose it for the game's full fps.\nTurning frame gen ON starts it again (about 10 s).");
   }
 
+  // ---- FG engine: DLSS-G (NVIDIA's own) or XeMFG (EXPERIMENTAL: Intel's XeSS frame generation run inside DLSS-G, xmx.h). A pick is written to
+  // HSF.ini and applies when the game starts again. The row stays one line: its note says the engine in use, hovering it gives XeMFG's full
+  // state (FgEngineReport), and one amber line shows under it only when something is wrong (FgEngineProblem).
+  FgEngineState& engine = FgEngine();
+  const hsf::xmx::Status xmx = XmxNow();
+  ui::RowLabel("FG ENGINE", c::GREEN);
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", FgEngineReport(engine, xmx).c_str());
+  {
+    static const char* const ENGINES[] = {"DLSS-G", "XEMFG"};
+    static const char* const TIPS[] = {"NVIDIA's own frame generation. The default.",
+                                       "EXPERIMENTAL. Intel's XeSS frame generation, run inside DLSS-G.\n"
+                                       "Needs libxess_fg.dll 1.3.1.78 and libxell.dll next to HSF.ini.\n"
+                                       "3x to 6x also needs MFG-Unlocker or the RenoDX MFG unlock add-on.\n"
+                                       "Applies when the game starts again."};
+    int pick = engine.pick;
+    if (ui::Choice("##fgengine", ENGINES, 2, &pick, 0, TIPS) && pick != engine.pick) {
+      engine.pick = pick;
+      WritePrivateProfileStringW(L"HSF", L"FgEngine", pick == 1 ? L"xemfg" : L"dlssg", g_ini_path);
+      Log(pick == 1 ? "menu: FG ENGINE set to XEMFG (FgEngine=xemfg), from the next launch" : "menu: FG ENGINE set to DLSS-G (FgEngine=dlssg), from the next launch");
+    }
+    char note[64];
+    ImU32 note_colour = c::DIM;
+    if (engine.pick != (engine.running ? 1 : 0)) {
+      std::snprintf(note, sizeof(note), "> RESTART THE GAME TO SWITCH");
+      note_colour = c::AMBER;
+    } else if (!engine.running) {
+      std::snprintf(note, sizeof(note), "> NVIDIA");
+    } else if (XmxFellBack(engine, xmx)) {
+      std::snprintf(note, sizeof(note), "> DLSS-G (XEMFG FAILED)");
+      note_colour = c::AMBER;
+    } else {
+      std::snprintf(note, sizeof(note), "> XEMFG // EXPERIMENTAL // %uX", xmx.published ? xmx.max_frames + 1 : 2u);
+      note_colour = xmx.generating ? c::GREEN : c::DIM;
+    }
+    ui::RightNote(note, note_colour);
+  }
+  if (const std::string problem = FgEngineProblem(engine, xmx); !problem.empty()) {
+    ImGui::SetCursorScreenPos(ImVec2(ui::ControlX(), ImGui::GetCursorScreenPos().y));
+    ui::Caps(problem.c_str(), c::AMBER, 0.75f);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", FgEngineReport(engine, xmx).c_str());
+  }
+
   // ---- Multiplier: only what DLSS-G says this machine can do, once it has said.
   ui::RowLabel("MULTIPLIER", c::RED);
   const OlderCardMod& older = OlderCardModNow();
@@ -7456,6 +7575,8 @@ void DrawPanel(effect_runtime* runtime) {
     if (now.max_frames != 0)
       for (int i = 0; i < 5; ++i)
         if (static_cast<uint32_t>(i) + 1 > now.max_frames) above |= 1u << i;
+    // XeMFG running on Intel's own 2x model: 3X and up would only show the real frame again.
+    if (engine.running && xmx.hooked > 0 && xmx.published && xmx.max_frames == 1) above |= 0x1Eu;
     // The game's own Streamline too old for MFG: the crossed-out boxes say why.
     const OldStreamline& old_sl = OldStreamlineNow(now.max_frames, older);
     const char* tips[5] = {};
@@ -8362,7 +8483,7 @@ void DrawOverlay(bool advanced) {
   if (advanced)
     std::snprintf(head, sizeof(head), "HSF // %s%s%s", GpuName(), v.api[0] != '\0' ? " // " : "", v.api);
   else if (v.generating)
-    std::snprintf(head, sizeof(head), "HSF // DLSS-G %uX", per_real);
+    std::snprintf(head, sizeof(head), "HSF // %s %uX", FgEngineName(FgEngine(), XmxNow()), per_real);
   else
     std::snprintf(head, sizeof(head), "HSF // FRAME GEN");
   float head_used = Spaced(draw, ImVec2(x, y), text * 0.9f, head, c::DIM) + gap;
@@ -8448,11 +8569,18 @@ void DrawOverlay(bool advanced) {
 
     // ---- Left: generation, Reflex, FPS cap.
     section(x, y1, "GENERATION");
-    if (v.generating) std::snprintf(value, sizeof(value), "DLSS-G %uX", per_real);
+    const FgEngineState& fg_engine = FgEngine();
+    const hsf::xmx::Status xmx = XmxNow();
+    if (v.generating) std::snprintf(value, sizeof(value), "%s %uX", FgEngineName(fg_engine, xmx), per_real);
     else std::snprintf(value, sizeof(value), "%s", g_extra_enabled ? "NOT GENERATING" : "OFF");
     extra[0] = '\0';
     if (v.max_frames != 0) std::snprintf(extra, sizeof(extra), "MAX %uX", v.max_frames + 1);
     line(x, w, y1, "MODE", c::DIM, value, v.generating ? c::TEXT : c::AMBER, extra);
+    // XeMFG asked for (HSF.ini FgEngine): which engine really runs, amber when it fell back.
+    if (fg_engine.running) {
+      if (XmxFellBack(fg_engine, xmx)) line(x, w, y1, "ENGINE", c::DIM, "DLSS-G (XEMFG FAILED)", c::AMBER);
+      else line(x, w, y1, "ENGINE", c::DIM, "XEMFG", xmx.preflight ? c::TEXT : c::AMBER, "EXP");
+    }
     const char* route = v.route;
     if (std::strncmp(route, "IN GAME // ", 11) == 0) route += 11;
     line(x, w, y1, "ROUTE", c::DIM, route, c::TEXT);

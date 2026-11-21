@@ -276,6 +276,8 @@ std::atomic<uint32_t> g_max_frames{1};
 std::atomic<uint32_t> g_idle_logged{0};
 std::mutex g_failure_lock;
 std::string g_failure;
+std::string g_model_note;  // under g_failure_lock: Status::model
+std::atomic<bool> g_published{false};
 bool g_preflight_passed = false;
 
 void Fail(const std::string& reason) {
@@ -377,6 +379,11 @@ bool LoadContext(ID3D12Device* device) {
     g_max_frames.store(model.max_frames, std::memory_order_relaxed);
     if (model.max_frames > 1) Line("3x to %ux ready (multi-frame model, programs from %s)", model.max_frames + 1, model.source.c_str());
     else Line("Intel's own 2x model only: %s", model.why.c_str());
+    {
+      std::lock_guard guard(g_failure_lock);
+      g_model_note = model.max_frames > 1 ? model.source : model.why;
+    }
+    g_published = true;
   }
   void** wrapper = nullptr;
   const auto created = Guarded(base + kFactoryRva, device, &wrapper, nullptr);
@@ -834,11 +841,14 @@ Status Snapshot() {
   const uint64_t tick = g_last_generated_tick.load(std::memory_order_relaxed);
   s.generating = tick != 0 && GetTickCount64() - tick < 2000;
   s.max_frames = g_max_frames.load(std::memory_order_relaxed);
-  std::string failure;
+  s.published = g_published.load();
+  std::string failure, model;
   {
     std::lock_guard guard(g_failure_lock);
     failure = g_failure;
+    model = g_model_note;
   }
+  strncpy_s(s.model, model.c_str(), _TRUNCATE);
   // Only with no hook at all is this a failure to start; one hooked copy still generates.
   if (failure.empty() && s.hooked == 0 && g_hooks_failed.load() > 0) failure = "the hook on DLSS-G's generator could not be installed";
   strncpy_s(s.failure, failure.c_str(), _TRUNCATE);

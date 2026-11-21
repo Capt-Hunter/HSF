@@ -7,6 +7,7 @@
 #pragma once
 
 #include "camera.h"
+#include "xmx.h"
 
 #include <d3d11.h>
 
@@ -32,6 +33,8 @@ struct Stats {
   bool gpu_hang = false;    // the helper turned DLSS-G off because the GPU stopped keeping up (note says so)
   int nvof_state = 0;       // NVIDIA Optical Flow in the helper: 0 off, 1 waiting, 2 active, 3 failed (nvof::State)
   bool foreign_dxgi = false;  // the helper's dxgi.dll is not Windows' own: ReShade and its add-ons run in the helper too
+  bool xmx_known = false;     // the helper wrote XeMFG's status (link version 15): `xmx` is the helper's, which runs DLSS-G
+  hsf::xmx::Status xmx;
   // Reflex on the game's frame (FrameStart): how long the game thread slept per frame, on average, and whether Reflex says it is available.
   float reflex_sleep_ms = 0;
   bool reflex_game_paced = false;  // the game thread slept on Reflex in the last second (FrameStart reached Streamline)

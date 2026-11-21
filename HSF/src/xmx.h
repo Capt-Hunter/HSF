@@ -35,7 +35,9 @@ struct Status {
   int hooked = 0;           // nvngx_dlssg.dll copies hooked: NVIDIA's generation is gone in this process once this is above 0
   bool generating = false;  // XeFG made a frame in the last 2 s
   uint32_t max_frames = 1;  // generated frames per real frame this model makes (1 = 2x, Intel's own model)
+  bool published = false;   // the model was set up (at XeFG's first context): `model` says how
   char failure[160] = "";   // why XeMFG is not running, or empty
+  char model[160] = "";     // once published: where the 3x-6x programs came from, or why it stays at 2x
 };
 Status Snapshot();
 
