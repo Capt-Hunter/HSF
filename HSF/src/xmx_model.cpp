@@ -6,16 +6,21 @@
 #include "xmx_model.h"
 
 #include <bcrypt.h>
+#include <psapi.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
+
+#include "lzma_dec.h"
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -26,9 +31,70 @@ using Bytes = std::vector<unsigned char>;
 using Programs = std::map<std::string, Bytes>;
 
 // ---- The 54 programs (runtime_payload.cpp, prepare_xemfg_inputs.py) ----
-// The program list MFGAdaUnlock embeds: 54 rows of "key<TAB>sha256", itself found by its own SHA-256.
-constexpr char kManifestSha256[] = "d74bd783d29280ed372653701ce9b0395362e381faace1213206e0bdd9bfc9e5";
-constexpr size_t kProgramCount = 54;
+// The program list: decoder key and SHA-256 of each program, from the 54-row manifest MFGAdaUnlock embeds (its SHA-256 d74bd783...).
+// 30 distinct programs: some keys share one. Hashes only; the programs themselves come from the user's own mod (FindPrograms).
+struct ProgramRow {
+  const char* key;
+  const char* sha256;
+};
+constexpr ProgramRow kProgramTable[] = {
+    {"34510306390392534204181", "bc9d3fff9f957f756ca6776b50ed96b87314d7ae96213e35011284250ece3f34"},
+    {"34510549607087156077416", "1bebcab193714ee264da7dc0a96e313d74ad4c71017fdea5314c8b07f6b56394"},
+    {"34510630495729375117249", "6acf82efd2a0c95c342a154f1f13cc8dc8450bcef6044175b3c91b17e21bedc0"},
+    {"34511130729005347619443", "8c4a23058529dd0f5a7aab90c42d9d9e50cb0d13d261031d783b11b3f81562bb"},
+    {"34511160110267935226759", "0142035fb0845ff49f5c20fe6c5ff533efc68e30b6ceedd6783da8a2a4cb95b7"},
+    {"34511460816689149022550", "2f31a5964c891994d8d5c5cfcf2b9fac5f73a78e2549b17944190533c6e95c88"},
+    {"34511775204213202565591", "3577b7537200e869aff122f06d1ff9310f07b67b351931b685451de616c6496d"},
+    {"34513405466145798375150", "1bebcab193714ee264da7dc0a96e313d74ad4c71017fdea5314c8b07f6b56394"},
+    {"34513793361990215758205", "3577b7537200e869aff122f06d1ff9310f07b67b351931b685451de616c6496d"},
+    {"34515160591401652990146", "8c4a23058529dd0f5a7aab90c42d9d9e50cb0d13d261031d783b11b3f81562bb"},
+    {"34515410463317489640932", "f4aa535a6fc74410ae8b684eb881b9fd511c6a1ac1c784cc95bd8f7fd8ea0f61"},
+    {"34515657724417237518993", "f4aa535a6fc74410ae8b684eb881b9fd511c6a1ac1c784cc95bd8f7fd8ea0f61"},
+    {"34516380930220257970286", "f4aa535a6fc74410ae8b684eb881b9fd511c6a1ac1c784cc95bd8f7fd8ea0f61"},
+    {"34517260297374432353812", "8c4a23058529dd0f5a7aab90c42d9d9e50cb0d13d261031d783b11b3f81562bb"},
+    {"34517625535393435596474", "6acf82efd2a0c95c342a154f1f13cc8dc8450bcef6044175b3c91b17e21bedc0"},
+    {"34517804162798471891092", "c8b778ce1332e0f4f0c31b6985a4f77f88d01305602e932f78dac0157a7de840"},
+    {"34517926239615626135843", "1bebcab193714ee264da7dc0a96e313d74ad4c71017fdea5314c8b07f6b56394"},
+    {"34518157918880769121294", "3577b7537200e869aff122f06d1ff9310f07b67b351931b685451de616c6496d"},
+    {"3452159554838854843181", "51667b6d9955036a10cbd4e363881252de8ca5d3b6f210a7a3ee6cab719629a6"},
+    {"3452703420262894380461", "13abff5d769ef56f99cb9ee7825968872e28395d77a6d344053c06cb08b8064c"},
+    {"3452733261465573612279", "f4aa535a6fc74410ae8b684eb881b9fd511c6a1ac1c784cc95bd8f7fd8ea0f61"},
+    {"3453044563380101633987", "13abff5d769ef56f99cb9ee7825968872e28395d77a6d344053c06cb08b8064c"},
+    {"345403028921287745114", "c8b778ce1332e0f4f0c31b6985a4f77f88d01305602e932f78dac0157a7de840"},
+    {"3454723847365348416138", "51667b6d9955036a10cbd4e363881252de8ca5d3b6f210a7a3ee6cab719629a6"},
+    {"345629657834658089628", "855ea04032a06d002e0be772a0dc941b9ba1497ad0d93e9be2c8e7f3296e2a51"},
+    {"3456611144524852740280", "3577b7537200e869aff122f06d1ff9310f07b67b351931b685451de616c6496d"},
+    {"345853420520350049400", "397171dd727f55ab174c574f4c3a87f197c6910ca2087cef66ae7f2e5e698c73"},
+    {"3458799740138742970455", "6acf82efd2a0c95c342a154f1f13cc8dc8450bcef6044175b3c91b17e21bedc0"},
+    {"3459485083775095487499", "51667b6d9955036a10cbd4e363881252de8ca5d3b6f210a7a3ee6cab719629a6"},
+    {"3459900000412734828113", "2f338a641e65601e8a1b528ee001ba455db64f7e370972bcb8051657c2565e4c"},
+    {"3461420893142609508058", "402afbef69b75abd60590549fabc2836a76bf78aaf42d86d0308f6a20c1b5cb9"},
+    {"346228873022202761969", "45c264e344a6894f65b29f2be5ddc81fafa831daeddeb1b4d8278426929b3d0b"},
+    {"34811228111448562003997", "00b1098a80a5e662de426284e6bf7bdf82ed236eb7c8aef1e74f9ebed204019a"},
+    {"35110677435103722760616", "8008ab36ad231fe0411e7177a2db2747e0cb7a448f87f6203f7075b0edd9e0b2"},
+    {"35110677436203234388827", "df293f6bfd22af772c886dbce7c937d66480b2fc2de26c91bc2bd8a4e6ac4fb0"},
+    {"35115408590283900931308", "709f1188aea8481bf0bcfd62406edec731138307c94b9ce67848fd4b9feb0464"},
+    {"35115408591383412559519", "d4ab4bbfcc47f219110b7c35c49ece9612e86f434c36d91ca847b5f25ee5f4b8"},
+    {"35118300970848558985152", "8bde7db0638cb99e399b6d250b2c0ce5174d28085e25ee8bd4b534c85f96ec9b"},
+    {"35118300971948070613363", "e6800a53087cd6cae5818f27645dbbac203c61ca016b2d4e928204e4fd9dd877"},
+    {"3515873413746975655382", "d4ab4bbfcc47f219110b7c35c49ece9612e86f434c36d91ca847b5f25ee5f4b8"},
+    {"3515873414846487283593", "709f1188aea8481bf0bcfd62406edec731138307c94b9ce67848fd4b9feb0464"},
+    {"3517111066626369642692", "df293f6bfd22af772c886dbce7c937d66480b2fc2de26c91bc2bd8a4e6ac4fb0"},
+    {"3517111067725881270903", "8008ab36ad231fe0411e7177a2db2747e0cb7a448f87f6203f7075b0edd9e0b2"},
+    {"351747859676298538780", "e6800a53087cd6cae5818f27645dbbac203c61ca016b2d4e928204e4fd9dd877"},
+    {"351747860775810166991", "8bde7db0638cb99e399b6d250b2c0ce5174d28085e25ee8bd4b534c85f96ec9b"},
+    {"3518243144275597942266", "8cb7e938320fb1f189d62959e2d937eb24f9a7a1e0041d45d16b2243db6ea776"},
+    {"3518243145375109570477", "f5326c8b3443b6d62911e30012de1497e5d039f8310c0164fd56d1b456d0434a"},
+    {"3519166588561883014920", "f5326c8b3443b6d62911e30012de1497e5d039f8310c0164fd56d1b456d0434a"},
+    {"3519166589661394643131", "8cb7e938320fb1f189d62959e2d937eb24f9a7a1e0041d45d16b2243db6ea776"},
+    {"3523094507705513878191", "1d07fc625b5a62002a5754374778b9d84fc751aeedcc5695926ad65c097da220"},
+    {"3524380691093124776041", "f4ce38ed177ab5ce31119037f60dab508938c5fa43a4332c01c5bf62f4ada042"},
+    {"3538061477285680095061", "6ea243efa3359800d22d7ce274e5c2ad5178fdf61934b16855ae5ada1df4e979"},
+    {"3538061481683726607905", "ea67bb193e1f35c2f636fec5bc597347bd2c6d16619953304b21f5627f6aaeb7"},
+    {"3538061483882749864327", "bd0ea2581c98650bce63e5afe3ccbf490f8efda7d695fdd2a11d5eb240cf20f4"},
+};
+constexpr size_t kProgramCount = std::size(kProgramTable);
+static_assert(kProgramCount == 54);
 
 std::string Sha256(const void* data, size_t size) {
   static BCRYPT_ALG_HANDLE algorithm = [] {
@@ -119,43 +185,60 @@ std::vector<Bytes> DataResources(const Bytes& file) {
   return out;
 }
 
-// The 54 programs from one file, or an empty list with the reason.
+// Every DXBC program inside one blob, by SHA-256: the blob itself when it is one, and each one laid end to end in it (MFG Unlocker's
+// unpacked bundles). A DXBC header carries its own total size at offset 24.
+void CollectPrograms(const Bytes& blob, std::map<std::string, Bytes>& by_hash) {
+  size_t at = 0;
+  while (at + 32 <= blob.size()) {
+    const auto* hit = static_cast<const unsigned char*>(memchr(blob.data() + at, 'D', blob.size() - at));
+    if (hit == nullptr) break;
+    at = static_cast<size_t>(hit - blob.data());
+    uint32_t size = 0;
+    if (at + 32 <= blob.size() && memcmp(blob.data() + at, "DXBC", 4) == 0) memcpy(&size, blob.data() + at + 24, 4);
+    if (size >= 32 && size <= blob.size() - at) {
+      by_hash.emplace(Sha256(blob.data() + at, size), Bytes(blob.begin() + at, blob.begin() + at + size));
+      at += size;
+    } else {
+      ++at;
+    }
+  }
+}
+
+// The 54 programs from one file, or an empty list with the reason. Plain DXBC resources (MFGAdaUnlock's add-on) are read as they are;
+// LZMA-packed resources (MFG Unlocker 1.7.1 and later) are unpacked first, only while programs are still missing.
 Programs ProgramsFrom(const Bytes& file, std::string& why) {
-  std::map<std::string, const Bytes*> by_hash;
+  std::map<std::string, Bytes> by_hash;
   const auto resources = DataResources(file);
-  for (const auto& resource : resources) by_hash.emplace(Sha256(resource.data(), resource.size()), &resource);
-  const auto manifest = by_hash.find(kManifestSha256);
-  if (manifest == by_hash.end()) {
-    why = "it does not carry the program list this XeMFG port needs";
-    return {};
+  const auto complete = [&] {
+    for (const auto& row : kProgramTable)
+      if (by_hash.find(row.sha256) == by_hash.end()) return false;
+    return true;
+  };
+  for (const auto& resource : resources) CollectPrograms(resource, by_hash);
+  std::string unpack_why;
+  for (const auto& resource : resources) {
+    if (complete()) break;
+    if (!lzma::LooksLikeAlone(resource.data(), resource.size())) continue;
+    Bytes unpacked;
+    if (lzma::DecodeAlone(resource.data(), resource.size(), unpacked, 64u << 20, unpack_why)) CollectPrograms(unpacked, by_hash);
   }
   Programs programs;
-  const std::string text(manifest->second->begin(), manifest->second->end());
-  size_t start = 0;
-  while (start < text.size()) {
-    size_t end = text.find('\n', start);
-    if (end == std::string::npos) end = text.size();
-    std::string row = text.substr(start, end - start);
-    start = end + 1;
-    if (!row.empty() && row.back() == '\r') row.pop_back();
-    if (row.empty()) continue;
-    const size_t tab = row.find('\t');
-    const std::string key = row.substr(0, tab), hash = tab == std::string::npos ? "" : row.substr(tab + 1);
-    const auto found = by_hash.find(hash);
-    if (key.empty() || key.size() > 24 || key.find_first_not_of("0123456789") != std::string::npos || found == by_hash.end()) {
-      why = "its program list names a program it does not carry";
-      return {};
+  size_t missing = 0;
+  for (const auto& row : kProgramTable) {
+    const auto found = by_hash.find(row.sha256);
+    if (found == by_hash.end()) {
+      ++missing;
+      continue;
     }
-    const Bytes& program = *found->second;
-    uint32_t size = 0;
-    if (program.size() >= 32) memcpy(&size, program.data() + 24, 4);
-    if (program.size() < 32 || memcmp(program.data(), "DXBC", 4) != 0 || size != program.size() || !programs.emplace(key, program).second) {
-      why = "a program in it is not a valid shader";
-      return {};
-    }
+    programs.emplace(row.key, found->second);
   }
-  if (programs.size() != kProgramCount) {
-    why = "its program list has " + std::to_string(programs.size()) + " programs, not 54";
+  if (missing == kProgramCount) {
+    why = "it carries none of the programs this XeMFG port needs";
+    if (!unpack_why.empty()) why += " (" + unpack_why + ")";
+    return {};
+  }
+  if (missing != 0) {
+    why = "it carries only " + std::to_string(kProgramCount - missing) + " of the 54 programs (another version?)";
     return {};
   }
   return programs;
@@ -167,18 +250,39 @@ std::string Narrow(const std::wstring& text) {
   return out;
 }
 
-// MFGAdaUnlock's add-on: the one ReShade loaded, else a copy in the game's folder or HSF_streamline\mods (where ReShade does not load it).
+// Loaded modules that export the given function (MFG Unlocker loads under any name: version.dll in D3D12 games, its ProductName next
+// to HSF's helper).
+std::vector<std::wstring> LoadedWithExport(const char* name) {
+  std::vector<std::wstring> paths;
+  HMODULE modules[1024];
+  DWORD bytes = 0;
+  if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes)) return paths;
+  for (DWORD i = 0; i < std::min<DWORD>(bytes / sizeof(HMODULE), 1024); ++i) {
+    wchar_t path[MAX_PATH] = L"";
+    if (GetProcAddress(modules[i], name) != nullptr && GetModuleFileNameW(modules[i], path, MAX_PATH)) paths.emplace_back(path);
+  }
+  return paths;
+}
+
+// The programs come from either mod the user already has: MFGAdaUnlock's add-on (renodx-mfgunlock.addon64) or dashdogy's MFG Unlocker
+// (MFGUnlocker.dll, or version.dll in D3D12 games). The loaded copies first, then copies in the game's folder or HSF_streamline\mods
+// (where nothing loads them). Files are read, never loaded.
 Programs FindPrograms(const wchar_t* folder, std::string& source) {
   std::vector<std::wstring> paths;
   wchar_t loaded[MAX_PATH] = L"";
   if (HMODULE module = GetModuleHandleW(L"renodx-mfgunlock.addon64"); module != nullptr && GetModuleFileNameW(module, loaded, MAX_PATH))
     paths.emplace_back(loaded);
-  paths.push_back(std::wstring(folder) + L"\\renodx-mfgunlock.addon64");
-  paths.push_back(std::wstring(folder) + L"\\HSF_streamline\\mods\\renodx-mfgunlock.addon64");
+  for (auto& path : LoadedWithExport("MfgUnlockSingleModuleQuery")) paths.push_back(std::move(path));
+  const std::wstring base(folder);
+  for (const wchar_t* name : {L"\\renodx-mfgunlock.addon64", L"\\HSF_streamline\\mods\\renodx-mfgunlock.addon64", L"\\MFGUnlocker.dll",
+                              L"\\HSF_streamline\\mods\\MFGUnlocker.dll", L"\\version.dll"})
+    paths.push_back(base + name);
   std::string reasons;
-  for (const auto& path : paths) {
+  for (size_t i = 0; i < paths.size(); ++i) {
+    bool seen = false;
+    for (size_t j = 0; j < i; ++j) seen = seen || lstrcmpiW(paths[i].c_str(), paths[j].c_str()) == 0;
     Bytes file;
-    if (!ReadFileBytes(path, file)) continue;
+    if (seen || !ReadFileBytes(paths[i], file)) continue;
     std::string why;
     Programs programs;
     try {
@@ -187,13 +291,13 @@ Programs FindPrograms(const wchar_t* folder, std::string& source) {
       why = e.what();
     }
     if (!programs.empty()) {
-      source = Narrow(path);
+      source = Narrow(paths[i]);
       return programs;
     }
-    reasons += (reasons.empty() ? "" : "; ") + Narrow(path) + ": " + why;
+    reasons += (reasons.empty() ? "" : "; ") + Narrow(paths[i]) + ": " + why;
   }
-  throw std::runtime_error(reasons.empty() ? "3x to 6x needs MFGAdaUnlock's renodx-mfgunlock.addon64 (its 54 programs) in the game's folder or "
-                                             "HSF_streamline\\mods"
+  throw std::runtime_error(reasons.empty() ? "3x to 6x needs MFGAdaUnlock's renodx-mfgunlock.addon64 or dashdogy's MFG Unlocker (1.7.1 or later) "
+                                             "in the game's folder or HSF_streamline\\mods"
                                            : reasons);
 }
 

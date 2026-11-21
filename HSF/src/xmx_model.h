@@ -8,7 +8,8 @@
 // another mod already published is used as it is.
 //
 // The 54 shader programs are derived from Intel's and stay under Intel's terms: HSF never ships them. They are read, without loading or
-// running any code, from the user's own copy of MFGAdaUnlock's add-on (renodx-mfgunlock.addon64), matched by SHA-256.
+// running any code, from the user's own copy of MFGAdaUnlock's add-on (renodx-mfgunlock.addon64, plain resources) or of dashdogy's MFG
+// Unlocker (1.7.1 and later pack them with LZMA: lzma_dec.h), matched by SHA-256 against HSF's list of hashes.
 #pragma once
 
 #include <windows.h>
