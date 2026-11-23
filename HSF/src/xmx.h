@@ -5,7 +5,7 @@
 // Ported from MFGAdaUnlock-RenoDx by ImDreamt (MIT, Copyright (c) 2026 ImDreamt), commit 8b854ff: src/addons/mfgunlock/xmx_hook.hpp,
 // xmx_generator.hpp, xmx_policy.hpp and tag_states.hpp. The licence is in licenses/ and THIRD_PARTY_NOTICES.md.
 //
-// HSF ships nothing from Intel. The user puts libxess_fg.dll 1.3.1.78 and libxell.dll next to HSF.ini (the game's folder). Anything
+// libxess_fg.dll 1.3.1.78 and libxell.dll sit in HSF_streamline (or next to HSF.ini, the game's folder). Anything
 // missing or of another build: no hook, plain DLSS-G, and Snapshot says why. Hooking nvngx_dlssg.dll ends NVIDIA's own generation in that
 // process, so the hook goes in only after the preflight, and from then on a frame XeFG cannot make repeats the real one: never black.
 #pragma once
@@ -19,8 +19,8 @@ namespace hsf::xmx {
 
 using LogFunction = void (*)(const char* text);
 
-// Once per process; later calls change nothing (the engine changes on a restart). wanted: HSF.ini FgEngine=xemfg. intel_folder: where
-// libxess_fg.dll and libxell.dll are looked for (the game's folder, next to HSF.ini).
+// Once per process; later calls change nothing (the engine changes on a restart). wanted: HSF.ini FgEngine=xemfg. intel_folder: the game's folder
+// (next to HSF.ini). libxess_fg.dll and libxell.dll are looked for in its HSF_streamline first, then in it.
 void Configure(bool wanted, const wchar_t* intel_folder, LogFunction log);
 // From a frame loop of the process that runs DLSS-G (the add-on's present, the helper's presenter). Looks for nvngx_dlssg.dll copies at
 // most once a second and hooks each new one. Does nothing unless Configure asked for XeMFG and the preflight passed.

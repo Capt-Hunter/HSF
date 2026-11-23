@@ -1,6 +1,6 @@
 // See xmx.h. Ported from MFGAdaUnlock-RenoDx by ImDreamt (MIT, Copyright (c) 2026 ImDreamt), commit 8b854ff: the hook from
 // xmx_hook.hpp, the generator from xmx_generator.hpp, the decisions from xmx_policy.hpp. HSF's changes: HSF's own hook patcher
-// (hook_patch.h) in place of Detours, HSF.log in place of ReShade's log, the Intel files next to HSF.ini, and the modules found by a poll
+// (hook_patch.h) in place of Detours, HSF.log in place of ReShade's log, the Intel files in HSF_streamline (or next to HSF.ini), and the modules found by a poll
 // from the frame loop (the add-on is resident by then, which is what their 1.8.3 install-at-first-Present does). The multi-frame model
 // (3x to 6x) is in xmx_model.cpp. Not ported yet: the HUD composition (step 6), the panel and support report.
 #include "xmx.h"
@@ -281,6 +281,9 @@ State& Get() {
 bool g_wanted = false;
 bool g_configured = false;
 wchar_t g_folder[MAX_PATH] = L"";
+// Where the Intel files are: HSF_streamline when libxess_fg.dll is there, else the game's folder (g_folder). In HSF_streamline they never clash
+// with a game's own XeSS frame generation files, which have the same names.
+wchar_t g_intel_folder[MAX_PATH] = L"";
 std::atomic<uint64_t> g_last_generated_tick{0};
 std::atomic<uint64_t> g_last_evaluate_tick{0};
 std::atomic<int> g_evaluations_logged{0};
@@ -312,7 +315,7 @@ void NoteIdle(policy::Idle idle) {
   if ((g_idle_logged.fetch_or(bit, std::memory_order_relaxed) & bit) == 0) Line("not generating: %s", policy::IdleText(idle));
 }
 
-std::wstring IntelPath(const wchar_t* file) { return std::wstring(g_folder) + L"\\" + file; }
+std::wstring IntelPath(const wchar_t* file) { return std::wstring(g_intel_folder) + L"\\" + file; }
 
 DWORD FileTimestamp(const std::wstring& path) {
   const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -334,7 +337,7 @@ bool Exists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) 
 bool Preflight() {
   static const bool passed = [] {
     if (!Exists(IntelPath(L"libxess_fg.dll"))) {
-      Fail("libxess_fg.dll not found next to HSF.ini");
+      Fail("libxess_fg.dll not found in HSF_streamline or next to HSF.ini");
       return false;
     }
     if (FileTimestamp(IntelPath(L"libxess_fg.dll")) != kKnownTimestamp) {
@@ -342,10 +345,10 @@ bool Preflight() {
       return false;
     }
     if (!Exists(IntelPath(L"libxell.dll"))) {
-      Fail("libxell.dll not found next to HSF.ini");
+      Fail("libxell.dll not found next to libxess_fg.dll");
       return false;
     }
-    Line("preflight passed: libxess_fg.dll 1.3.1.78 and libxell.dll in %ls", g_folder);
+    Line("preflight passed: libxess_fg.dll 1.3.1.78 and libxell.dll in %ls", g_intel_folder);
     return true;
   }();
   g_preflight_passed = passed;
@@ -367,14 +370,87 @@ std::string ModulePath(HMODULE module) {
   return module != nullptr && GetModuleFileNameA(module, text, MAX_PATH) ? std::string(text) : std::string("not loaded");
 }
 
+// XeMFG's own two Intel files, loaded by full path, and the activation context that makes their names mean these copies. A game that ships
+// its own XeSS frame generation (Assassin's Creed Shadows: 1.2) loads files with the same names, often before HSF is in. libxess_fg.dll
+// never imports libxell.dll: it asks for the module already loaded under that name, and with two loaded Windows may hand it the game's. An
+// activation context listing both names, with HSF's folder as its directory, is looked at before the loaded modules, so while it is active
+// on a thread the names resolve to XeMFG's copies. It is active around every call into XeFG (IntelScope). Next to HSF.ini (the game's
+// folder) the files are the game's own anyway, so no context is made there.
+HMODULE g_own_fg = nullptr;
+HMODULE g_own_ll = nullptr;
+HANDLE g_actctx = INVALID_HANDLE_VALUE;
+
+struct IntelScope {
+  ULONG_PTR cookie{};
+  bool on{};
+  IntelScope() { on = g_actctx != INVALID_HANDLE_VALUE && ActivateActCtx(g_actctx, &cookie) != FALSE; }
+  ~IntelScope() {
+    if (on) DeactivateActCtx(0, cookie);
+  }
+  IntelScope(const IntelScope&) = delete;
+  IntelScope& operator=(const IntelScope&) = delete;
+};
+
+// The manifest is written next to the Intel files (Windows takes the files from the manifest's own folder; a manifest in TEMP with
+// lpAssemblyDirectory set finds nothing), under a name of this process's own, read once by CreateActCtxW and deleted.
+HANDLE MakeIntelContext() {
+  static const char kManifest[] =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
+      "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\r\n"
+      "  <assemblyIdentity type=\"win32\" name=\"HSF.XeMFG.Intel\" version=\"1.0.0.0\" processorArchitecture=\"amd64\"/>\r\n"
+      "  <file name=\"libxess_fg.dll\"/>\r\n"
+      "  <file name=\"libxell.dll\"/>\r\n"
+      "</assembly>\r\n";
+  const std::wstring path = IntelPath((L"hsf_xemfg_" + std::to_wstring(GetCurrentProcessId()) + L".manifest").c_str());
+  const HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
+  DWORD written = 0;
+  const BOOL ok = WriteFile(file, kManifest, static_cast<DWORD>(sizeof(kManifest) - 1), &written, nullptr);
+  CloseHandle(file);
+  HANDLE context = INVALID_HANDLE_VALUE;
+  if (ok) {
+    ACTCTXW desc{};
+    desc.cbSize = sizeof(desc);
+    desc.lpSource = path.c_str();
+    context = CreateActCtxW(&desc);
+  }
+  DeleteFileW(path.c_str());
+  return context;
+}
+
+// Loads XeMFG's two files and checks that XeFG will find them by name. Empty when all is well, else why not (then no hook goes in: plain DLSS-G).
+std::string LoadOwnIntel() {
+  static const std::string why = []() -> std::string {
+    if (_wcsicmp(g_intel_folder, g_folder) != 0) {
+      g_actctx = MakeIntelContext();
+      if (g_actctx == INVALID_HANDLE_VALUE) return "no activation context for HSF_streamline (the folder may not be writable)";
+    }
+    IntelScope scope;
+    // libxell first: libxess_fg looks for it already loaded.
+    g_own_ll = LoadLibraryExW(IntelPath(L"libxell.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    g_own_fg = LoadLibraryExW(IntelPath(L"libxess_fg.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (g_own_ll == nullptr) return "libxell.dll could not be loaded";
+    if (g_own_fg == nullptr) return "libxess_fg.dll could not be loaded";
+    const auto* base = reinterpret_cast<const unsigned char*>(g_own_fg);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    if (nt->FileHeader.TimeDateStamp != kKnownTimestamp) return "the libxess_fg.dll in use (" + ModulePath(g_own_fg) + ") is not 1.3.1.78";
+    // What XeFG will get when it asks for libxell.dll by name.
+    const HMODULE by_name = GetModuleHandleW(L"libxell.dll");
+    if (by_name != g_own_ll) return "libxell.dll by name gives " + ModulePath(by_name) + ", not XeMFG's " + ModulePath(g_own_ll);
+    Line("Intel files loaded: %s and %s%s", ModulePath(g_own_fg).c_str(), ModulePath(g_own_ll).c_str(),
+         scope.on ? " (activation context: their names mean these copies, even with a game's own loaded)" : "");
+    return {};
+  }();
+  return why;
+}
+
 bool LoadContext(ID3D12Device* device) {
   auto& state = Get();
-  state.fg = GetModuleHandleW(L"libxess_fg.dll");
-  if (state.fg == nullptr) state.fg = LoadLibraryExW(IntelPath(L"libxess_fg.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-  if (state.fg == nullptr) {
-    Fail("libxess_fg.dll could not be loaded");
+  if (const std::string why = LoadOwnIntel(); !why.empty()) {
+    Fail(why);
     return false;
   }
+  state.fg = g_own_fg;
   auto* base = reinterpret_cast<unsigned char*>(state.fg);
   const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
   // A copy the game loaded itself wins over HSF's folder, and may be another build.
@@ -384,8 +460,7 @@ bool LoadContext(ID3D12Device* device) {
   }
   if (!state.published) {
     state.published = true;
-    HMODULE ll = GetModuleHandleW(L"libxell.dll");
-    if (ll == nullptr) ll = LoadLibraryExW(IntelPath(L"libxell.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    const HMODULE ll = g_own_ll;
     Line("runtime %s and %s", ModulePath(state.fg).c_str(), ModulePath(ll).c_str());
     // Before XeFG's first context: its pipelines and frame limits are fixed when a context is made.
     const auto model = model::Publish(state.fg, ll, g_folder);
@@ -773,7 +848,11 @@ uint64_t g_last_poll = 0;
 int OnEvaluate(EvaluateFeatureFn real, ID3D12GraphicsCommandList* list, const void* handle, const Parameter* params, void* callback) {
   if (params != nullptr && g_evaluations_logged.fetch_add(1, std::memory_order_relaxed) < 4) LogParameters(params);
   g_last_evaluate_tick.store(GetTickCount64(), std::memory_order_relaxed);
-  const bool done = Evaluate(list, params);
+  bool done = false;
+  {
+    IntelScope scope;
+    done = Evaluate(list, params);
+  }
   Stats();
   if (done) return NGX_SUCCESS;
   // Only for a call with no list or parameters: a pass-through here would leave a black image.
@@ -901,6 +980,11 @@ void Attach(HMODULE module) {
   if (entry == nullptr) return;
   g_seen.push_back(module);
   const std::string where = ModulePath(module);
+  if (const std::string why = LoadOwnIntel(); !why.empty()) {
+    Fail(why + ": plain DLSS-G");
+    g_hooks_failed.fetch_add(1);
+    return;
+  }
   const int slot = static_cast<int>(g_seen.size()) - 1;
   if (slot >= kSlots) {
     g_hooks_failed.fetch_add(1);
@@ -943,9 +1027,34 @@ void Configure(bool wanted, const wchar_t* intel_folder, LogFunction log) {
   g_log = log;
   g_wanted = wanted;
   if (intel_folder != nullptr) wcsncpy_s(g_folder, intel_folder, _TRUNCATE);
+  wcsncpy_s(g_intel_folder, g_folder, _TRUNCATE);
+  const std::wstring streamline = std::wstring(g_folder) + L"\\HSF_streamline";
+  if (GetFileAttributesW((streamline + L"\\libxess_fg.dll").c_str()) != INVALID_FILE_ATTRIBUTES) wcsncpy_s(g_intel_folder, streamline.c_str(), _TRUNCATE);
   if (!wanted) return;
   Line("FgEngine=xemfg (EXPERIMENTAL): Intel's XeSS frame generation in place of NVIDIA's, inside DLSS-G");
   if (!Preflight()) Line("plain DLSS-G for this run");
+}
+
+// The name a DLL gave itself when it was built, from its export directory in memory. The NVIDIA App's DLSS-G override loads NVIDIA's
+// generator from NGX\models\dlssg\...\160_E658700.bin: same exports, but a file name XeMFG would never match. Its export name is still
+// nvngx_dlssg.dll.
+bool IsGenerator(HMODULE module) {
+  wchar_t name[MAX_PATH] = L"";
+  if (GetModuleBaseNameW(GetCurrentProcess(), module, name, MAX_PATH) != 0 && _wcsicmp(name, L"nvngx_dlssg.dll") == 0) return true;
+  __try {
+    const auto* base = reinterpret_cast<const unsigned char*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (dir.VirtualAddress == 0 || dir.Size < sizeof(IMAGE_EXPORT_DIRECTORY)) return false;
+    const auto* exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + dir.VirtualAddress);
+    if (exports->Name == 0) return false;
+    return _strnicmp(reinterpret_cast<const char*>(base + exports->Name), "nvngx_dlssg.dll", 16) == 0;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
 }
 
 void Poll() {
@@ -959,9 +1068,8 @@ void Poll() {
   if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes)) return;
   const DWORD count = (std::min)(bytes / static_cast<DWORD>(sizeof(HMODULE)), static_cast<DWORD>(std::size(modules)));
   for (DWORD i = 0; i < count; ++i) {
-    wchar_t name[MAX_PATH] = L"";
-    if (GetModuleBaseNameW(GetCurrentProcess(), modules[i], name, MAX_PATH) == 0) continue;
-    if (_wcsicmp(name, L"nvngx_dlssg.dll") == 0) Attach(modules[i]);
+    if (std::find(g_seen.begin(), g_seen.end(), modules[i]) != g_seen.end()) continue;
+    if (IsGenerator(modules[i])) Attach(modules[i]);
   }
 }
 

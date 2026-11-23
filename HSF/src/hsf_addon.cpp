@@ -7425,7 +7425,7 @@ std::string FgEngineReport(const FgEngineState& engine, const hsf::xmx::Status& 
   text += "\n\nXEMFG THIS RUN";
   if (!xmx.preflight) {
     text += std::string("\nIntel files: ") + (xmx.failure[0] != '\0' ? xmx.failure : "not checked yet") + ".";
-    text += "\nPut libxess_fg.dll 1.3.1.78 and libxell.dll next to HSF.ini.";
+    text += "\nPut libxess_fg.dll 1.3.1.78 and libxell.dll in the HSF_streamline folder.";
     return text;
   }
   text += "\nIntel files: found (libxess_fg.dll 1.3.1.78, libxell.dll).";
@@ -7527,7 +7527,7 @@ void DrawPanel(effect_runtime* runtime) {
     static const char* const ENGINES[] = {"DLSS-G", "XEMFG"};
     static const char* const TIPS[] = {"NVIDIA's own frame generation. The default.",
                                        "EXPERIMENTAL. Intel's XeSS frame generation, run inside DLSS-G.\n"
-                                       "Needs libxess_fg.dll 1.3.1.78 and libxell.dll next to HSF.ini.\n"
+                                       "Needs libxess_fg.dll 1.3.1.78 and libxell.dll in HSF_streamline.\n"
                                        "3x to 6x also needs MFG-Unlocker or the RenoDX MFG unlock add-on.\n"
                                        "Applies when the game starts again."};
     int pick = engine.pick;
@@ -8889,7 +8889,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         hsf::hsflog::Open((log_path + L"HSF.log").c_str());
       }
 #ifdef HSF_SL_GAME
-      // FgEngine (EXPERIMENTAL XeMFG, xmx.h): read once, a change needs a restart. The Intel files are looked for next to HSF.ini.
+      // FgEngine (EXPERIMENTAL XeMFG, xmx.h): read once, a change needs a restart. The Intel files are looked for in HSF_streamline, then next to HSF.ini.
       if (g_ini_path[0] != L'\0') {
         std::wstring folder = g_ini_path;
         folder.resize(folder.find_last_of(L'\\'));
