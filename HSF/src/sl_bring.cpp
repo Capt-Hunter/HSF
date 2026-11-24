@@ -974,7 +974,7 @@ void CatchPresent(IUnknown* swap_chain) {
   if (swap_chain == nullptr) return;
   void** const table = *reinterpret_cast<void***>(swap_chain);
   g_game_swap_chain = swap_chain;
-  if (g_made_queue != nullptr) hsf::fp16swap::Start(swap_chain, g_made_swap_chain, g_made_queue, RealQueue(g_made_queue), &Line);
+  if (g_made_queue != nullptr) hsf::fp16swap::Start(swap_chain, g_made_swap_chain, g_made_queue, RealQueue(g_made_queue), &Line, g_made_table);
   if (g_present_table == table) return;
   if (g_present_table != nullptr) {
     Line("a second kind of swap chain: its frames are not followed");

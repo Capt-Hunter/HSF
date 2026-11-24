@@ -30,6 +30,9 @@ constexpr DXGI_FORMAT REAL_FORMAT = DXGI_FORMAT_R10G10B10A2_UNORM;
 constexpr UINT RING = 3;  // conversions in flight
 
 // A method table HSF wrote into, with what was there before. The game's swap chain and Streamline's can be of two kinds (ReShade's and Streamline's).
+// A kind can have more than one table: ReLimiter's VSync control puts a copy of Streamline's table on the object (verbatim from index -1, the
+// class locator), a new one after a resize; BLACKTAIL went black when HSF had hooked only the first copy and the game took its back buffers
+// through the second. HSF hooks the class table as well, and a table it never wrote into is matched to one it did by that locator.
 struct Table {
   void** table = nullptr;
   GetBufferFn get_buffer = nullptr;
@@ -39,8 +42,9 @@ struct Table {
   CheckColorSpaceFn check_space = nullptr;
   SetColorSpace1Fn set_space = nullptr;
   ResizeBuffers1Fn resize1 = nullptr;
+  void* locator = nullptr;  // index -1: the same in a verbatim copy
 };
-Table g_tables[2];
+Table g_tables[6];
 
 LineFn g_line = nullptr;
 SRWLOCK g_lock = SRWLOCK_INIT;
@@ -90,10 +94,21 @@ bool WriteSlot(void** table, int slot, void* value) {
   return true;
 }
 
+void* Locator(void** table) {
+  void* locator = nullptr;
+  if (table == nullptr || !ReadProcessMemory(GetCurrentProcess(), table - 1, &locator, sizeof(locator), nullptr)) return nullptr;
+  return locator;
+}
+
 const Table* For(void* object) {
   void** const table = *static_cast<void***>(object);
   for (const Table& t : g_tables) {
     if (t.table == table) return &t;
+  }
+  void* const locator = Locator(table);
+  if (locator == nullptr) return nullptr;
+  for (const Table& t : g_tables) {
+    if (t.table != nullptr && t.locator == locator) return &t;
   }
   return nullptr;
 }
@@ -338,12 +353,18 @@ HRESULT STDMETHODCALLTYPE HookSetSpace(IDXGISwapChain3* swap, DXGI_COLOR_SPACE_T
   return For(swap)->set_space(swap, space);
 }
 
-void HookTable(void* object) {
-  if (object == nullptr) return;
-  void** const table = *static_cast<void***>(object);
+// A table whose GetBuffer is already HSF's was copied from one HSF wrote into: For() finds it by its locator, and its slots are not originals.
+bool Carries(void** table) {
+  void* slot = nullptr;
+  return ReadProcessMemory(GetCurrentProcess(), table + SLOT_GET_BUFFER, &slot, sizeof(slot), nullptr) && slot == reinterpret_cast<void*>(&HookGetBuffer);
+}
+
+void HookTableAt(void** const table) {
+  if (table == nullptr) return;
   for (Table& t : g_tables) {
     if (t.table == table) return;
   }
+  if (Carries(table)) return;
   for (Table& t : g_tables) {
     if (t.table != nullptr) continue;
     t.get_buffer = reinterpret_cast<GetBufferFn>(table[SLOT_GET_BUFFER]);
@@ -353,6 +374,7 @@ void HookTable(void* object) {
     t.check_space = reinterpret_cast<CheckColorSpaceFn>(table[SLOT_CHECK_COLOR_SPACE]);
     t.set_space = reinterpret_cast<SetColorSpace1Fn>(table[SLOT_SET_COLOR_SPACE1]);
     t.resize1 = reinterpret_cast<ResizeBuffers1Fn>(table[SLOT_RESIZE_BUFFERS1]);
+    t.locator = Locator(table);
     t.table = table;
     const bool written = WriteSlot(table, SLOT_GET_BUFFER, reinterpret_cast<void*>(&HookGetBuffer)) &&
                          WriteSlot(table, SLOT_GET_DESC, reinterpret_cast<void*>(&HookGetDesc)) &&
@@ -367,6 +389,10 @@ void HookTable(void* object) {
   Line("FP16 watch: no room for the table %p", table);
 }
 
+void HookTable(void* object) {
+  if (object != nullptr) HookTableAt(*static_cast<void***>(object));
+}
+
 }  // namespace
 
 bool Rewrite(DXGI_FORMAT& format) {
@@ -379,7 +405,7 @@ bool Rewrite(DXGI_FORMAT& format) {
   return true;
 }
 
-void Start(IUnknown* game, IUnknown* made, IUnknown* queue, IUnknown* real_queue, LineFn line) {
+void Start(IUnknown* game, IUnknown* made, IUnknown* queue, IUnknown* real_queue, LineFn line, void* made_class_table) {
   g_line = line;
   if (game == nullptr || queue == nullptr || real_queue == nullptr) return;
   AcquireSRWLockExclusive(&g_lock);
@@ -402,6 +428,12 @@ void Start(IUnknown* game, IUnknown* made, IUnknown* queue, IUnknown* real_queue
     g_queue->GetDevice(IID_PPV_ARGS(&g_device));
   }
   ReleaseSRWLockExclusive(&g_lock);
+  // The class table first: a copy put on the object before this still holds Streamline's own methods, and is hooked next as itself.
+  if (made_class_table != nullptr && made_class_table != *reinterpret_cast<void**>(made != nullptr ? made : game)) {
+    HookTableAt(static_cast<void**>(made_class_table));
+    Line("FP16: Streamline's swap chain has a copy of its table on it (%p, its class table %p): both carry HSF's methods",
+         *reinterpret_cast<void**>(made != nullptr ? made : game), made_class_table);
+  }
   HookTable(game);
   HookTable(made);
   g_active = g_want.load() && g_game_device && g_device;
@@ -414,6 +446,10 @@ void Start(IUnknown* game, IUnknown* made, IUnknown* queue, IUnknown* real_queue
 
 void BeforePresent(IUnknown* game) {
   if (!g_active.load() || game != g_game.load()) return;
+  // A copy made before HSF hooked the class table may be put back on an object later: it is hooked as itself.
+  for (void* const object : {g_game.load(), g_made.load()}) {
+    if (object != nullptr && For(object) != nullptr && !Carries(*static_cast<void***>(object))) HookTable(object);
+  }
   const bool due = g_space_due.exchange(false);
   if (due || ++g_presents % SPACE_EVERY == 0) PushSpace(due);
   AcquireSRWLockExclusive(&g_lock);
