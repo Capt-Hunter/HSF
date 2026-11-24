@@ -45,4 +45,4 @@ Players install these themselves. HSF only reads what they produce, and none of 
 | Luma, by Pumbo (Filoppi) and contributors | in D3D11 games it adds DLSS to, HSF reads the motion vectors and depth Luma hands to DLSS, and feeds them to frame generation |
 | Intel XeSS frame generation (`libxess_fg.dll` 1.3.1.78 and `libxell.dll`), by Intel | the EXPERIMENTAL XeMFG engine, under Intel's own licence |
 | MFGAdaUnlock's RenoDX add-on (`renodx-mfgunlock.addon64`), by ImDreamt, or MFG-Unlocker 1.7.1 or newer | XeMFG reads the 54 shader programs of the 3x to 6x model from the player's own copy, without loading it. The programs are derived from Intel's and are never shipped with HSF. |
-| ReLimiter, by RankFTW | a frame limiter that runs alongside HSF; HSF loads NVIDIA's NGX early when ReLimiter is next to it, and tells it the multiplier on the helper route |
+| ReLimiter, by Mat, Laz and Rank (RankFTW) | a frame limiter that runs alongside HSF; HSF loads NVIDIA's NGX early when ReLimiter is next to it, and tells it the multiplier on the helper route |

@@ -6,8 +6,8 @@ Every file tracked in `HSF/`, and what it is for.
 
 | Target | Output | Sources |
 |---|---|---|
-| `hsf_addon` | `hsf.addon64` / `hsf.addon32` | `hsf_addon.cpp ui.cpp dlssg_remote.cpp dx9_bridge.cpp gpu_fence9.cpp vk_bridge.cpp vk_hook.cpp score.cpp depth.cpp hud.cpp dxgi_guard.cpp safe_try.cpp hsf_log.cpp`. The 64-bit build adds `dlssg_core.cpp hdr_out.cpp` and the D3D12 modules (`HSF_SL_GAME`): `sl_game.cpp sl_bring.cpp depth_fit.cpp ngx_input.cpp frame_checks.cpp compose.cpp debug_view.cpp`, and delay-loads `sl.interposer.dll`. |
-| `hsf_dlssg_helper` | `hsf-dlssg-helper64.exe` (64-bit only) | `dlssg_helper.cpp dlssg_core.cpp hsf_log.cpp hdr_out.cpp compose.cpp frame_checks.cpp nvof_flow.cpp` |
+| `hsf_addon` | `hsf.addon64` / `hsf.addon32` | `hsf_addon.cpp ui.cpp dlssg_remote.cpp dx9_bridge.cpp gpu_fence9.cpp vk_bridge.cpp vk_hook.cpp score.cpp depth.cpp hud.cpp dxgi_guard.cpp safe_try.cpp hsf_log.cpp`. The 64-bit build adds `dlssg_core.cpp hdr_out.cpp` and the D3D12 modules (`HSF_SL_GAME`): `sl_game.cpp sl_bring.cpp depth_fit.cpp ngx_input.cpp frame_checks.cpp compose.cpp debug_view.cpp`, and XeMFG's `xmx.cpp xmx_model.cpp lzma_dec.cpp`, and delay-loads `sl.interposer.dll`. |
+| `hsf_dlssg_helper` | `hsf-dlssg-helper64.exe` (64-bit only) | `dlssg_helper.cpp dlssg_core.cpp hsf_log.cpp hdr_out.cpp compose.cpp frame_checks.cpp nvof_flow.cpp xmx.cpp xmx_model.cpp lzma_dec.cpp hook_patch.cpp safe_try.cpp` |
 | `d3d12_scene` | `d3d12_scene.exe` (64-bit only, built only when the NGX SDK is in the Luma checkout next to HSF) | `tests/d3d12_scene.cpp` |
 | `hsf_vk_layer` | `hsf_vk_layer64.dll` and its manifest (64-bit only) | `vk_layer.cpp` |
 | `vk_scene` | `vk_scene.exe` (64-bit only) | `tests/vk_scene.cpp` |
@@ -134,7 +134,7 @@ Offline tests and probes. CMake builds the ones it lists into `build/x64` (D3D12
 | `helper_exit_test.cpp` | the helper dies with its game (job or watchdog); with `hdr10` / `hdr10bug`, an eye test of HDR10 through the helper |
 | `gpu_reserve_test.cpp` | the GPU reserve's spike count and governor against a simple card model, and one live load reading |
 | `lzma_test.cpp`, `lzma_fixture.h` | the LZMA decoder on streams made by Python's `lzma` module |
-| `xmx_programs_test.cpp` | finds XeMFG's 54 programs in a mod file given on the command line (the mods are not in the repo; not in the suite) |
+| `xmx_programs_test.cpp` | finds XeMFG's 54 programs in a mod file given on the command line (the mods are not in the repo; `test.ps1` leaves it out) |
 | `vk_scene.cpp` | a small Vulkan program for bringing up the Vulkan route without a game (run by hand, not in the suite) |
 
 ## `HSF/tools`

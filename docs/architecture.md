@@ -91,7 +91,7 @@ Ported from MFGAdaUnlock-RenoDx by ImDreamt (MIT), whose model set-up came from 
 
 ### 3.5 Alongside ReLimiter
 
-ReLimiter looks for NVIDIA's NGX when it starts, which on the bring-in route is before Streamline has loaded it, so HSF loads `_nvngx.dll` early when ReLimiter is next to the add-on (`SlPreloadNgx`). On the helper route DLSS-G runs in the helper, where ReLimiter cannot see the multiplier, so the game side states it each frame through Reflex's `SetReflexSync` call on the game's device (`dlssg_remote.cpp`), which only ReLimiter's hook reads. ReLimiter copies a swap chain's method table to control VSync; the FP16 path (`fp16_swap.cpp`) therefore hooks Streamline's class table too, and matches such copies to it by the class locator at index -1.
+ReLimiter hooks NVIDIA's NGX only as it starts, which on the bring-in route is before Streamline has loaded it, so HSF loads `_nvngx.dll` early when ReLimiter is next to the add-on (`SlPreloadNgx`). On the helper route DLSS-G runs in the helper, where ReLimiter cannot see the multiplier, so the game side states it each frame through NvAPI's `NvAPI_D3D_SetReflexSync` on the game's device (`dlssg_remote.cpp`): the driver refuses the call, and only ReLimiter's hook reads it. ReLimiter copies a swap chain's method table to control VSync; the FP16 path (`fp16_swap.cpp`) therefore hooks Streamline's class table too, and matches such copies to it by the class locator at index -1. On the bring-in route ReLimiter itself also needs two fixes (its proxy check and DLSS-G's worker Presents under Streamline); they are in its own code, not HSF's.
 
 ## 4. The D3D11 and DX9 routes
 
