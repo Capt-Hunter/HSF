@@ -1107,6 +1107,7 @@ sl::Result HookSetFeatureLoaded(sl::Feature feature, bool loaded) {
 
 using hookpatch::CodeStillThere;
 using hookpatch::Hook;
+using hookpatch::ModuleCave;
 using hookpatch::NearSlot;
 using hookpatch::PointRelay;
 using hookpatch::WriteAbsoluteJump;
@@ -1133,8 +1134,10 @@ Hook g_feature_hooks[] = {
     {"slReflexSetOptions", reinterpret_cast<void*>(&HookReflexOptions), reinterpret_cast<void**>(&g_real_reflex_options)},
 };
 
-// H1: what the plugin hook hands out in place of slDLSSGSetOptions, a jump to HookDlssgOptions in a code page that outlives HSF (see HandOutOptions). Under g_lock.
+// H1: what the plugin hook hands out in place of slDLSSGSetOptions, a stub in DLSS-G's own module that jumps to the relay, a jump to HookDlssgOptions in a code page that
+// outlives HSF (see HandOutOptions). With no room in DLSS-G's module, the relay is handed out itself. Under g_lock.
 uint8_t* g_options_stub = nullptr;
+uint8_t* g_options_relay = nullptr;
 std::atomic<bool> g_plugin_route{false};  // the game's slDLSSGSetOptions calls come through HSF's stub, with no patch on DLSS-G's code
 
 // The Steam overlay hooks DLSS-G's functions itself. Handed HSF's stub, it would patch HSF's code, which goes away when ReShade unloads HSF.
@@ -1352,9 +1355,29 @@ bool OptionsPatched() {
   return false;
 }
 
+// The stub in DLSS-G's module: an absolute jump to the relay. Never changed once written: a tool that hooks the stub (MinHook) copies the jump's target into its own trampoline,
+// so only the relay behind it may be pointed elsewhere.
+bool WriteStub(uint8_t* stub, const uint8_t* relay) {
+  uint8_t jump[14];
+  WriteAbsoluteJump(jump, relay);
+  return hookpatch::WriteCode(stub, jump, sizeof(jump));
+}
+
+// The stub still holds a jump: HSF's, or a tool's hook on top of it. Not after DLSS-G's plugin was loaded again at the same place, with new pages.
+bool StubIntact(const uint8_t* stub) {
+  uint8_t head[2];
+  return SafeCopy(head, stub, sizeof(head)) && ((head[0] == 0xFF && head[1] == 0x25) || head[0] == 0xE9);
+}
+
 // Under g_lock. real is DLSS-G's slDLSSGSetOptions from one copy of the plugin.
+// Streamline gets a stub inside DLSS-G's own module, in the free bytes after its code. Tools that look up which module a function is in before they hook it take it as
+// DLSS-G's: ReLimiter pins that module and gives up on a function in none, and so never saw HSF's options on this route (Shadows, with HSF's stub in a page of its own).
+// The stub jumps to the relay in HSF's code page, which jumps to HSF's hook; another load of HSF, or the unload, points the relay elsewhere.
 void* HandOutOptions(void* real) {
-  if (g_plugin_route.load() && g_options_stub != nullptr && reinterpret_cast<void*>(g_real_dlssg_options) == real) return g_options_stub;
+  if (g_plugin_route.load() && g_options_stub != nullptr && reinterpret_cast<void*>(g_real_dlssg_options) == real) {
+    if (g_options_stub != g_options_relay && !StubIntact(g_options_stub) && !WriteStub(g_options_stub, g_options_relay)) return real;
+    return g_options_stub;
+  }
   // One at a time: a second copy, or DLSS-G's code is already patched, keeps its own.
   if (g_plugin_route.load() || OptionsPatched()) {
     static void* s_said = nullptr;
@@ -1364,28 +1387,36 @@ void* HandOutOptions(void* real) {
     }
     return real;
   }
-  // The stub is called through a pointer, so it need not be near DLSS-G's code. Some games leave no free memory near it (Gothic Remake, the NVIDIA App's DLSS-G):
+  // The relay is reached through a jump, so it need not be near DLSS-G's code. Some games leave no free memory near it (Gothic Remake, the NVIDIA App's DLSS-G):
   // then a page anywhere, kept for good like the near ones.
-  uint8_t* stub = g_options_stub != nullptr ? g_options_stub : NearSlot(static_cast<uint8_t*>(real));
-  if (stub == nullptr) stub = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
-  if (stub == nullptr) {
+  uint8_t* relay = g_options_relay != nullptr ? g_options_relay : NearSlot(static_cast<uint8_t*>(real));
+  if (relay == nullptr) relay = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+  if (relay == nullptr) {
     Line("Streamline asked DLSS-G's plugin for slDLSSGSetOptions (%p): no memory for HSF's stub, DLSS-G's own handed out", real);
     return real;
   }
   g_real_dlssg_options = reinterpret_cast<SetDlssgOptionsFn>(real);  // ready before any call can arrive
   std::atomic_thread_fence(std::memory_order_seq_cst);
-  if (g_options_stub == nullptr) {
-    WriteAbsoluteJump(stub, reinterpret_cast<const void*>(&HookDlssgOptions));
-    FlushInstructionCache(GetCurrentProcess(), stub, 16);
+  if (g_options_relay == nullptr) {
+    WriteAbsoluteJump(relay, reinterpret_cast<const void*>(&HookDlssgOptions));
+    FlushInstructionCache(GetCurrentProcess(), relay, 16);
   } else {
-    PointRelay(stub, reinterpret_cast<const void*>(&HookDlssgOptions));
+    PointRelay(relay, reinterpret_cast<const void*>(&HookDlssgOptions));
+  }
+  g_options_relay = relay;
+  uint8_t* stub = ModuleCave(real, 14);
+  if (stub != nullptr && !WriteStub(stub, relay)) stub = nullptr;
+  if (stub == nullptr) {
+    stub = relay;
+    Line("DLSS-G's module has no free bytes for HSF's stub: HSF's relay handed out, in no module (tools that look up the function's module, as ReLimiter does, do not see HSF's options)");
   }
   g_options_stub = stub;
   g_plugin_route.store(true);
   wchar_t value[64];
-  std::swprintf(value, 64, L"%p %p", static_cast<void*>(stub), real);
+  std::swprintf(value, 64, L"%p %p %p", static_cast<void*>(stub), real, static_cast<void*>(relay));
   SetEnvironmentVariableW(STUB_VARIABLE, value);
-  Line("DLSS-G's slDLSSGSetOptions (%p) handed to Streamline as HSF's (%p) through the plugin hook: DLSS-G's code is not patched", real, static_cast<void*>(stub));
+  Line("DLSS-G's slDLSSGSetOptions (%p) handed to Streamline as HSF's (%p, %s) through the plugin hook: DLSS-G's code is not patched", real, static_cast<void*>(stub),
+       stub != relay ? "a stub in DLSS-G's module, then HSF's relay" : "HSF's relay");
   return stub;
 }
 
@@ -1402,21 +1433,24 @@ void* PluginFunction(int copy, const char* name) {
 void AdoptOptionsStub() {
   wchar_t value[64] = L"";
   if (GetEnvironmentVariableW(STUB_VARIABLE, value, 64) == 0) return;
-  void *stub = nullptr, *real = nullptr;
+  void *stub = nullptr, *real = nullptr, *relay = nullptr;
   uint8_t head[6];
-  if (swscanf_s(value, L"%p %p", &stub, &real) != 2 || !CodeStillThere(stub) || !CodeStillThere(real) || !SafeCopy(head, stub, sizeof(head))) return;
+  const int fields = swscanf_s(value, L"%p %p %p", &stub, &real, &relay);
+  if (fields == 2) relay = stub;  // a build of HSF that handed out the relay itself
+  if (fields < 2 || !CodeStillThere(stub) || !CodeStillThere(real) || !CodeStillThere(relay) || !SafeCopy(head, relay, sizeof(head))) return;
   if (head[0] != 0xFF || head[1] != 0x25 || head[2] != 0 || head[3] != 0 || head[4] != 0 || head[5] != 0) return;
   g_real_dlssg_options = reinterpret_cast<SetDlssgOptionsFn>(real);
   std::atomic_thread_fence(std::memory_order_seq_cst);
   g_options_stub = static_cast<uint8_t*>(stub);
-  PointRelay(g_options_stub, reinterpret_cast<const void*>(&HookDlssgOptions));
+  g_options_relay = static_cast<uint8_t*>(relay);
+  PointRelay(g_options_relay, reinterpret_cast<const void*>(&HookDlssgOptions));
   g_plugin_route.store(true);
   Line("DLSS-G's slDLSSGSetOptions: HSF's stub from the last load (%p) taken back", stub);
 }
 
-// Unload: Streamline keeps calling the stub, which now goes straight to DLSS-G.
+// Unload: Streamline keeps calling the stub, whose relay now goes straight to DLSS-G.
 void ReleaseOptionsStub() {
-  if (g_options_stub != nullptr && g_real_dlssg_options != nullptr && CodeStillThere(g_options_stub)) PointRelay(g_options_stub, reinterpret_cast<const void*>(g_real_dlssg_options));
+  if (g_options_relay != nullptr && g_real_dlssg_options != nullptr && CodeStillThere(g_options_relay)) PointRelay(g_options_relay, reinterpret_cast<const void*>(g_real_dlssg_options));
   g_plugin_route.store(false);
 }
 

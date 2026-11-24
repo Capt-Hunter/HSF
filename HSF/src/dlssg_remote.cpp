@@ -384,6 +384,60 @@ void EarlyWait(Remote& r) {
   g_early_ticks += Qpc() - from;
 }
 
+// Frame limiters in the game's process (ReLimiter) learn frame generation's multiplier from Streamline's NvAPI_D3D_SetReflexSync call
+// (fgMultiplier), which on this route happens in the helper, so they never see it: they took every game frame for a frame on screen and
+// capped the real frames at the cap meant for all of them. Each frame handed over states the multiplier in the game's process too, with
+// the same call on the game's device, enable and disable both 0, so it says nothing else. Only while ReLimiter is loaded.
+struct ReflexSyncParams {
+  uint32_t version;
+  uint32_t flags;  // bEnable : 1, bDisable : 1, reserved : 30
+  uint32_t vblank_interval_us;
+  int32_t time_in_queue_us;
+  uint32_t time_in_queue_us_target;
+  uint8_t fg_multiplier;
+  uint8_t reserved[27];
+};
+static_assert(sizeof(ReflexSyncParams) == 48, "nvapi.h NV_SET_REFLEX_SYNC_PARAMS_V1");
+
+static void StateMultiplierToLimiters(Remote& r, uint32_t multiplier) {
+  using SetReflexSync = int(__cdecl*)(IUnknown*, ReflexSyncParams*);
+  static SetReflexSync s_call = nullptr;
+  static ULONGLONG s_next_look = 0;
+  static bool s_logged = false;
+  if (s_call == nullptr) {
+    const ULONGLONG now = GetTickCount64();
+    if (now < s_next_look) return;
+    s_next_look = now + 2000;
+    if (GetModuleHandleW(L"relimiter.addon64") == nullptr && GetModuleHandleW(L"relimiter.addon") == nullptr &&
+        GetModuleHandleW(L"relimiter.addon32") == nullptr)
+      return;
+#ifdef _WIN64
+    const HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
+#else
+    const HMODULE nvapi = GetModuleHandleW(L"nvapi.dll");
+#endif
+    if (nvapi == nullptr) return;
+    using QueryInterface = void*(__cdecl*)(uint32_t);
+    const auto query = reinterpret_cast<QueryInterface>(GetProcAddress(nvapi, "nvapi_QueryInterface"));
+    if (query == nullptr) return;
+    s_call = reinterpret_cast<SetReflexSync>(query(0xB9F6FAFFu));
+    if (s_call == nullptr) {
+      s_next_look = ~0ull;
+      Log("ReLimiter: NvAPI has no SetReflexSync, so it cannot be told the frame generation multiplier");
+      return;
+    }
+  }
+  ReflexSyncParams params{};
+  params.version = static_cast<uint32_t>(sizeof(params)) | (1u << 16);
+  params.fg_multiplier = static_cast<uint8_t>(std::clamp(multiplier, 1u, 6u));
+  const int status = s_call(r.device11.Get(), &params);
+  if (!s_logged) {
+    s_logged = true;
+    Log("ReLimiter: told the frame generation multiplier each frame (%ux, NvAPI status %d), so its cap counts the generated frames too",
+        static_cast<unsigned>(params.fg_multiplier), status);
+  }
+}
+
 void FrameStart() {
   if (!Running()) return;
   Remote& r = *g_r;
@@ -456,6 +510,7 @@ void EndCopyTiming(Remote& r, UINT i) {
 void Submit(ID3D11Texture2D* back_buffer, const FrameInputs& inputs) {
   if (!Running()) return;
   Remote& r = *g_r;
+  StateMultiplierToLimiters(r, g_on ? g_frames + 1 : 1);
   // The game frame's Streamline index: from FrameStart, or (first frame, or the helper was not taking messages then) a token without a sleep.
   uint32_t index = r.game_index;
   LONGLONG start = r.game_start;

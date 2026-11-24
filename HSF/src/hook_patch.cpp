@@ -147,10 +147,51 @@ static void PublishRelay(const Hook& hook) {
 
 // The 8-byte address in the relay's absolute jump, written in one go.
 void PointRelay(uint8_t* relay, const void* to) {
+  MEMORY_BASIC_INFORMATION mbi{};
+  const bool writable = VirtualQuery(relay + 6, &mbi, sizeof(mbi)) != 0 && (mbi.Protect & (PAGE_EXECUTE_READWRITE | PAGE_READWRITE)) != 0;
+  DWORD old = 0;
+  if (!writable && !VirtualProtect(relay + 6, 8, PAGE_EXECUTE_READWRITE, &old)) return;
   LONG64 value;
   std::memcpy(&value, &to, 8);
   _InterlockedExchange64(reinterpret_cast<volatile LONG64*>(relay + 6), value);
+  if (!writable) VirtualProtect(relay + 6, 8, old, &old);
   FlushInstructionCache(GetCurrentProcess(), relay, 16);
+}
+
+uint8_t* ModuleCave(const void* inside, size_t bytes) {
+  HMODULE module = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(inside), &module)) return nullptr;
+  uint8_t* const base = reinterpret_cast<uint8_t*>(module);
+  const auto* const dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+  const auto* const nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+  const uintptr_t align = nt->OptionalHeader.SectionAlignment;
+  if (align < 0x1000 || (align & (align - 1)) != 0) return nullptr;
+  constexpr size_t SPARE = 16;  // left free after the code: nothing that reads a little past the last instruction meets the stub
+  const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+  for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+    if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 || section->Misc.VirtualSize == 0) continue;
+    uint8_t* const code_end = base + section->VirtualAddress + section->Misc.VirtualSize;
+    uint8_t* const end = base + section->VirtualAddress + ((section->Misc.VirtualSize + align - 1) & ~(align - 1));
+    for (uintptr_t at = ((reinterpret_cast<uintptr_t>(code_end) + SPARE + 7) & ~uintptr_t{7}) + 2; at + bytes <= reinterpret_cast<uintptr_t>(end); at += 8) {
+      const uint8_t* const from = reinterpret_cast<const uint8_t*>(at) - SPARE;
+      if (!CodeStillThere(from) || !CodeStillThere(reinterpret_cast<const uint8_t*>(at) + bytes - 1)) break;
+      bool free = true;
+      for (const uint8_t* b = from; b < reinterpret_cast<const uint8_t*>(at) + bytes && free; ++b) free = *b == 0x00 || *b == 0xCC;
+      if (free) return reinterpret_cast<uint8_t*>(at);
+    }
+  }
+  return nullptr;
+}
+
+bool WriteCode(uint8_t* at, const void* bytes, size_t size) {
+  DWORD old = 0;
+  if (!VirtualProtect(at, size, PAGE_EXECUTE_READWRITE, &old)) return false;
+  std::memcpy(at, bytes, size);
+  VirtualProtect(at, size, old, &old);
+  FlushInstructionCache(GetCurrentProcess(), at, size);
+  return true;
 }
 
 // target starts with someone else's jump. If an earlier load of HSF hooked it and left its relay, take that relay back: their jump still leads through it.

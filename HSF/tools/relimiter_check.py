@@ -77,7 +77,7 @@ def main():
     # ---- ReLimiter ----
     states = []
     for l in rl:
-        m = re.match(r"\[\s*([\d.]+)\] \[\w+\] FG state \(\w+\): presenting (yes|no), multiplier (\d+).*?statement \d+, mode (unknown )?(\d+).*FG input route (\w+)", l)
+        m = re.match(r"\[\s*([\d.]+)\] \[\w+\] FG state \(\w+\): presenting (yes|no), multiplier (\d+).*?statement \d+(?: not fresh)?, mode (unknown )?(\d+).*FG input route (\w+)", l)
         if m:
             states.append((float(m.group(1)), m.group(2) == "yes", int(m.group(3)), m.group(4) is None, int(m.group(5)), m.group(6)))
     first_yes = next((i for i, s in enumerate(states) if s[1]), None)

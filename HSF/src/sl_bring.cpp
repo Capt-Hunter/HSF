@@ -1356,6 +1356,19 @@ void Start(const wchar_t* log_path, const wchar_t* folder, const StartOptions& o
     const HMODULE early = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     Line("sl.interposer.dll loaded early, as HSF loads: %s", early != nullptr ? "yes" : "no");
   }
+  if (options.preload_ngx && GetModuleHandleW(L"_nvngx.dll") == nullptr) {
+    // The driver's NGX folder, as NGX itself finds it.
+    wchar_t folder_ngx[MAX_PATH] = L"";
+    DWORD size = sizeof(folder_ngx);
+    const LSTATUS read = RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", L"FullPath", RRF_RT_REG_SZ, nullptr, folder_ngx, &size);
+    if (read != ERROR_SUCCESS || folder_ngx[0] == L'\0') {
+      Line("NVIDIA's NGX not loaded early for ReLimiter: the driver's NGX folder is not in the registry (%ld)", static_cast<long>(read));
+    } else {
+      const std::wstring dll = std::wstring(folder_ngx) + L"\\_nvngx.dll";
+      const HMODULE ngx = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+      Line("NVIDIA's NGX loaded early for ReLimiter, which hooks it only as it starts: %s (%ls)", ngx != nullptr ? "yes" : "no", dll.c_str());
+    }
+  }
 }
 
 void NoteDevice(void* device) {
