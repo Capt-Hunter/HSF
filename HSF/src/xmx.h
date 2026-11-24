@@ -3,7 +3,7 @@
 // DLSS-G (in game, bring-in, the helper for D3D11, DX9, 32-bit and Vulkan games) gets the same engine through one hook.
 //
 // Ported from MFGAdaUnlock-RenoDx by ImDreamt (MIT, Copyright (c) 2026 ImDreamt), commit 8b854ff: src/addons/mfgunlock/xmx_hook.hpp,
-// xmx_generator.hpp, xmx_policy.hpp and tag_states.hpp. The licence is in licenses/ and THIRD_PARTY_NOTICES.md.
+// xmx_generator.hpp, xmx_policy.hpp and tag_states.hpp. The licence is in third_party/mfgadaunlock/LICENSE and THIRD_PARTY_NOTICES.md.
 //
 // libxess_fg.dll 1.3.1.78 and libxell.dll sit in HSF_streamline (or next to HSF.ini, the game's folder). Anything
 // missing or of another build: no hook, plain DLSS-G, and Snapshot says why. Hooking nvngx_dlssg.dll ends NVIDIA's own generation in that

@@ -19,6 +19,7 @@ Older files may still have `Presenter`, `Generated` and `Pacing`. They belonged 
 | Key | Default | Values | When | Route | What it does |
 |---|---|---|---|---|---|
 | `Extra` | `1` | 0, 1 | Live | All | The menu's FRAME GEN. 0 shows real frames only. |
+| `FgEngine` | `dlssg` | `dlssg`, `xemfg` | Start | All | The menu's FG ENGINE. `dlssg` is NVIDIA's own frame generation. `xemfg` is EXPERIMENTAL: Intel's XeSS frame generation makes the frames inside DLSS-G, so DLSS-G still presents, paces and runs Reflex. It needs `libxess_fg.dll` 1.3.1.78 and `libxell.dll` in `HSF_streamline` (or next to `HSF.ini`). 3x to 6x also needs MFGAdaUnlock's RenoDX add-on or MFG-Unlocker 1.7.1 or newer in the game. When a file is missing or of another build, HSF runs plain DLSS-G and the menu says why. |
 | `DlssgFrames` | `1` | 1 to 5 | Live | All | Generated frames per real frame: 1 = 2x, up to 5 = 6x. It is capped to what DLSS-G reports this GPU can do. |
 | `MfgKey` | `118` (F7) | key code, 0 = none | Live | All | Cycles `DlssgFrames` in game. Set in the menu's KEYBINDS section. |
 | `FrameGenKey` | `0` (none) | key code, 0 = none | Live | All | Turns frame generation (`Extra`) on and off in game. Set in KEYBINDS. |
@@ -72,6 +73,7 @@ Older files may still have `Presenter`, `Generated` and `Pacing`. They belonged 
 | `SlManualHooking` | `0` | 0, 1 | Start | D3D12-B | Streamline's manual hooking mode, for games that crash while Streamline starts. |
 | `SlEarlyLoad` | `1` | 0, 1 | Start | D3D12-B | Loads `sl.interposer.dll` when HSF loads, before `slInit`, so add-ons that look for Streamline at start-up find it (RenoDX DLSS picks its Present hook then). |
 | `SlNgxPath` | empty | a folder | Start | D3D12-B | Folder of the game's own `nvngx_dlss.dll`, given to Streamline after `HSF_streamline`. Streamline starts NGX before the game does, with only its plugin folders to find DLSS in, so a game that runs DLSS through NGX (Unreal's DLSS plugin) otherwise finds no DLSS and hides it. HSF writes it when it picks this route in a game with DLSS loaded, or after its own search of the game folder (a copy the game has loaded comes first; with several copies the newest). `none:` plus a time means the search found none; it searches again when the game's exe changes. Empty = search at the next start. |
+| `SlPreloadNgx` | `1` | 0, 1 | Start | D3D12-B | When ReLimiter (`relimiter.addon64`) sits next to HSF, HSF loads NVIDIA's NGX before ReLimiter starts, so ReLimiter finds it. 0 turns this off. |
 | `SlRouteDlssg` | `-1` | -1, 0, 1 | Start | D3D12-B | DLSS-G's own calls on ReShade's D3D12 device go to the game's native device. -1 = on only when a RenoDX HDR mod is loaded (the RenoDX DLSS NR mods, `renodx-dlss*`, do not count), 0 = never, 1 = always. |
 | `DlssgRebuildCamera` | `1` | 0, 1 | Live | D3D12-G | DLSS-G gets `clipToPrevClip` and `prevClipToClip` rebuilt by HSF from the camera, not the game's. |
 | `DlssgCameraKey` | `122` (F11) | key code, 0 = none | Live | D3D12-G | Flips `DlssgRebuildCamera` in game. |

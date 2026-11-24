@@ -72,6 +72,9 @@ D3D11 and DX9 games, 32-bit and 64-bit, run DLSS-G in the helper. Streamline 2.1
 | `ngx_input.h`, `ngx_input.cpp` | Hooks `_nvngx.dll`'s DLSS evaluate (D3D12 and D3D11) and copies the game's motion and depth. D24 and D16 depth goes through a conversion shader. |
 | `ngx_call.h` | One reading of a DLSS call (part in use, scale, jitter, flags, reset) for all three NGX hooks. |
 | `debug_view.h`, `debug_view.cpp` | The D3D12 DEPTH and MOTION views: exactly what DLSS-G was tagged with, drawn over the picture. |
+| `xmx.h`, `xmx.cpp` | XeMFG (EXPERIMENTAL, `FgEngine=xemfg`): the preflight of Intel's files, the hook on `nvngx_dlssg.dll`'s evaluate, and the XeFG generator inside it. Also built into the helper. Ported from MFGAdaUnlock-RenoDx (MIT). |
+| `xmx_model.h`, `xmx_model.cpp` | XeMFG's 3x to 6x: finds the 54 programs in the player's own MFGAdaUnlock add-on or MFG-Unlocker by SHA-256 and sets up the multi-frame model in `libxess_fg.dll`. Ported from MFGAdaUnlock-RenoDx and MFG-Unlocker (MIT). |
+| `lzma_dec.h`, `lzma_dec.cpp` | A small decoder for the LZMA-alone format, HSF's own code, for the programs MFG-Unlocker packs. |
 
 ### DX9
 
@@ -130,6 +133,8 @@ Offline tests and probes. CMake builds the ones it lists into `build/x64` (D3D12
 | `depth_fit_test.cpp` | the depth fit pass |
 | `helper_exit_test.cpp` | the helper dies with its game (job or watchdog); with `hdr10` / `hdr10bug`, an eye test of HDR10 through the helper |
 | `gpu_reserve_test.cpp` | the GPU reserve's spike count and governor against a simple card model, and one live load reading |
+| `lzma_test.cpp`, `lzma_fixture.h` | the LZMA decoder on streams made by Python's `lzma` module |
+| `xmx_programs_test.cpp` | finds XeMFG's 54 programs in a mod file given on the command line (the mods are not in the repo; not in the suite) |
 | `vk_scene.cpp` | a small Vulkan program for bringing up the Vulkan route without a game (run by hand, not in the suite) |
 
 ## `HSF/tools`
@@ -141,6 +146,7 @@ Offline tests and probes. CMake builds the ones it lists into `build/x64` (D3D12
 | `stack_sweep.ps1`, `sweep_renodx_dlss.ini` | runs `d3d12_scene.exe` with the real mod stack (ReShade 6.8.0, RenoDX DLSS, GITC Uplift; Streamline none, 2.14 or 2.13) in every mix that has broken before, one PASS or FAIL per case |
 | `hang_stacks.py` | reads a full memory dump of a hung 64-bit game and prints where each thread is |
 | `guard.ps1` | exits 1 while any anti-cheat game runs. Run it before every test tool and install. |
+| `relimiter_check.py` | reads a game folder's `HSF.log` and ReLimiter's log after a run and says whether ReLimiter saw HSF's frame generation the way DLSS-G got it. It does not know the helper route yet, so it can report FAIL on a helper-route run that worked. |
 | `install.ps1` | dev install of the add-on, `HSF.fx`, Streamline and the helper into a D3D11 or DX9 game. Keeps an existing `HSF.ini` (`-FreshIni` replaces it), and the old add-on in `_hsf_experimental`. |
 | `install_sl_game.ps1` | dev install for D3D12 games (`-LogOnly`, `-BringIn`, `-LaunchPadFrom`, `-DynamicRes`, `-Remove`) |
 | `dump_process.ps1` | full-memory minidump of a hung test process |
@@ -156,4 +162,4 @@ Offline tests and probes. CMake builds the ones it lists into `build/x64` (D3D12
 | `minhook` | MinHook, for the DX9 fence hooks and the Vulkan `vkCreateDevice` hook, BSD-2-Clause |
 | `nvof` | NVIDIA Optical Flow SDK 5.0 interface headers |
 | `vulkan-headers` | Khronos Vulkan-Headers (`VK_HEADER_VERSION` 296), only the C headers HSF includes, Apache-2.0 or MIT |
-| `renodx`, `kibblerz-aio` | the licences of code ported from RenoDX (MIT) and DLSS5 ReShade AIO (Apache-2.0) |
+| `renodx`, `kibblerz-aio`, `mfgadaunlock`, `mfg-unlocker` | the licences of code ported from RenoDX (MIT), DLSS5 ReShade AIO (Apache-2.0), MFGAdaUnlock-RenoDx (MIT) and MFG-Unlocker (MIT) |
