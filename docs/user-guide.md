@@ -250,3 +250,9 @@ Frame generation and the overlay have no key until you set one, because the free
 ## 9. Uninstall
 
 Delete `hsf.addon64` or `hsf.addon32`, `HSF.ini`, `HSF_safe_try.ini`, `HSF.log`, `HSF.previous.log`, the `HSF_streamline` folder and `reshade-shaders\Shaders\HSF.fx`. HSF changes nothing else in the game folder. There is one exception: on DirectX 9 games that ran out of memory, the 4 GB flag may have been set by hand in the exe, and the original was kept next to it.
+
+## Experimental Apex ANR FG on D3D12
+
+Apex is an optional backend for 64-bit D3D12 games with a native FP16 scRGB swap chain. Keep NVIDIA's `HSF_streamline` folder in place. Get the [Apex V.B20 add-on archive](https://github.com/apex-compute/ANR/releases/tag/FG-V.B20) and copy its `Apex Neural Rendering FG\dlssg` folder into `HSF_apex` beside `HSF.ini`. Keep the provider and its data together at `HSF_apex\dlssg\nvngx_dlssg.dll`.
+
+With HSF's D3D12 bring-in route active, choose **APEX ANR FG** in **BACKEND** and restart the game. Apex needs motion and depth and supports 2x and 3x when the presentation path allows it. It retains the game's FP16 scRGB color output. See [the Apex settings](settings.md#4-d3d12-routes) for VSync-off pacing and diagnostics.
