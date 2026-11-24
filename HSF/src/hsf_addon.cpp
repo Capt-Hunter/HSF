@@ -8928,6 +8928,16 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         sl_options.factory_proxy = GetPrivateProfileIntW(L"HSF", L"SlFactoryProxy", 1, g_ini_path) != 0;
         sl_options.manual_hooking = GetPrivateProfileIntW(L"HSF", L"SlManualHooking", 0, g_ini_path) != 0;
         sl_options.early_load = GetPrivateProfileIntW(L"HSF", L"SlEarlyLoad", 1, g_ini_path) != 0;
+        // ReLimiter next to HSF: NVIDIA's NGX is loaded now, before ReLimiter starts and looks for it (sl_bring.h).
+        if (GetPrivateProfileIntW(L"HSF", L"SlPreloadNgx", 1, g_ini_path) != 0) {
+          wchar_t addon_folder[MAX_PATH] = L"";
+          GetModuleFileNameW(module, addon_folder, MAX_PATH);
+          if (wchar_t* const slash = wcsrchr(addon_folder, L'\\')) *slash = L'\0';
+          const std::wstring here = addon_folder;
+          sl_options.preload_ngx = GetModuleHandleW(L"relimiter.addon64") != nullptr ||
+                                   GetFileAttributesW((here + L"\\relimiter.addon64").c_str()) != INVALID_FILE_ATTRIBUTES ||
+                                   GetFileAttributesW((here + L"\\relimiter.addon").c_str()) != INVALID_FILE_ATTRIBUTES;
+        }
         wchar_t ngx_path[MAX_PATH] = L"";
         GetPrivateProfileStringW(L"HSF", L"SlNgxPath", L"", ngx_path, MAX_PATH, g_ini_path);
         sl_options.ngx_path = ngx_path;

@@ -1,9 +1,12 @@
 // Offline test of HSF's patcher (src/sl_game.cpp) on made-up functions, no game needed: the full length decoder for starts HSF's short list does not know (H3), a function
 // that is not 8-byte aligned, and the safe-try switch that turns the decoder off for a game.   hook_test   (exit code 0 = all passed)
+#include "../src/hook_patch.h"
 #include "../src/safe_try.h"
 #include "../src/sl_game.h"
 
 #include <windows.h>
+
+#include <MinHook.h>
 
 #include <cstdio>
 #include <cstring>
@@ -91,11 +94,56 @@ void TestHooks() {
   hsf::slgame::UnhookFunctions();
 }
 
+int Seven() { return 7; }
+int Eight() { return 8; }
+IntFn g_tool_real = nullptr;
+int ToolHook() { return g_tool_real() + 100; }
+
+// HSF's stub for the plugin route: in free bytes of a module (here this test's own), so a tool that looks up the function's module (ReLimiter) finds one. It jumps to a relay
+// that can be pointed elsewhere, as at unload.
+void TestModuleCave() {
+  using namespace hsf::hookpatch;
+  uint8_t* const stub = ModuleCave(reinterpret_cast<const void*>(&Seven), 14);
+  Check(stub != nullptr, "cave: this module has free bytes after its code");
+  if (stub == nullptr) return;
+  HMODULE owner = nullptr, self = nullptr;
+  GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(stub), &owner);
+  GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&Seven), &self);
+  Check(owner != nullptr && owner == self, "cave: the stub belongs to the module of the function it stands for");
+  Check((reinterpret_cast<uintptr_t>(stub + 6) & 7) == 0, "cave: the jump's address is 8-byte aligned");
+  MEMORY_BASIC_INFORMATION mbi{};
+  VirtualQuery(stub, &mbi, sizeof(mbi));
+  const DWORD protect_before = mbi.Protect;
+  auto* const relay = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+  WriteAbsoluteJump(relay, reinterpret_cast<const void*>(&Seven));
+  uint8_t jump[14];
+  WriteAbsoluteJump(jump, relay);
+  Check(WriteCode(stub, jump, sizeof(jump)), "cave: the stub is written into the module's read-only code");
+  VirtualQuery(stub, &mbi, sizeof(mbi));
+  Check(mbi.Protect == protect_before, "cave: the page's protection is put back");
+  const auto call = reinterpret_cast<IntFn>(stub);
+  Check(call() == 7, "cave: the stub leads through the relay (7)");
+  PointRelay(relay, reinterpret_cast<const void*>(&Eight));
+  Check(call() == 8, "cave: the relay pointed elsewhere, the stub unchanged (8)");
+  // A tool hooks the stub with MinHook, as ReLimiter does: its trampoline keeps the relay as the target, so pointing the relay still works under it.
+  const bool hooked = MH_Initialize() == MH_OK && MH_CreateHook(stub, reinterpret_cast<void*>(&ToolHook), reinterpret_cast<void**>(&g_tool_real)) == MH_OK && MH_EnableHook(stub) == MH_OK;
+  Check(hooked && call() == 108, "cave: a MinHook hook on the stub reaches the relay (108)");
+  PointRelay(relay, reinterpret_cast<const void*>(&Seven));
+  Check(hooked && call() == 107, "cave: under the MinHook hook, pointing the relay still works (107)");
+  MH_DisableHook(stub);
+  MH_RemoveHook(stub);
+  MH_Uninitialize();
+  Check(ModuleCave(reinterpret_cast<const void*>(&Seven), 14) != stub, "cave: used bytes are not handed out again");
+  uint8_t on_stack = 0;
+  Check(ModuleCave(&on_stack, 14) == nullptr, "cave: memory in no module has none");
+}
+
 }  // namespace
 
 int main() {
   TestDecoder();
   TestHooks();
+  TestModuleCave();
   std::printf(g_failures == 0 ? "all passed\n" : "%d FAILED\n", g_failures);
   return g_failures == 0 ? 0 : 1;
 }

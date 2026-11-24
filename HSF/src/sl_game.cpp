@@ -172,6 +172,7 @@ constexpr uint32_t TRACE_FRAMES = 3;
 struct DriveState {
   uint32_t highest_token = 0;    // SeeToken, under g_lock
   ULONGLONG on_at = 0;           // DriveFrame: when HSF last turned generation on
+  ULONGLONG echo_at = 0;         // DriveFrame: when HSF last sent its options again after the game's (g_options_echo)
   bool dynamic_sent = false;     // DriveFrame: what DLSS-G was last sent
   uint32_t output_sent = 0;
   uint32_t idle_polls = 0;       // Poll: HSF's own frame pick
@@ -181,6 +182,7 @@ struct DriveState {
   void Reset() {
     highest_token = 0;
     on_at = 0;
+    echo_at = 0;
     dynamic_sent = false;
     output_sent = 0;
     idle_polls = 0;
@@ -391,6 +393,11 @@ GetFunctionFn g_real_get_function = nullptr;
 GetTokenFn g_real_get_token = nullptr;
 SetDlssOptionsFn g_real_dlss_options = nullptr;
 SetDlssgOptionsFn g_real_dlssg_options = nullptr;
+// HSF's own options go in through slDLSSGSetOptions' entry, so other tools hooked there (ReLimiter reads the mode from each call) see what DLSS-G really gets.
+// Set on HSF's thread for that call only: HookDlssgOptions then passes it straight on.
+thread_local bool t_own_options_call = false;
+// The game sent options HSF overrides (its mode or frame count differ from HSF's): tools hooked on the entry saw the game's, so DriveFrame sends HSF's again.
+std::atomic<bool> g_options_echo{false};
 SetReflexOptionsFn g_real_reflex_options = nullptr;
 SetFeatureLoadedFn g_real_set_loaded = nullptr;
 IsFeatureLoadedFn g_is_loaded = nullptr;
@@ -466,9 +473,14 @@ TokenAsked g_tokens_asked[TOKEN_THREADS] = {};  // under g_lock
 std::atomic<bool> g_token_pick_highest{false};
 // When HSF last sent its own constants and Streamline took them.
 std::atomic<ULONGLONG> g_own_constants_last{0};
+// A new frame count sent while DLSS-G generates, with no off step in between (DriveFrame), checked by the state poll: 1 DLSS-G took it, 0 it did not (so HSF goes
+// back to off for one frame, then on), -1 not known yet.
+std::atomic<int> g_count_direct{-1};
+std::atomic<ULONGLONG> g_count_change_at{0};
 
 // Generation needs vectors and depth, which come with evaluate calls, or with the game's own tags for DLSS-G. Menus have none, so generation waits for a run of them and stops when they stop.
 constexpr ULONGLONG EVALUATE_GONE_MS = motiontiming::EVALUATE_GONE_MS;
+constexpr ULONGLONG ECHO_GAP_MS = 500;  // DriveFrame: HSF's options again after the game's, at most this often
 constexpr ULONGLONG ON_SETTLE_MS = motiontiming::ON_SETTLE_MS;  // after generation goes on, quick off waits this long (DriveFrame)
 constexpr uint32_t EVALUATE_STREAK_TO_START = 10;
 constexpr float QUICK_OFF_GAPS = 3.0f, QUICK_OFF_LEAST_MS = 50.0f;
@@ -751,6 +763,21 @@ sl::Result HookConstants(const sl::Constants& values, const sl::FrameToken& fram
 // The evaluate inputs carry the game's vectors and depth, on an open command list. DLSS-G needs them at present, so hand them to Streamline for this frame. They are tagged as only valid
 // now, which has Streamline copy them on this command list, because the game's "valid until present" was only ever put to the test by DLSS, which reads them here and now.
 // One tag per call: the game's Streamline indexes an array by its own size of the struct, which may not be the SDK's.
+// The size of the vectors DLSS-G gets, from the game's tags or HSF's own. A change means dynamic resolution, and DLSS-G must be told: without the flag,
+// every options call with vectors smaller than the output set DLSS-G up again (Gothic Remake with DLSS at Quality and HSF reading its vectors through
+// NGX: the game's own options every 500 ms, each one a moment of no frame generation, and ReLimiter lost its FG route twice a second).
+void NoteVectorSize(uint32_t width, uint32_t height) {
+  const uint32_t old_width = g_mv_width.exchange(width, std::memory_order_relaxed), old_height = g_mv_height.exchange(height, std::memory_order_relaxed);
+  if (old_width != 0 && (old_width != width || old_height != height)) {
+    g_dynamic.store(true, std::memory_order_relaxed);
+    static std::atomic<uint32_t> s_lines{0};
+    if (s_lines.fetch_add(1, std::memory_order_relaxed) < 4000) {
+      Lock lock;
+      Line("vectors now %ux%u, were %ux%u, generating %d", width, height, old_width, old_height, g_generating.load(std::memory_order_relaxed) ? 1 : 0);
+    }
+  }
+}
+
 void TagForGeneration(const sl::FrameToken& frame, const sl::BaseStructure** inputs, uint32_t count, sl::CommandBuffer* cmd) {
   if (cmd == nullptr || inputs == nullptr) return;
   sl::ViewportHandle viewport(g_viewport.load(std::memory_order_relaxed));
@@ -780,17 +807,7 @@ void TagForGeneration(const sl::FrameToken& frame, const sl::BaseStructure** inp
       tag.extent.width = width;
       tag.extent.height = height;
     }
-    if (tag.type == sl::kBufferTypeMotionVectors) {
-      const uint32_t old_width = g_mv_width.exchange(width, std::memory_order_relaxed), old_height = g_mv_height.exchange(height, std::memory_order_relaxed);
-      if (old_width != 0 && (old_width != width || old_height != height)) {
-        g_dynamic.store(true, std::memory_order_relaxed);
-        static std::atomic<uint32_t> s_lines{0};
-        if (s_lines.fetch_add(1, std::memory_order_relaxed) < 4000) {
-          Lock lock;
-          Line("vectors now %ux%u, were %ux%u, generating %d", width, height, old_width, old_height, g_generating.load(std::memory_order_relaxed) ? 1 : 0);
-        }
-      }
-    }
+    if (tag.type == sl::kBufferTypeMotionVectors) NoteVectorSize(width, height);
     if (tag.type == sl::kBufferTypeMotionVectors) {
       if (const VectorsHook hook = g_vectors_hook.load(std::memory_order_acquire)) {
         const uint32_t extent[4] = {tag.extent.left, tag.extent.top, tag.extent.width, tag.extent.height};
@@ -969,6 +986,7 @@ sl::Result HookDlssOptions(const sl::ViewportHandle& viewport, const sl::DLSSOpt
 
 sl::Result HookDlssgOptions(const sl::ViewportHandle& viewport, const sl::DLSSGOptions& options) {
   InFlight in_flight;
+  if (t_own_options_call) return g_real_dlssg_options(viewport, options);
   alignas(16) unsigned char bytes[OPTIONS_BYTES] = {};
   // Much more than the struct, in case it is newer than the SDK's. If that runs off the end of the stack, the SDK's size.
   const bool have = SafeCopy(bytes, &options, OPTIONS_BYTES) || SafeCopy(bytes, &options, sizeof(sl::DLSSGOptions));
@@ -993,7 +1011,23 @@ sl::Result HookDlssgOptions(const sl::ViewportHandle& viewport, const sl::DLSSGO
   g_have_game_options = true;
   g_viewport.store(SafeViewport(&viewport), std::memory_order_relaxed);
   sl::DLSSGOptions& ours = *reinterpret_cast<sl::DLSSGOptions*>(bytes);
+  const sl::DLSSGMode game_mode = ours.mode;
+  const uint32_t game_frames = ours.numFramesToGenerate;
   ApplyChoices(ours, g_generating.load(std::memory_order_relaxed), std::max(g_frames_sent.load(std::memory_order_relaxed), 1u));
+  if (ours.mode != game_mode || (ours.mode != sl::DLSSGMode::eOff && ours.numFramesToGenerate != game_frames)) {
+    // Tools hooked on the entry ahead of HSF read the mode from the game's own struct after the call returns (ReLimiter: Gothic Remake sends "off" twice a second,
+    // and each one read as frame generation stopping). So HSF's mode and frame count go into the game's struct as well. Only these two fields: the game fills
+    // them again on its next call. Where the struct cannot be written, HSF sends its options again from DriveFrame (g_options_echo).
+    sl::DLSSGOptions& game = const_cast<sl::DLSSGOptions&>(options);
+    const bool written = SafeCopy(&game.mode, &ours.mode, sizeof(ours.mode)) && SafeCopy(&game.numFramesToGenerate, &ours.numFramesToGenerate, sizeof(ours.numFramesToGenerate));
+    if (!written) g_options_echo.store(true, std::memory_order_relaxed);
+    static std::atomic<bool> s_said{false};
+    if (!s_said.exchange(true)) {
+      Lock lock;
+      Line("the game's own DLSS-G options (mode %u, %u frames) %s", static_cast<uint32_t>(game_mode), game_frames,
+           written ? "now carry HSF's mode and frame count, so tools hooked ahead of HSF read what DLSS-G gets" : "could not be changed: HSF sends its own again after them");
+    }
+  }
   return g_real_dlssg_options(viewport, ours);
 }
 
@@ -1076,6 +1110,7 @@ sl::Result HookSetFeatureLoaded(sl::Feature feature, bool loaded) {
 
 using hookpatch::CodeStillThere;
 using hookpatch::Hook;
+using hookpatch::ModuleCave;
 using hookpatch::NearSlot;
 using hookpatch::PointRelay;
 using hookpatch::WriteAbsoluteJump;
@@ -1102,8 +1137,10 @@ Hook g_feature_hooks[] = {
     {"slReflexSetOptions", reinterpret_cast<void*>(&HookReflexOptions), reinterpret_cast<void**>(&g_real_reflex_options)},
 };
 
-// H1: what the plugin hook hands out in place of slDLSSGSetOptions, a jump to HookDlssgOptions in a code page that outlives HSF (see HandOutOptions). Under g_lock.
+// H1: what the plugin hook hands out in place of slDLSSGSetOptions, a stub in DLSS-G's own module that jumps to the relay, a jump to HookDlssgOptions in a code page that
+// outlives HSF (see HandOutOptions). With no room in DLSS-G's module, the relay is handed out itself. Under g_lock.
 uint8_t* g_options_stub = nullptr;
+uint8_t* g_options_relay = nullptr;
 std::atomic<bool> g_plugin_route{false};  // the game's slDLSSGSetOptions calls come through HSF's stub, with no patch on DLSS-G's code
 
 // The Steam overlay hooks DLSS-G's functions itself. Handed HSF's stub, it would patch HSF's code, which goes away when ReShade unloads HSF.
@@ -1321,27 +1358,68 @@ bool OptionsPatched() {
   return false;
 }
 
+// The stub in DLSS-G's module: an absolute jump to the relay. Never changed once written: a tool that hooks the stub (MinHook) copies the jump's target into its own trampoline,
+// so only the relay behind it may be pointed elsewhere.
+bool WriteStub(uint8_t* stub, const uint8_t* relay) {
+  uint8_t jump[14];
+  WriteAbsoluteJump(jump, relay);
+  return hookpatch::WriteCode(stub, jump, sizeof(jump));
+}
+
+// The stub still holds a jump: HSF's, or a tool's hook on top of it. Not after DLSS-G's plugin was loaded again at the same place, with new pages.
+bool StubIntact(const uint8_t* stub) {
+  uint8_t head[2];
+  return SafeCopy(head, stub, sizeof(head)) && ((head[0] == 0xFF && head[1] == 0x25) || head[0] == 0xE9);
+}
+
 // Under g_lock. real is DLSS-G's slDLSSGSetOptions from one copy of the plugin.
+// Streamline gets a stub inside DLSS-G's own module, in the free bytes after its code. Tools that look up which module a function is in before they hook it take it as
+// DLSS-G's: ReLimiter pins that module and gives up on a function in none, and so never saw HSF's options on this route (Shadows, with HSF's stub in a page of its own).
+// The stub jumps to the relay in HSF's code page, which jumps to HSF's hook; another load of HSF, or the unload, points the relay elsewhere.
 void* HandOutOptions(void* real) {
-  if (g_plugin_route.load() && g_options_stub != nullptr && reinterpret_cast<void*>(g_real_dlssg_options) == real) return g_options_stub;
+  if (g_plugin_route.load() && g_options_stub != nullptr && reinterpret_cast<void*>(g_real_dlssg_options) == real) {
+    if (g_options_stub != g_options_relay && !StubIntact(g_options_stub) && !WriteStub(g_options_stub, g_options_relay)) return real;
+    return g_options_stub;
+  }
   // One at a time: a second copy, or DLSS-G's code is already patched, keeps its own.
-  if (g_plugin_route.load() || OptionsPatched()) return real;
-  uint8_t* const stub = g_options_stub != nullptr ? g_options_stub : NearSlot(static_cast<uint8_t*>(real));
-  if (stub == nullptr) return real;
+  if (g_plugin_route.load() || OptionsPatched()) {
+    static void* s_said = nullptr;
+    if (s_said != real) {
+      s_said = real;
+      Line("Streamline asked DLSS-G's plugin for slDLSSGSetOptions (%p): handed DLSS-G's own, as %s", real, g_plugin_route.load() ? "another copy already has HSF's" : "its code is already patched");
+    }
+    return real;
+  }
+  // The relay is reached through a jump, so it need not be near DLSS-G's code. Some games leave no free memory near it (Gothic Remake, the NVIDIA App's DLSS-G):
+  // then a page anywhere, kept for good like the near ones.
+  uint8_t* relay = g_options_relay != nullptr ? g_options_relay : NearSlot(static_cast<uint8_t*>(real));
+  if (relay == nullptr) relay = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+  if (relay == nullptr) {
+    Line("Streamline asked DLSS-G's plugin for slDLSSGSetOptions (%p): no memory for HSF's stub, DLSS-G's own handed out", real);
+    return real;
+  }
   g_real_dlssg_options = reinterpret_cast<SetDlssgOptionsFn>(real);  // ready before any call can arrive
   std::atomic_thread_fence(std::memory_order_seq_cst);
-  if (g_options_stub == nullptr) {
-    WriteAbsoluteJump(stub, reinterpret_cast<const void*>(&HookDlssgOptions));
-    FlushInstructionCache(GetCurrentProcess(), stub, 16);
+  if (g_options_relay == nullptr) {
+    WriteAbsoluteJump(relay, reinterpret_cast<const void*>(&HookDlssgOptions));
+    FlushInstructionCache(GetCurrentProcess(), relay, 16);
   } else {
-    PointRelay(stub, reinterpret_cast<const void*>(&HookDlssgOptions));
+    PointRelay(relay, reinterpret_cast<const void*>(&HookDlssgOptions));
+  }
+  g_options_relay = relay;
+  uint8_t* stub = ModuleCave(real, 14);
+  if (stub != nullptr && !WriteStub(stub, relay)) stub = nullptr;
+  if (stub == nullptr) {
+    stub = relay;
+    Line("DLSS-G's module has no free bytes for HSF's stub: HSF's relay handed out, in no module (tools that look up the function's module, as ReLimiter does, do not see HSF's options)");
   }
   g_options_stub = stub;
   g_plugin_route.store(true);
   wchar_t value[64];
-  std::swprintf(value, 64, L"%p %p", static_cast<void*>(stub), real);
+  std::swprintf(value, 64, L"%p %p %p", static_cast<void*>(stub), real, static_cast<void*>(relay));
   SetEnvironmentVariableW(STUB_VARIABLE, value);
-  Line("DLSS-G's slDLSSGSetOptions (%p) handed to Streamline as HSF's (%p) through the plugin hook: DLSS-G's code is not patched", real, static_cast<void*>(stub));
+  Line("DLSS-G's slDLSSGSetOptions (%p) handed to Streamline as HSF's (%p, %s) through the plugin hook: DLSS-G's code is not patched", real, static_cast<void*>(stub),
+       stub != relay ? "a stub in DLSS-G's module, then HSF's relay" : "HSF's relay");
   return stub;
 }
 
@@ -1358,21 +1436,24 @@ void* PluginFunction(int copy, const char* name) {
 void AdoptOptionsStub() {
   wchar_t value[64] = L"";
   if (GetEnvironmentVariableW(STUB_VARIABLE, value, 64) == 0) return;
-  void *stub = nullptr, *real = nullptr;
+  void *stub = nullptr, *real = nullptr, *relay = nullptr;
   uint8_t head[6];
-  if (swscanf_s(value, L"%p %p", &stub, &real) != 2 || !CodeStillThere(stub) || !CodeStillThere(real) || !SafeCopy(head, stub, sizeof(head))) return;
+  const int fields = swscanf_s(value, L"%p %p %p", &stub, &real, &relay);
+  if (fields == 2) relay = stub;  // a build of HSF that handed out the relay itself
+  if (fields < 2 || !CodeStillThere(stub) || !CodeStillThere(real) || !CodeStillThere(relay) || !SafeCopy(head, relay, sizeof(head))) return;
   if (head[0] != 0xFF || head[1] != 0x25 || head[2] != 0 || head[3] != 0 || head[4] != 0 || head[5] != 0) return;
   g_real_dlssg_options = reinterpret_cast<SetDlssgOptionsFn>(real);
   std::atomic_thread_fence(std::memory_order_seq_cst);
   g_options_stub = static_cast<uint8_t*>(stub);
-  PointRelay(g_options_stub, reinterpret_cast<const void*>(&HookDlssgOptions));
+  g_options_relay = static_cast<uint8_t*>(relay);
+  PointRelay(g_options_relay, reinterpret_cast<const void*>(&HookDlssgOptions));
   g_plugin_route.store(true);
   Line("DLSS-G's slDLSSGSetOptions: HSF's stub from the last load (%p) taken back", stub);
 }
 
-// Unload: Streamline keeps calling the stub, which now goes straight to DLSS-G.
+// Unload: Streamline keeps calling the stub, whose relay now goes straight to DLSS-G.
 void ReleaseOptionsStub() {
-  if (g_options_stub != nullptr && g_real_dlssg_options != nullptr && CodeStillThere(g_options_stub)) PointRelay(g_options_stub, reinterpret_cast<const void*>(g_real_dlssg_options));
+  if (g_options_relay != nullptr && g_real_dlssg_options != nullptr && CodeStillThere(g_options_relay)) PointRelay(g_options_relay, reinterpret_cast<const void*>(g_real_dlssg_options));
   g_plugin_route.store(false);
 }
 
@@ -1703,6 +1784,9 @@ void Start(const wchar_t* log_path, bool drive, bool dynamic_resolution_known) {
   for (TokenAsked& t : g_tokens_asked) t = {};
   g_token_pick_highest.store(false);
   g_own_constants_last.store(0);
+  g_count_direct.store(-1);
+  g_options_echo.store(false);
+  g_count_change_at.store(0);
   g_tag_without_frame.store(false);
   g_dynamic.store(dynamic_resolution_known);
   g_have_camera_now = g_have_camera_before = false;
@@ -1818,28 +1902,47 @@ static void DriveFrame() {
   uint32_t& s_output_sent = g_run.output_sent;
   const bool dynamic = g_dynamic.load(std::memory_order_relaxed);
   const uint32_t output = g_output_width.load(std::memory_order_relaxed);
-  if (on == g_generating.load(std::memory_order_relaxed) && (!on || frames == g_frames_sent.load(std::memory_order_relaxed)) && (!on || (dynamic == s_dynamic_sent && (!dynamic || output == s_output_sent)))) return;
+  const bool unchanged = on == g_generating.load(std::memory_order_relaxed) && (!on || frames == g_frames_sent.load(std::memory_order_relaxed)) && (!on || (dynamic == s_dynamic_sent && (!dynamic || output == s_output_sent)));
+  // The game's own options went past tools hooked on the entry: HSF's go again, at most twice a second, so a game that sends options every frame costs little.
+  ULONGLONG& s_echo_at = g_run.echo_at;
+  const bool echo = unchanged && g_options_echo.load(std::memory_order_relaxed) && now - s_echo_at >= ECHO_GAP_MS;
+  if (unchanged && !echo) return;
+  g_options_echo.store(false, std::memory_order_relaxed);
+  if (echo) s_echo_at = now;
   char why[64] = "";
-  if (!allowed) std::snprintf(why, sizeof(why), ", frame generation is off in HSF");
+  if (echo) std::snprintf(why, sizeof(why), ", again after the game's own options");
+  else if (!allowed) std::snprintf(why, sizeof(why), ", frame generation is off in HSF");
   else if (focus_hold) std::snprintf(why, sizeof(why), ", the game's window is not in front");
   else if (!data_flowing) {
     const ULONGLONG gone = now - LastGameData();
     if (gone > gone_ms) std::snprintf(why, sizeof(why), ", no vectors for %llu ms", gone);
     else std::snprintf(why, sizeof(why), ", vectors just came back");
   } else if (doubted) std::snprintf(why, sizeof(why), ", the score doubts the vectors");
-  // A new frame count while DLSS-G generates has left it on and generating nothing (seen in the test harness). So off for one frame, then on with the new count from the next call.
+  // A new frame count while DLSS-G generates has left it on and generating nothing (seen in the test harness). But every off step shows the game's own frames for a
+  // moment, which frame limiters (ReLimiter) read as frame generation stopping. So the new count goes straight in first, and the state poll checks DLSS-G took it
+  // (g_count_direct). If it did not, from then on: off for one frame, then on with the new count from the next call.
   if (on && g_generating.load(std::memory_order_relaxed) && frames != g_frames_sent.load(std::memory_order_relaxed)) {
-    on = false;
-    frames = g_frames_sent.load(std::memory_order_relaxed);
-    std::snprintf(why, sizeof(why), ", for a new frame count");
+    if (g_count_direct.load(std::memory_order_relaxed) == 0) {
+      on = false;
+      frames = std::max(g_frames_sent.load(std::memory_order_relaxed), 1u);
+      std::snprintf(why, sizeof(why), ", for a new frame count");
+    } else {
+      g_count_change_at.store(now, std::memory_order_relaxed);
+      std::snprintf(why, sizeof(why), ", a new frame count with no off step");
+    }
   }
 
   sl::Result result = sl::Result::eOk;
   uint32_t optimal_width = 0, optimal_height = 0;
   {
     OptionsLock options_lock;
-    const SetDlssgOptionsFn send = FeatureHook("slDLSSGSetOptions").installed || g_plugin_route.load(std::memory_order_relaxed) ? g_real_dlssg_options : g_direct_dlssg_options;
+    const Hook& options_hook = FeatureHook("slDLSSGSetOptions");
+    const SetDlssgOptionsFn send = options_hook.installed || g_plugin_route.load(std::memory_order_relaxed) ? g_real_dlssg_options : g_direct_dlssg_options;
     if (send == nullptr) return;
+    // Through the entry when HSF's hook is on it (the plugin route's stub, or the patch on DLSS-G's code): tools hooked there see HSF's options.
+    SetDlssgOptionsFn entry = nullptr;
+    if (g_plugin_route.load(std::memory_order_relaxed) && g_options_stub != nullptr) entry = reinterpret_cast<SetDlssgOptionsFn>(g_options_stub);
+    else if (options_hook.installed && CodeStillThere(options_hook.target)) entry = reinterpret_cast<SetDlssgOptionsFn>(options_hook.target);
     alignas(16) unsigned char bytes[OPTIONS_BYTES] = {};
     if (g_have_game_options) std::memcpy(bytes, g_game_options, OPTIONS_BYTES);
     else new (bytes) sl::DLSSGOptions{};
@@ -1853,8 +1956,16 @@ static void DriveFrame() {
     s_output_sent = output;
     optimal_width = options.dynamicResWidth;
     optimal_height = options.dynamicResHeight;
-    result = send(viewport, options);
+    if (entry != nullptr) {
+      t_own_options_call = true;
+      result = entry(viewport, options);
+      t_own_options_call = false;
+    } else {
+      result = send(viewport, options);
+    }
   }
+  static uint32_t s_echo_lines = 0;
+  if (echo && ++s_echo_lines > 20) return;  // a game that sends options every frame would fill the log
   Lock lock;
   Line("HSF sets DLSS-G %s, %u generated per real frame, dynamic resolution %d, optimal %ux%u%s: result %d", on ? "ON" : "off", frames, dynamic ? 1 : 0, optimal_width, optimal_height, why, static_cast<int>(result));
 }
@@ -2126,6 +2237,19 @@ void Poll() {
     }
   }
   g_presented_period.fetch_add(state.numFramesActuallyPresented);
+  // A new frame count sent with no off step (DriveFrame): after 2 s DLSS-G should show it. If not, the off step comes back for this run, starting now.
+  const ULONGLONG changed_at = g_count_change_at.load(std::memory_order_relaxed);
+  if (changed_at != 0 && GetTickCount64() - changed_at >= 2000) {
+    g_count_change_at.store(0, std::memory_order_relaxed);
+    const uint32_t want = g_frames_sent.load(std::memory_order_relaxed) + 1;
+    if (g_generating.load(std::memory_order_relaxed) && state.numFramesActuallyPresented != want) {
+      g_count_direct.store(0, std::memory_order_relaxed);
+      g_frames_sent.store(0, std::memory_order_relaxed);  // DriveFrame now sees a new count and takes the off step
+      Line("DLSS-G shows %u per real frame 2 s after a new frame count (%u wanted): HSF goes off for a frame on each new count from now on", state.numFramesActuallyPresented, want);
+    } else if (g_count_direct.exchange(1, std::memory_order_relaxed) != 1) {
+      Line("DLSS-G took a new frame count with no off step");
+    }
+  }
   // HSF picks the frame itself (no evaluates, no game tags, its own constants). If its tags land and DLSS-G still shows nothing for a few seconds, the frame
   // it picked is not the one being presented: try the other end of the recent tokens. No setting for anyone to change; the log says which one works.
   const ULONGLONG t = GetTickCount64();
@@ -2266,6 +2390,8 @@ bool TagOptical(void* command_list, void* depth, uint32_t depth_state, void* mot
   ext.top = extent[1];
   ext.width = extent[2];
   ext.height = extent[3];
+  // HSF's own vectors change size too: flow at its own size, the game's DLSS at its render size, which follows the game's DLSS quality.
+  if (ext.width != 0 && ext.height != 0) NoteVectorSize(ext.width, ext.height);
   sl::Resource depth_resource{};
   depth_resource.type = sl::ResourceType::eTex2d;
   depth_resource.native = depth;
