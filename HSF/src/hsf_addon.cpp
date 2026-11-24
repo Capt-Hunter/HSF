@@ -37,6 +37,7 @@
 #include "ngx_input.h"
 #include "frame_checks.h"
 #include "sl_game.h"
+#include "xmx.h"
 #include <sl_core_types.h>  // Streamline's feature and result numbers (GameStreamlineStarted)
 #endif
 
@@ -391,8 +392,71 @@ bool g_sl_bring = false;  // SlBringIn=1: a D3D12 game with no Streamline gets i
 using ExitUserProcessFn = void(NTAPI*)(LONG);
 ExitUserProcessFn g_real_exit_user_process = nullptr;
 hsf::hookpatch::HookSet g_exit_hook;
+// ExitProcess comes after the game's own exit code has torn down its globals, and Windows then ends every other thread at once. slShutdown
+// takes a few hundred ms, and in that time the game's own threads ran on into the torn-down state (RE Village: a game thread faulted on a
+// destroyed lock, which MFG-Unlocker's crash dump then turned into a hang at quit). So the threads the game's exe started are paused first;
+// Streamline's, the driver's and other DLLs' threads keep running for slShutdown. The process heap is held while pausing, so no paused
+// thread is inside it. Windows ends the paused threads with the rest.
+uint32_t PauseGameThreads() {
+  using QueryThreadFn = LONG(NTAPI*)(HANDLE, int, void*, ULONG, ULONG*);
+  const auto query = reinterpret_cast<QueryThreadFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+  const auto exe = reinterpret_cast<const unsigned char*>(GetModuleHandleW(nullptr));
+  if (query == nullptr || exe == nullptr) return 0;
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(exe + reinterpret_cast<const IMAGE_DOS_HEADER*>(exe)->e_lfanew);
+  const uintptr_t begin = reinterpret_cast<uintptr_t>(exe), end = begin + nt->OptionalHeader.SizeOfImage;
+  const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) return 0;
+  const DWORD process = GetCurrentProcessId(), self = GetCurrentThreadId();
+  uint32_t paused = 0;
+  const HANDLE heap = GetProcessHeap();
+  const bool locked = HeapLock(heap) != FALSE;
+  THREADENTRY32 entry{sizeof(entry)};
+  for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+    if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
+    const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);  // the start address needs full query rights
+    if (thread == nullptr) continue;
+    uintptr_t start = 0;  // 9 = ThreadQuerySetWin32StartAddress
+    if (query(thread, 9, &start, sizeof(start), nullptr) >= 0 && start >= begin && start < end && SuspendThread(thread) != static_cast<DWORD>(-1)) ++paused;
+    CloseHandle(thread);
+  }
+  if (locked) HeapUnlock(heap);
+  CloseHandle(snapshot);
+  return paused;
+}
+
+// After slShutdown a DLL of HSF's Streamline can still be loaded, held by another mod's hooks (MFG-Unlocker keeps sl.dlss_g.dll), and its
+// global destructors then run while Windows unloads the DLLs, reading parts already freed (Village: a fault in sl.dlss_g.dll on the exiting
+// thread, which MFG-Unlocker logged as a crash and dumped on every quit). The game has already said how it exits, so a fault inside
+// HSF_streamline from then on ends the process at once with the game's exit code.
+LONG g_exit_code = 0;
+LONG CALLBACK OnFaultAfterShutdown(EXCEPTION_POINTERS* e) {
+  if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+  HMODULE module = nullptr;
+  wchar_t path[MAX_PATH] = L"";
+  const size_t folder = wcslen(g_sl_folder);
+  if (folder == 0 ||
+      !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          static_cast<LPCWSTR>(e->ExceptionRecord->ExceptionAddress), &module) ||
+      !GetModuleFileNameW(module, path, MAX_PATH) || _wcsnicmp(path, g_sl_folder, folder) != 0 || path[folder] != L'\\')
+    return EXCEPTION_CONTINUE_SEARCH;
+  Log("game is exiting: a DLL of HSF's Streamline faulted while Windows unloaded it, so the process ends now with the game's exit code");
+  TerminateProcess(GetCurrentProcess(), static_cast<UINT>(g_exit_code));
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
 void NTAPI OnExitUserProcess(LONG code) {
+  if (hsf::slbring::NeedsExitShutdown()) {
+    const uint32_t paused = PauseGameThreads();
+    char line[128];
+    snprintf(line, sizeof(line), "game is exiting: %u of its own threads paused before HSF's Streamline shuts down", paused);
+    Log(line);
+  }
+  const bool shut_down = hsf::slbring::NeedsExitShutdown();
   hsf::slbring::ShutdownForExit();
+  if (shut_down) {
+    g_exit_code = code;
+    AddVectoredExceptionHandler(1, &OnFaultAfterShutdown);
+  }
   g_real_exit_user_process(code);
 }
 bool g_ngx_input = true;  // NgxInput=0: flow even when the game's DLSS could give its vectors
@@ -1131,6 +1195,10 @@ bool StopHelperWhileOff() {
 std::atomic<uint32_t> g_game_color_space{DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
 
 void OnPresentColorSpace(command_queue*, swapchain* swap, const rect*, const rect*, uint32_t, const rect*) {
+#ifdef HSF_SL_GAME
+  // XeMFG's hook on DLSS-G's generator in this process (the in-game and bring-in routes): looked for at most once a second.
+  hsf::xmx::Poll();
+#endif
   if (swap == nullptr) return;
   uint32_t space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
   switch (swap->get_color_space()) {
@@ -7302,6 +7370,83 @@ void OpenDiscordForum() {
   }).detach();
 }
 
+// ---- FG ENGINE (HSF.ini FgEngine, xmx.h): DLSS-G or the EXPERIMENTAL XeMFG. The engine is read once at start, so the row's pick applies on the
+// next launch; `running` is what this run started with. HSF.ini is written only by this row, so its first read is this run's engine.
+struct FgEngineState {
+  bool read = false;
+  bool running = false;  // this run started with FgEngine=xemfg
+  int pick = 0;          // the row: 0 DLSS-G, 1 XeMFG
+};
+FgEngineState& FgEngine() {
+  static FgEngineState state;
+  if (!state.read && g_ini_path[0] != L'\0') {
+    wchar_t value[32] = L"";
+    GetPrivateProfileStringW(L"HSF", L"FgEngine", L"dlssg", value, static_cast<DWORD>(std::size(value)), g_ini_path);
+    state.read = true;
+    state.running = _wcsicmp(value, L"xemfg") == 0;
+    state.pick = state.running ? 1 : 0;
+  }
+  return state;
+}
+
+// XeMFG's state where DLSS-G runs: the helper's (D3D11, DX9, 32-bit, Vulkan) once it has written it, else this process's (D3D12 routes).
+hsf::xmx::Status XmxNow() {
+  if (hsf::dlssg::Running() && g_dlssg_stats.xmx_known) return g_dlssg_stats.xmx;
+#ifdef HSF_SL_GAME
+  return hsf::xmx::Snapshot();
+#else
+  return {};
+#endif
+}
+
+// `text` cut to `limit` characters with "..." for one menu line; a path keeps only its file name.
+std::string MenuShort(const char* text, size_t limit, bool file_name = false) {
+  std::string s = text;
+  if (file_name)
+    if (const size_t slash = s.find_last_of("\\/"); slash != std::string::npos) s = s.substr(slash + 1);
+  if (s.size() > limit) s = s.substr(0, limit - 3) + "...";
+  return s;
+}
+
+// XeMFG was asked for but runs no hook: plain DLSS-G this run.
+bool XmxFellBack(const FgEngineState& engine, const hsf::xmx::Status& xmx) { return engine.running && xmx.failure[0] != '\0' && xmx.hooked == 0; }
+
+// Who makes the generated frames this run, for the overlay: XeMFG once its hook is in, else DLSS-G.
+const char* FgEngineName(const FgEngineState& engine, const hsf::xmx::Status& xmx) { return engine.running && xmx.hooked > 0 ? "XEMFG" : "DLSS-G"; }
+
+// FG ENGINE's hover text: XeMFG's whole state, in sentences.
+std::string FgEngineReport(const FgEngineState& engine, const hsf::xmx::Status& xmx) {
+  std::string text = "Who makes the generated frames.\nDLSS-G: NVIDIA's own. The default.\nXEMFG (EXPERIMENTAL): Intel's XeSS frame generation, run inside DLSS-G.\n"
+                     "A change applies when the game starts again.";
+  if (!engine.running) {
+    if (engine.pick == 1) text += "\n\nXeMFG starts at the next launch. The Intel files and 3x to 6x are checked then.";
+    return text;
+  }
+  text += "\n\nXEMFG THIS RUN";
+  if (!xmx.preflight) {
+    text += std::string("\nIntel files: ") + (xmx.failure[0] != '\0' ? xmx.failure : "not checked yet") + ".";
+    text += "\nPut libxess_fg.dll 1.3.1.78 and libxell.dll in the HSF_streamline folder.";
+    return text;
+  }
+  text += "\nIntel files: found (libxess_fg.dll 1.3.1.78, libxell.dll).";
+  if (!xmx.published) text += "\n3x to 6x: looked for when the first frame is generated.";
+  else if (xmx.max_frames > 1) text += std::string("\n3x to ") + std::to_string(xmx.max_frames + 1) + "x: programs from " + xmx.model + ".";
+  else text += std::string("\n2x only: ") + xmx.model + ".\nFor 3x to 6x add MFG-Unlocker or the RenoDX MFG unlock add-on.";
+  if (xmx.failure[0] != '\0') text += std::string(xmx.hooked == 0 ? "\nNot running, plain DLSS-G: " : "\nStopped: ") + xmx.failure + ".";
+  else if (xmx.generating) text += "\nGenerating frames.";
+  else text += "\nNo frames generated yet.";
+  return text;
+}
+
+// The one line under FG ENGINE, only when XeMFG runs and something is wrong; empty otherwise.
+std::string FgEngineProblem(const FgEngineState& engine, const hsf::xmx::Status& xmx) {
+  if (!engine.running || engine.pick != 1) return {};
+  if (!xmx.preflight) return "INTEL FILES: " + MenuShort(xmx.failure[0] != '\0' ? xmx.failure : "not checked yet", 60);
+  if (xmx.failure[0] != '\0') return (xmx.hooked == 0 ? "PLAIN DLSS-G: " : "STOPPED: ") + MenuShort(xmx.failure, 60);
+  if (xmx.published && xmx.max_frames == 1) return "2X ONLY: NO MFG-UNLOCKER OR RENODX MFG UNLOCK ADD-ON FOUND";
+  return {};
+}
+
 // The header's colour presets: a panel colour and an accent each. The first is HSF's default look.
 constexpr hsf::ui::Preset COLOUR_PRESETS[] = {
     {"Default: green-grey and orange", hsf::ui::DEFAULT_PANEL_RGB, hsf::ui::DEFAULT_ACCENT_RGB},
@@ -7371,6 +7516,48 @@ void DrawPanel(effect_runtime* runtime) {
       ImGui::SetTooltip("The DLSS-G helper is still running with frame gen off,\nso turning it back ON is instant.\n\nClose it for the game's full fps.\nTurning frame gen ON starts it again (about 10 s).");
   }
 
+  // ---- FG engine: DLSS-G (NVIDIA's own) or XeMFG (EXPERIMENTAL: Intel's XeSS frame generation run inside DLSS-G, xmx.h). A pick is written to
+  // HSF.ini and applies when the game starts again. The row stays one line: its note says the engine in use, hovering it gives XeMFG's full
+  // state (FgEngineReport), and one amber line shows under it only when something is wrong (FgEngineProblem).
+  FgEngineState& engine = FgEngine();
+  const hsf::xmx::Status xmx = XmxNow();
+  ui::RowLabel("FG ENGINE", c::GREEN);
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", FgEngineReport(engine, xmx).c_str());
+  {
+    static const char* const ENGINES[] = {"DLSS-G", "XEMFG"};
+    static const char* const TIPS[] = {"NVIDIA's own frame generation. The default.",
+                                       "EXPERIMENTAL. Intel's XeSS frame generation, run inside DLSS-G.\n"
+                                       "Needs libxess_fg.dll 1.3.1.78 and libxell.dll in HSF_streamline.\n"
+                                       "3x to 6x also needs MFG-Unlocker or the RenoDX MFG unlock add-on.\n"
+                                       "Applies when the game starts again."};
+    int pick = engine.pick;
+    if (ui::Choice("##fgengine", ENGINES, 2, &pick, 0, TIPS) && pick != engine.pick) {
+      engine.pick = pick;
+      WritePrivateProfileStringW(L"HSF", L"FgEngine", pick == 1 ? L"xemfg" : L"dlssg", g_ini_path);
+      Log(pick == 1 ? "menu: FG ENGINE set to XEMFG (FgEngine=xemfg), from the next launch" : "menu: FG ENGINE set to DLSS-G (FgEngine=dlssg), from the next launch");
+    }
+    char note[64];
+    ImU32 note_colour = c::DIM;
+    if (engine.pick != (engine.running ? 1 : 0)) {
+      std::snprintf(note, sizeof(note), "> RESTART THE GAME TO SWITCH");
+      note_colour = c::AMBER;
+    } else if (!engine.running) {
+      std::snprintf(note, sizeof(note), "> NVIDIA");
+    } else if (XmxFellBack(engine, xmx)) {
+      std::snprintf(note, sizeof(note), "> DLSS-G (XEMFG FAILED)");
+      note_colour = c::AMBER;
+    } else {
+      std::snprintf(note, sizeof(note), "> XEMFG // EXPERIMENTAL // %uX", xmx.published ? xmx.max_frames + 1 : 2u);
+      note_colour = xmx.generating ? c::GREEN : c::DIM;
+    }
+    ui::RightNote(note, note_colour);
+  }
+  if (const std::string problem = FgEngineProblem(engine, xmx); !problem.empty()) {
+    ImGui::SetCursorScreenPos(ImVec2(ui::ControlX(), ImGui::GetCursorScreenPos().y));
+    ui::Caps(problem.c_str(), c::AMBER, 0.75f);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", FgEngineReport(engine, xmx).c_str());
+  }
+
   // ---- Multiplier: only what DLSS-G says this machine can do, once it has said.
   ui::RowLabel("MULTIPLIER", c::RED);
   const OlderCardMod& older = OlderCardModNow();
@@ -7388,6 +7575,8 @@ void DrawPanel(effect_runtime* runtime) {
     if (now.max_frames != 0)
       for (int i = 0; i < 5; ++i)
         if (static_cast<uint32_t>(i) + 1 > now.max_frames) above |= 1u << i;
+    // XeMFG running on Intel's own 2x model: 3X and up would only show the real frame again.
+    if (engine.running && xmx.hooked > 0 && xmx.published && xmx.max_frames == 1) above |= 0x1Eu;
     // The game's own Streamline too old for MFG: the crossed-out boxes say why.
     const OldStreamline& old_sl = OldStreamlineNow(now.max_frames, older);
     const char* tips[5] = {};
@@ -8294,7 +8483,7 @@ void DrawOverlay(bool advanced) {
   if (advanced)
     std::snprintf(head, sizeof(head), "HSF // %s%s%s", GpuName(), v.api[0] != '\0' ? " // " : "", v.api);
   else if (v.generating)
-    std::snprintf(head, sizeof(head), "HSF // DLSS-G %uX", per_real);
+    std::snprintf(head, sizeof(head), "HSF // %s %uX", FgEngineName(FgEngine(), XmxNow()), per_real);
   else
     std::snprintf(head, sizeof(head), "HSF // FRAME GEN");
   float head_used = Spaced(draw, ImVec2(x, y), text * 0.9f, head, c::DIM) + gap;
@@ -8380,11 +8569,18 @@ void DrawOverlay(bool advanced) {
 
     // ---- Left: generation, Reflex, FPS cap.
     section(x, y1, "GENERATION");
-    if (v.generating) std::snprintf(value, sizeof(value), "DLSS-G %uX", per_real);
+    const FgEngineState& fg_engine = FgEngine();
+    const hsf::xmx::Status xmx = XmxNow();
+    if (v.generating) std::snprintf(value, sizeof(value), "%s %uX", FgEngineName(fg_engine, xmx), per_real);
     else std::snprintf(value, sizeof(value), "%s", g_extra_enabled ? "NOT GENERATING" : "OFF");
     extra[0] = '\0';
     if (v.max_frames != 0) std::snprintf(extra, sizeof(extra), "MAX %uX", v.max_frames + 1);
     line(x, w, y1, "MODE", c::DIM, value, v.generating ? c::TEXT : c::AMBER, extra);
+    // XeMFG asked for (HSF.ini FgEngine): which engine really runs, amber when it fell back.
+    if (fg_engine.running) {
+      if (XmxFellBack(fg_engine, xmx)) line(x, w, y1, "ENGINE", c::DIM, "DLSS-G (XEMFG FAILED)", c::AMBER);
+      else line(x, w, y1, "ENGINE", c::DIM, "XEMFG", xmx.preflight ? c::TEXT : c::AMBER, "EXP");
+    }
     const char* route = v.route;
     if (std::strncmp(route, "IN GAME // ", 11) == 0) route += 11;
     line(x, w, y1, "ROUTE", c::DIM, route, c::TEXT);
@@ -8397,10 +8593,17 @@ void DrawOverlay(bool advanced) {
     if (const HudSetting hud = HudSettingNow(v); hud.setting != nullptr)
       line(x, w, y1, "HUD", c::DIM, *hud.setting ? "PROTECTED" : "NOT PROTECTED", *hud.setting ? c::TEXT : c::DIM);
     const OlderCardMod& older = OlderCardModNow();
+    // XeMFG took its 3x-6x programs from MFG-Unlocker's file (not from the RenoDX unlock add-on).
+    std::string model_lower = xmx.model;
+    for (char& ch : model_lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    const bool xmx_uses_mod = fg_engine.running && xmx.hooked > 0 && xmx.published && xmx.max_frames > 1 && model_lower.find("renodx") == std::string::npos;
     if (older.live && older.family != 5) {
       if (older.safe_max != 0) std::snprintf(value, sizeof(value), "UP TO %uX", older.safe_max);
       else std::snprintf(value, sizeof(value), "LOADED");
       line(x, w, y1, "MFG-UNLOCKER", c::DIM, value, c::AMBER);
+    } else if (older.live || xmx_uses_mod) {
+      // RTX 50 has MFG of its own, so MFG-Unlocker unlocks nothing there; it is loaded all the same, and XeMFG may run on its programs.
+      line(x, w, y1, "MFG-UNLOCKER", c::DIM, xmx_uses_mod ? "LOADED // XEMFG 3X-6X" : "LOADED // NOT NEEDED ON RTX 50", c::TEXT);
     } else {
       line(x, w, y1, "MFG-UNLOCKER", c::DIM, "NOT IN USE", c::DIM);
     }
@@ -8685,6 +8888,14 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         log_path.resize(log_path.find_last_of(L'\\') + 1);
         hsf::hsflog::Open((log_path + L"HSF.log").c_str());
       }
+#ifdef HSF_SL_GAME
+      // FgEngine (EXPERIMENTAL XeMFG, xmx.h): read once, a change needs a restart. The Intel files are looked for in HSF_streamline, then next to HSF.ini.
+      if (g_ini_path[0] != L'\0') {
+        std::wstring folder = g_ini_path;
+        folder.resize(folder.find_last_of(L'\\'));
+        hsf::xmx::Configure(hsf::xmx::WantedFromIni(g_ini_path), folder.c_str(), &Log);
+      }
+#endif
       {
         // New ways of hooking are tried with the old kept as the backup (safe_try.h); HSF keeps its marks in HSF_safe_try.ini next to HSF.ini.
         std::wstring safe_try = g_ini_path;
@@ -8717,6 +8928,16 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         sl_options.factory_proxy = GetPrivateProfileIntW(L"HSF", L"SlFactoryProxy", 1, g_ini_path) != 0;
         sl_options.manual_hooking = GetPrivateProfileIntW(L"HSF", L"SlManualHooking", 0, g_ini_path) != 0;
         sl_options.early_load = GetPrivateProfileIntW(L"HSF", L"SlEarlyLoad", 1, g_ini_path) != 0;
+        // ReLimiter next to HSF: NVIDIA's NGX is loaded now, before ReLimiter starts and looks for it (sl_bring.h).
+        if (GetPrivateProfileIntW(L"HSF", L"SlPreloadNgx", 1, g_ini_path) != 0) {
+          wchar_t addon_folder[MAX_PATH] = L"";
+          GetModuleFileNameW(module, addon_folder, MAX_PATH);
+          if (wchar_t* const slash = wcsrchr(addon_folder, L'\\')) *slash = L'\0';
+          const std::wstring here = addon_folder;
+          sl_options.preload_ngx = GetModuleHandleW(L"relimiter.addon64") != nullptr ||
+                                   GetFileAttributesW((here + L"\\relimiter.addon64").c_str()) != INVALID_FILE_ATTRIBUTES ||
+                                   GetFileAttributesW((here + L"\\relimiter.addon").c_str()) != INVALID_FILE_ATTRIBUTES;
+        }
         wchar_t ngx_path[MAX_PATH] = L"";
         GetPrivateProfileStringW(L"HSF", L"SlNgxPath", L"", ngx_path, MAX_PATH, g_ini_path);
         sl_options.ngx_path = ngx_path;

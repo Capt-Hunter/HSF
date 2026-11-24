@@ -97,6 +97,7 @@ bool g_have_submitted = false;
 void* g_submit_queue = nullptr;  // the queue the last call's command buffer went to
 constexpr uint64_t NO_SUBMITS_AFTER = 30;  // calls recorded with no submit seen: ReShade does not report submits, hand over the last call recorded
 uint64_t g_serial = 0;
+uint64_t g_calls = 0;  // every upscaler call that reached MainCall, taken or not: its clock. g_serial counts only the taken ones and stops when none are
 call::Created g_created;  // from the last CreateFeature for DLSS
 call::MainCall g_main;
 int g_refused_motion = 0, g_refused_depth = 0;
@@ -320,7 +321,7 @@ bool Take(VkCommandBuffer cmd, const Parameter* parameters, FrameVk& out) {
   call::DepthPart d;
   if (depth != nullptr) d = call::ReadDepthPart(parameters, c, depth->width, depth->height);
   const uint32_t depth_width = d.width, depth_height = d.height, dx = d.x, dy = d.y;
-  if (!g_main.Take(c.Area(), g_serial)) return false;
+  if (!g_main.Take(c.Area(), ++g_calls)) return false;
 
   const VkFormat depth_format = depth != nullptr ? depth->format : VK_FORMAT_UNDEFINED;
   const Copies& now = g_ring[0];

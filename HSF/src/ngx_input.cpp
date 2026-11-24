@@ -96,6 +96,7 @@ Copies g_copies;
 Frame g_frame;
 bool g_have_frame = false;
 uint64_t g_serial = 0;
+uint64_t g_calls = 0;  // every upscaler call that reached MainCall, taken or not: its clock. g_serial counts only the taken ones and stops when none are
 struct OldCopies {
   Copies copies;
   uint64_t serial;
@@ -285,7 +286,7 @@ bool Record(ID3D12GraphicsCommandList* list, const Parameter* parameters, Frame&
   }
 
   const call::DlssCall c = call::Read(parameters, g_created, static_cast<uint32_t>(motion_desc.Width), motion_desc.Height);
-  if (!g_main.Take(c.Area(), g_serial)) return false;
+  if (!g_main.Take(c.Area(), ++g_calls)) return false;
 
   if (g_copies.motion == nullptr || g_copies.width != motion_desc.Width || g_copies.height != motion_desc.Height || g_copies.motion_format != motion_desc.Format ||
       g_copies.depth_format != depth_desc.Format || (g_copies.convert != nullptr) != Converted(depth_desc.Format) || g_copies.depth->GetDesc().Width != depth_desc.Width || g_copies.depth->GetDesc().Height != depth_desc.Height) {

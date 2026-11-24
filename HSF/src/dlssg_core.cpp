@@ -2,6 +2,7 @@
 
 #include "dlssg_core.h"
 #include "hsf_log.h"
+#include "xmx.h"
 
 #include <sl_consts.h>
 #include <sl_pcl.h>
@@ -17,6 +18,9 @@
 #include <vector>
 
 namespace hsf::dlssg_core {
+
+bool MfgUnlockerLoaded();  // below, with the mods HSF loads
+
 namespace {
 
 const sl::ViewportHandle VIEWPORT{0};
@@ -257,7 +261,13 @@ bool MakeInputs(Presenter& p, const FrameInputs& in) {
 }
 
 void SetDlssgOptions(Presenter& p, bool on, uint32_t frames, bool ui) {
-  if (p.options_set && p.last_on == on && p.last_frames == frames && p.last_ui == ui) return;
+  // MFG-Unlocker changes the frame count from its own menu by rewriting the next slDLSSGSetOptions call, so while it is loaded the same
+  // options go again twice a second (quietly): its choice lands within half a second, with no need to turn HSF's frame generation off
+  // and on.
+  const ULONGLONG now = GetTickCount64();
+  const bool same = p.options_set && p.last_on == on && p.last_frames == frames && p.last_ui == ui;
+  if (same && (!MfgUnlockerLoaded() || now - p.options_sent < 500)) return;
+  p.options_sent = now;
   // A new frame count while generating left DLSS-G on but generating nothing (harness, 2x -> 4x). Off for one frame first; the next frame's
   // call turns it back on with the new count.
   if (p.options_set && p.last_on && on && p.last_frames != frames) on = false;
@@ -280,6 +290,7 @@ void SetDlssgOptions(Presenter& p, bool on, uint32_t frames, bool ui) {
   // The scene and the overlays are generated apart and put together afterwards.
   options.enableUserInterfaceRecomposition = ui ? sl::Boolean::eTrue : sl::Boolean::eFalse;
   const sl::Result res = slDLSSGSetOptions(VIEWPORT, options);
+  if (same) return;
   Log("DLSS-G %s (%u generated per real frame, overlays %s): %d", on ? "on" : "off", options.numFramesToGenerate, ui ? "kept out" : "in the picture", static_cast<int>(res));
 }
 
@@ -537,6 +548,8 @@ void RecordFrame(Presenter& p, const FrameInputs& in, bool motion, bool reset, b
                               sl::ResourceTag(&mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent),
                               sl::ResourceTag(ui ? &hudless : nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &frame_extent),
                               sl::ResourceTag(ui ? &ui_alpha : nullptr, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent, &frame_extent)};
+    // Valid until present: DLSS-G hands these to NGX as they are, in the state given here (xmx.h, for XeMFG's copies).
+    for (const sl::Resource* r : {&depth, &mvec, &hudless, &ui_alpha}) hsf::xmx::tagstates::Record(r->native, r->state);
     slSetTagForFrame(token, VIEWPORT, tags, static_cast<uint32_t>(std::size(tags)), reinterpret_cast<sl::CommandBuffer*>(p.list.Get()));
   } else {
     p.compose.ForgetHistory();
@@ -589,6 +602,8 @@ static_assert(sizeof(MfgUnlockerStatus) == 64);
 using MfgUnlockerQueryFn = BOOL(WINAPI*)(MfgUnlockerStatus*);
 MfgUnlockerQueryFn g_mfg_unlocker_query[4] = {};
 std::atomic<uint32_t> g_mfg_unlocker_queries{0};
+
+bool MfgUnlockerLoaded() { return g_mfg_unlocker_queries.load() != 0; }
 
 void LoadMod(const std::wstring& path, const char* why) {
   // The altered search path lets a mod find its own files and DLLs next to it.
@@ -1020,6 +1035,8 @@ void Run(Presenter& p, Host& host) {
         continue;
       }
     }
+    // XeMFG's hook on DLSS-G's generator in this process (xmx.h): looked for at most once a second.
+    hsf::xmx::Poll();
     FrameInputs in = host.Inputs(id);
     // No flow effect, NVOF on: NVOF makes the flow alone, in a texture of HSF's choosing. Once DLSS-G's inputs exist they set the size, as for an effect's flow.
     const bool nvof_alone = in.motion == nullptr && in.nvof;

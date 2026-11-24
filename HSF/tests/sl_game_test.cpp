@@ -186,6 +186,36 @@ uint8_t* MakeReflexStub() {
   return page;
 }
 
+// A tool hooked on slDLSSGSetOptions' entry ahead of HSF, as ReLimiter is: it passes the call on, then reads the mode and frame count from the caller's struct.
+SetDlssgOptionsFn g_tool_next = nullptr;
+sl::DLSSGMode g_tool_mode = sl::DLSSGMode::eCount;
+uint32_t g_tool_frames = 0, g_tool_calls = 0;
+bool g_tool_saw_off = false;
+
+sl::Result ToolSetOptions(const sl::ViewportHandle& viewport, const sl::DLSSGOptions& options) {
+  const sl::Result result = g_tool_next(viewport, options);
+  g_tool_mode = options.mode;
+  g_tool_frames = options.numFramesToGenerate;
+  if (options.mode == sl::DLSSGMode::eOff) g_tool_saw_off = true;
+  ++g_tool_calls;
+  return result;
+}
+
+// Puts the tool on top of HSF's jump at entry: the jump now goes to the tool, and the tool goes on to where HSF's jump went.
+void PutToolOnTop(uint8_t* entry) {
+  int32_t relative;
+  std::memcpy(&relative, entry + 1, 4);
+  g_tool_next = reinterpret_cast<SetDlssgOptionsFn>(entry + 5 + relative);
+  uint8_t* const thunk = entry + 0x200;
+  const uint8_t jump[] = {0xFF, 0x25, 0, 0, 0, 0};  // jmp [rip+0]
+  std::memcpy(thunk, jump, sizeof(jump));
+  const void* const tool = reinterpret_cast<const void*>(&ToolSetOptions);
+  std::memcpy(thunk + 6, &tool, sizeof(tool));
+  const int32_t to_thunk = static_cast<int32_t>(thunk - (entry + 5));
+  std::memcpy(entry + 1, &to_thunk, 4);
+  FlushInstructionCache(GetCurrentProcess(), entry, 4096);
+}
+
 // A point seen by two cameras: the rebuilt matrix must take where the first sees it to where the second does.
 void Project(const float world[3], const hsf::slgame::CameraPose& pose, const float view_to_clip[4][4], float out[4]) {
   float d[3], view[4];
@@ -325,9 +355,9 @@ void TestDrive(sl::Result (*set_loaded)(sl::Feature, bool), EvaluateFn evaluate,
 
   hsf::slgame::SetGeneration(true, 2);
   hsf::slgame::Poll();
-  Check(g_fake_mode == sl::DLSSGMode::eOff && g_fake_frames == 3, "drive: a new frame count while generating goes off first");
+  Check(g_fake_mode == sl::DLSSGMode::eOn && g_fake_frames == 2, "drive: a new frame count while generating goes straight in, with no off step");
   hsf::slgame::Poll();
-  Check(g_fake_mode == sl::DLSSGMode::eOn && g_fake_frames == 2, "drive: then on with the new count, on the next frame");
+  Check(g_fake_mode == sl::DLSSGMode::eOn && g_fake_frames == 2, "drive: and stays on with the new count");
 
   // Quick off: a gap much shorter than EVALUATE_GONE_MS stops generation, only with the option on. Not in the first second after generation went on
   // (ON_SETTLE_MS: DLSS-G starting up stalls the game's frames), so that second passes first.
@@ -458,7 +488,7 @@ void TestDrive(sl::Result (*set_loaded)(sl::Feature, bool), EvaluateFn evaluate,
     Check(Has(text.str(), "generating 1"), "drive: a size change is logged with whether generation is on");
     Check(Has(text.str(), "frame generation is off in HSF"), "drive: off is logged with HSF's switch as its reason");
     Check(Has(text.str(), "no vectors for"), "drive: off is logged with missing vectors as its reason");
-    Check(Has(text.str(), "for a new frame count"), "drive: off is logged with the frame count as its reason");
+    Check(Has(text.str(), "a new frame count with no off step"), "drive: a new frame count is logged as sent with no off step");
     Check(Has(text.str(), "evaluates back after"), "drive: the length of a gap in evaluates is logged");
     Check(Has(text.str(), "HSF sets the reset"), "cut: logged");
     Check(Has(text.str(), "with NO reset near it"), "cut: a picture cut with no reset is logged");
@@ -498,6 +528,86 @@ void TestDrive(sl::Result (*set_loaded)(sl::Feature, bool), EvaluateFn evaluate,
   hsf::slgame::Poll();
   Check(g_fake_mode == sl::DLSSGMode::eOn && g_fake_frames == 2, "restart: generation goes on as in the first run");
   hsf::slgame::Stop(false);
+
+  // ReLimiter: a tool on the entry ahead of HSF must read what DLSS-G gets. HSF's own calls go in through the entry, the game's struct carries HSF's mode and
+  // frame count, and where that struct cannot be written HSF sends its own again, at most every ECHO_GAP_MS.
+  {
+    uint8_t* const entry = MakeStub();
+    const auto call = reinterpret_cast<SetDlssgOptionsFn>(entry);
+    hsf::slgame::Start(log, true);
+    hsf::slgame::SetGeneration(true, 2);
+    Check(hsf::slgame::HookFeatureFunctionForTest("slDLSSGSetOptions", entry), "tool: HSF hooks the entry");
+    PutToolOnTop(entry);
+    sl::DLSSGOptions g{};
+    g.structVersion = sl::kStructVersion3;
+    g.mode = sl::DLSSGMode::eOff;
+    g.numFramesToGenerate = 1;
+    call(viewport, g);
+    Check(g_tool_calls == 1 && g_tool_mode == sl::DLSSGMode::eOff, "tool: the game's call reaches the tool, then HSF");
+    for (uint32_t i = 0; i < 12; ++i) {
+      token.value = 700 + i;
+      evaluate(sl::kFeatureDLSS, token, inputs, 3, reinterpret_cast<sl::CommandBuffer*>(list.Get()));
+    }
+    const uint32_t fake_before = g_fake_calls, tool_before = g_tool_calls;
+    hsf::slgame::Poll();
+    Check(g_fake_mode == sl::DLSSGMode::eOn && g_fake_frames == 2, "tool: DLSS-G generates 2");
+    Check(g_fake_calls == fake_before + 1, "tool: HSF's own call reaches DLSS-G once, not again through HSF's hook");
+    Check(g_tool_calls == tool_before + 1 && g_tool_mode == sl::DLSSGMode::eOn && g_tool_frames == 2, "tool: HSF's own call goes in through the entry, so the tool sees it");
+
+    g_tool_saw_off = false;
+    call(viewport, g);
+    Check(g_fake_mode == sl::DLSSGMode::eOn && g_fake_frames == 2, "tool: the game's off reaches DLSS-G as HSF's on");
+    Check(g_tool_mode == sl::DLSSGMode::eOn && g_tool_frames == 2, "tool: after the game's off, the tool reads on with HSF's frame count");
+    Check(g.mode == sl::DLSSGMode::eOn && g.numFramesToGenerate == 2, "tool: the game's struct carries HSF's mode and frame count");
+    hsf::slgame::Poll();
+    Check(g_tool_mode == sl::DLSSGMode::eOn, "tool: no resend needed when the game's struct was written");
+
+    hsf::slgame::SetGeneration(true, 3);
+    hsf::slgame::Poll();
+    Check(g_tool_mode == sl::DLSSGMode::eOn && g_tool_frames == 3 && !g_tool_saw_off, "tool: a new frame count, and the tool never saw off");
+
+    // A game struct that cannot be written (read-only memory).
+    auto* const page = static_cast<sl::DLSSGOptions*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    g.mode = sl::DLSSGMode::eOff;
+    g.numFramesToGenerate = 1;
+    std::memcpy(page, &g, sizeof(g));
+    DWORD old = 0;
+    VirtualProtect(page, 4096, PAGE_READONLY, &old);
+    call(viewport, *page);
+    Check(g_fake_mode == sl::DLSSGMode::eOn && g_fake_frames == 3, "tool: read-only struct, DLSS-G still gets HSF's options");
+    Check(g_tool_mode == sl::DLSSGMode::eOff, "tool: read-only struct, the tool reads the game's off");
+    hsf::slgame::Poll();
+    Check(g_tool_mode == sl::DLSSGMode::eOn && g_tool_frames == 3, "tool: HSF sends its own again, and the tool reads on");
+    call(viewport, *page);
+    hsf::slgame::Poll();
+    Check(g_tool_mode == sl::DLSSGMode::eOff, "tool: not again within 500 ms");
+    for (uint32_t i = 0; i < 11; ++i) {  // the game's frames go on meanwhile: a gap with no evaluates would turn generation off
+      Sleep(50);
+      evaluate(sl::kFeatureDLSS, token, inputs, 3, reinterpret_cast<sl::CommandBuffer*>(list.Get()));
+    }
+    hsf::slgame::Poll();
+    Check(g_tool_mode == sl::DLSSGMode::eOn && g_tool_frames == 3, "tool: again once 500 ms passed");
+
+    // HSF's own vectors (flow, or the game's DLSS read through NGX) changing size turn the dynamic resolution flag on, as the game's do.
+    const uint32_t dynamic_flag = static_cast<uint32_t>(sl::DLSSGFlags::eDynamicResolutionEnabled);
+    Check((g_fake_flags & dynamic_flag) == 0, "optical: no dynamic resolution flag while the size holds");
+    hsf::slgame::SetOptical(true);
+    const uint32_t big_extent[4] = {0, 0, 320, 180}, small_extent[4] = {0, 0, 160, 90};
+    const float scale[2] = {1.f, 1.f};
+    hsf::slgame::TagOptical(list.Get(), texture, 0, texture, 0, big_extent, scale, false, true);
+    hsf::slgame::TagOptical(list.Get(), other_size, 0, other_size, 0, small_extent, scale, false, true);
+    evaluate(sl::kFeatureDLSS, token, inputs, 3, reinterpret_cast<sl::CommandBuffer*>(list.Get()));
+    hsf::slgame::Poll();
+    Check((g_fake_flags & dynamic_flag) != 0 && g_fake_mode == sl::DLSSGMode::eOn, "optical: HSF's own vectors changing size (DLAA to Quality) turn the dynamic resolution flag on");
+    hsf::slgame::SetOptical(false);
+    VirtualFree(page, 0, MEM_RELEASE);
+
+    hsf::slgame::Stop(false);
+    std::ifstream file(log, std::ios::binary);
+    std::stringstream text;
+    text << file.rdbuf();
+    Check(Has(text.str(), "again after the game's own options"), "tool: the resend is logged");
+  }
 }
 
 }  // namespace

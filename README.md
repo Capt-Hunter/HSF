@@ -26,6 +26,7 @@ A ReShade add-on. Up to 6x. DirectX 9, 11, 12 and Vulkan. 32-bit and 64-bit. SDR
 - **HDR stays HDR.** HDR10 goes to DLSS-G as HDR10, and FP16 (scRGB) is turned into HDR10. No setting needed.
 - **The best motion it can find.** When a game runs DLSS, HSF uses the game's own motion vectors and depth. In DirectX 11 games that a [Luma](https://github.com/Filoppi/Luma-Framework) mod adds DLSS to, it reads what Luma hands to DLSS. Every other game gets optical flow from a ReShade effect, which HSF combines with the game's depth and cleans up.
 - **Its own menu.** A tab in ReShade for the multiplier, FPS cap, Reflex, motion source, HUD protection and two overlays.
+- **A second engine, EXPERIMENTAL.** XeMFG runs Intel's XeSS frame generation inside DLSS-G, on every route. You add Intel's files yourself; see the [user guide](docs/user-guide.md).
 
 ## What you need
 
@@ -132,6 +133,8 @@ Pull requests and bug reports are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md
 - kibblerz and [DLSS5 ReShade AIO](https://github.com/kibblerz/DLSS5-Reshade-AIO) (Apache-2.0): the NVIDIA Optical Flow motion source is ported from it.
 - BarbatosAWLS and [AeonSR](https://github.com/BarbatosAWLS/AeonSR) (MIT): the Vulkan route presents from a window of its own, as AeonSR does.
 - Pumbo (Filoppi) and [Luma](https://github.com/Filoppi/Luma-Framework): HSF reads the motion and depth Luma mods hand to DLSS. No Luma code is used.
+- ImDreamt and MFGAdaUnlock-RenoDx (MIT): XeMFG's hook, generator and 3x to 6x model set-up are ported from it.
+- dashdogy and MFG-Unlocker (MIT): the 3x to 6x model set-up XeMFG uses started there.
 - RankFTW and [RHI](https://github.com/RankFTW/RHI), for bringing HSF to RHI's players.
 - [ghostinthecamera](https://github.com/ghostinthecamera/GITC-Uplift), for all of the help along the way.
 - A special thanks to [RankFTW](https://github.com/RankFTW), who helped a great deal: testing, finding bugs, the bring-in route fixes, and bringing HSF to RHI. HSF is much better for it.

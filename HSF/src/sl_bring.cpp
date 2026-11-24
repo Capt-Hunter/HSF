@@ -805,8 +805,26 @@ void BeginFrame(bool sleep) {
 
 // ---- DLSS-G's options ----
 
+// MFG-Unlocker (any file name: it is known by its status export) changes DLSS-G's frame count from its own menu by rewriting the next
+// slDLSSGSetOptions call. Looked for again every 5 s, since it can load after HSF.
+bool FrameCountModLoaded(ULONGLONG now) {
+  static ULONGLONG checked = 0;
+  static bool found = false;
+  if (checked != 0 && now - checked < 5000) return found;
+  checked = now;
+  HMODULE modules[1024];
+  DWORD bytes = 0;
+  bool any = false;
+  if (EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes))
+    for (DWORD i = 0; i < std::min<DWORD>(bytes / sizeof(HMODULE), 1024) && !any; ++i) any = GetProcAddress(modules[i], "MfgUnlockSingleModuleQuery") != nullptr;
+  if (any && !found) Line("MFG-Unlocker is loaded: DLSS-G's options go again twice a second so its menu can change the frame count");
+  found = any;
+  return found;
+}
+
 struct AppliedOptions {
   bool set = false, on = false;
+  ULONGLONG sent = 0;
   uint32_t frames = 0, width = 0, height = 0, input_width = 0, input_height = 0;
   DXGI_FORMAT colour = DXGI_FORMAT_UNKNOWN, motion = DXGI_FORMAT_UNKNOWN;
   bool dynamic = false;
@@ -817,10 +835,14 @@ void SetOptions(bool on, uint32_t frames, uint32_t width, uint32_t height, uint3
   const uint32_t most = std::max(g_max_frames.load(), 1u);
   frames = std::clamp(frames, 1u, most);
   AppliedOptions& a = g_options;
-  if (a.set && a.on == on && a.frames == frames && a.width == width && a.height == height && a.input_width == input_width && a.input_height == input_height && a.colour == colour && a.motion == motion && a.dynamic == dynamic) return;
+  const ULONGLONG now = GetTickCount64();
+  // While MFG-Unlocker is loaded the same options go again twice a second (quietly), so a frame count picked in its menu lands within
+  // half a second instead of waiting for HSF's own next change.
+  const bool same = a.set && a.on == on && a.frames == frames && a.width == width && a.height == height && a.input_width == input_width && a.input_height == input_height && a.colour == colour && a.motion == motion && a.dynamic == dynamic;
+  if (same && (now - a.sent < 500 || !FrameCountModLoaded(now))) return;
   // A new frame count while generating leaves DLSS-G on but generating nothing, as the helper found: off for one frame first, and the next frame's call turns it on again.
   if (a.set && a.on && on && a.frames != frames) on = false;
-  a = {true, on, frames, width, height, input_width, input_height, colour, motion, dynamic};
+  a = {true, on, now, frames, width, height, input_width, input_height, colour, motion, dynamic};
   sl::DLSSGOptions options{};
   options.mode = on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
   options.numFramesToGenerate = frames;
@@ -841,6 +863,7 @@ void SetOptions(bool on, uint32_t frames, uint32_t width, uint32_t height, uint3
   }
   const sl::Result result = g_sl_dlssg_options(VIEWPORT, options);
   g_generating = on;
+  if (same) return;
   Line("DLSS-G %s, %u generated per real frame, picture %ux%u format %u, inputs %ux%u: %d", on ? "ON" : "off", frames, width, height, static_cast<unsigned>(colour), input_width, input_height, static_cast<int>(result));
 }
 
@@ -951,7 +974,7 @@ void CatchPresent(IUnknown* swap_chain) {
   if (swap_chain == nullptr) return;
   void** const table = *reinterpret_cast<void***>(swap_chain);
   g_game_swap_chain = swap_chain;
-  if (g_made_queue != nullptr) hsf::fp16swap::Start(swap_chain, g_made_swap_chain, g_made_queue, RealQueue(g_made_queue), &Line);
+  if (g_made_queue != nullptr) hsf::fp16swap::Start(swap_chain, g_made_swap_chain, g_made_queue, RealQueue(g_made_queue), &Line, g_made_table);
   if (g_present_table == table) return;
   if (g_present_table != nullptr) {
     Line("a second kind of swap chain: its frames are not followed");
@@ -1356,6 +1379,19 @@ void Start(const wchar_t* log_path, const wchar_t* folder, const StartOptions& o
     const HMODULE early = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     Line("sl.interposer.dll loaded early, as HSF loads: %s", early != nullptr ? "yes" : "no");
   }
+  if (options.preload_ngx && GetModuleHandleW(L"_nvngx.dll") == nullptr) {
+    // The driver's NGX folder, as NGX itself finds it.
+    wchar_t folder_ngx[MAX_PATH] = L"";
+    DWORD size = sizeof(folder_ngx);
+    const LSTATUS read = RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", L"FullPath", RRF_RT_REG_SZ, nullptr, folder_ngx, &size);
+    if (read != ERROR_SUCCESS || folder_ngx[0] == L'\0') {
+      Line("NVIDIA's NGX not loaded early for ReLimiter: the driver's NGX folder is not in the registry (%ld)", static_cast<long>(read));
+    } else {
+      const std::wstring dll = std::wstring(folder_ngx) + L"\\_nvngx.dll";
+      const HMODULE ngx = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+      Line("NVIDIA's NGX loaded early for ReLimiter, which hooks it only as it starts: %s (%ls)", ngx != nullptr ? "yes" : "no", dll.c_str());
+    }
+  }
 }
 
 void NoteDevice(void* device) {
@@ -1659,6 +1695,8 @@ void Stop(bool process_exiting) {
   g_sl_dlssg_state = nullptr;
   Line("=== stopped catching swap chains ===");
 }
+
+bool NeedsExitShutdown() { return g_sl_started.load() && g_sl_shutdown != nullptr && !g_shut.load(); }
 
 void ShutdownForExit() {
   if (!g_sl_started.load() || g_sl_shutdown == nullptr || g_shut.exchange(true)) return;

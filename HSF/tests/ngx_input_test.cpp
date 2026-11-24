@@ -270,6 +270,19 @@ int main() {
   hsf::ngx::Latest(&frame);
   Check(frame.serial == before && frame.width == 640, "a small second call does not take over");
 
+  // DLAA to Quality: every call from now on is less than half the area of the largest. After 240 of them the largest is forgotten and the new
+  // size is taken (Gothic Remake: HSF fell back to flow for good, as its clock counted taken calls only and stopped).
+  block.uints["DLSS.Render.Subrect.Dimensions.Width"] = 300;
+  block.uints["DLSS.Render.Subrect.Dimensions.Height"] = 200;
+  for (int i = 0; i < 200; ++i) hsf::ngx::Capture(gpu.list.Get(), &block);
+  gpu.Run();
+  hsf::ngx::Latest(&frame);
+  Check(frame.serial == before, "a smaller size is refused for a while");
+  for (int i = 0; i < 50; ++i) hsf::ngx::Capture(gpu.list.Get(), &block);
+  gpu.Run();
+  hsf::ngx::Latest(&frame);
+  Check(frame.serial > before && frame.width == 300, "after 240 calls of a smaller size (DLAA to Quality), it is taken");
+
   // D24 and D16 depth cannot be copied to R32_FLOAT: a shader converts them, and the values come through.
   struct UnormCase {
     DXGI_FORMAT resource, view;

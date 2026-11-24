@@ -15,7 +15,7 @@
 namespace hsf::dlssg_link {
 
 constexpr uint32_t MAGIC = 0x47534648;  // "HFSG"
-constexpr uint32_t VERSION = 14;  // 14: the game's colour space; 13: overlay window (Vulkan); 12: helper's dxgi.dll not Windows' own (foreign_dxgi); 11: NVIDIA Optical Flow (FIX_NVOF, nvof_state); 10: ReShade menu open (mouse to the helper's window); 2: Reflex on the game's frame (messages, sleep handshake, FPS cap); 3: latency for the overlay; 4: per-frame reset; 5: real depth; 6: compose pass; 7: frame checks; 8: HUD-less image; 9: camera
+constexpr uint32_t VERSION = 15;  // 15: XeMFG status; 14: the game's colour space; 13: overlay window (Vulkan); 12: helper's dxgi.dll not Windows' own (foreign_dxgi); 11: NVIDIA Optical Flow (FIX_NVOF, nvof_state); 10: ReShade menu open (mouse to the helper's window); 2: Reflex on the game's frame (messages, sleep handshake, FPS cap); 3: latency for the overlay; 4: per-frame reset; 5: real depth; 6: compose pass; 7: frame checks; 8: HUD-less image; 9: camera
 constexpr uint32_t RING = 5;
 constexpr int32_t FIX_COMPOSE = 1, FIX_CHECKS = 2, FIX_CAMERA = 4, FIX_FIT = 8, FIX_RECORD = 16;  // Block::slot_compose. FIX_RECORD: write this frame's camera data to a file (camera_record.h)
 // Version 11: the frame's motion comes from NVIDIA Optical Flow in the helper (nvof_flow.h) in place of the effect's flow, whose texture still gives the size, format and
@@ -127,6 +127,12 @@ struct Block {
   // (R10G10B10A2 in ST.2084 with BT.2020 primaries, as RenoDX outputs) is shown as HDR10 by the helper's swap chain too.
   int32_t color_space;
   int32_t pad7;
+  // Version 15: helper -> add-on, XeMFG's status in the helper (xmx.h Status), once a second, for the menu. xmx_flags: 1 wanted, 2 preflight
+  // passed, 4 hooked, 8 generating, 16 model published, 32 written; 0 until the helper wrote it. The texts end in a zero.
+  volatile int32_t xmx_flags;
+  volatile int32_t xmx_max_frames;
+  char xmx_failure[160];
+  char xmx_model[160];
 };
 #pragma pack(pop)
 // Same layout in the 32-bit add-on and the 64-bit helper (checked in both builds).
@@ -134,7 +140,7 @@ static_assert(offsetof(Block, slots) == 40 && offsetof(Block, motion_ready) == 9
               offsetof(Block, on) == 232 && offsetof(Block, error) == 276 && offsetof(Block, request_event) == 520 &&
               offsetof(Block, messages) == 552 && offsetof(Block, slot_index) == 680 && offsetof(Block, slept) == 720 &&
               offsetof(Block, reflex_available) == 736 && offsetof(Block, slot_start) == 744 && offsetof(Block, latency_us) == 788 &&
-              offsetof(Block, report_frames) == 1824 && offsetof(Block, slot_reset) == 1856 && offsetof(Block, depth) == 1880 && offsetof(Block, depth_ready) == 1960 && offsetof(Block, slot_compose) == 2000 && offsetof(Block, hudless) == 2024 && offsetof(Block, hudless_ready) == 2104 && offsetof(Block, camera) == 2112 && offsetof(Block, camera_count) == 7872 && offsetof(Block, camera_frame) == 7896 && offsetof(Block, camera_hint) == 7936 && offsetof(Block, menu_open) == 7960 && offsetof(Block, foreign_dxgi) == 7968 && offsetof(Block, overlay_window) == 7972 && offsetof(Block, color_space) == 7976 && sizeof(Block) == 7984,
+              offsetof(Block, report_frames) == 1824 && offsetof(Block, slot_reset) == 1856 && offsetof(Block, depth) == 1880 && offsetof(Block, depth_ready) == 1960 && offsetof(Block, slot_compose) == 2000 && offsetof(Block, hudless) == 2024 && offsetof(Block, hudless_ready) == 2104 && offsetof(Block, camera) == 2112 && offsetof(Block, camera_count) == 7872 && offsetof(Block, camera_frame) == 7896 && offsetof(Block, camera_hint) == 7936 && offsetof(Block, menu_open) == 7960 && offsetof(Block, foreign_dxgi) == 7968 && offsetof(Block, overlay_window) == 7972 && offsetof(Block, color_space) == 7976 && offsetof(Block, xmx_flags) == 7984 && sizeof(Block) == 8312,
               "dlssg_link::Block layout changed");
 
 inline int64_t Message(uint32_t kind, uint32_t index) { return static_cast<int64_t>((static_cast<uint64_t>(kind) << 56) | index); }
