@@ -76,9 +76,9 @@ else()
   add_dependencies(sl_copies_test fake_interposer)
   # Offline test of the frame checks, no game needed.
   # A small program with no Streamline of its own: HSF must bring Streamline to it. Needs a folder with Streamline's DLLs and a GPU.
-  add_executable(sl_bring_test tests/sl_bring_test.cpp src/sl_bring.cpp src/fp16_swap.cpp src/hdr_out.cpp src/hsf_log.cpp src/debug_view.cpp src/depth_fit.cpp src/compose.cpp src/frame_checks.cpp src/nvof_flow.cpp)
+  add_executable(sl_bring_test tests/sl_bring_test.cpp src/sl_bring.cpp src/fp16_swap.cpp src/hdr_out.cpp src/hsf_log.cpp src/debug_view.cpp src/depth_fit.cpp src/compose.cpp src/frame_checks.cpp src/nvof_flow.cpp src/hook_patch.cpp src/safe_try.cpp)
   target_include_directories(sl_bring_test SYSTEM PRIVATE "${HSF_STREAMLINE}/include" "${HSF_NVOF}")
-  target_link_libraries(sl_bring_test PRIVATE d3d12 dxgi d3dcompiler)
+  target_link_libraries(sl_bring_test PRIVATE d3d12 dxgi d3dcompiler hsf_minhook)
   target_link_options(sl_bring_test PRIVATE "/ENTRY:wmainCRTStartup")
 
   # The hook on this machine's real _nvngx.dll, and a stand-in DLSS call on a real device.
