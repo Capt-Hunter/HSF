@@ -11,8 +11,8 @@ A ReShade add-on. Up to 6x. DirectX 9, 11, 12 and Vulkan. 32-bit and 64-bit. SDR
 </p>
 
 <p align="center">
-  <a href="docs/images/hsf-main.png"><img src="docs/images/hsf-main.png" width="32%" alt="HSF 0.9.9 at a glance: hardware, features, install steps, known issues, bug report"></a>
-  <a href="docs/images/hsf-patch.png"><img src="docs/images/hsf-patch.png" width="32%" alt="HSF 0.9.9 patch notes: scRGB HDR, real depth, Vulkan motion, keybinds, colour themes and fixes"></a>
+  <a href="docs/images/hsf-main.png"><img src="docs/images/hsf-main.png" width="32%" alt="HSF 0.10 at a glance: hardware, features, FG engine, install steps, known issues, bug report"></a>
+  <a href="docs/images/hsf-patch.png"><img src="docs/images/hsf-patch.png" width="32%" alt="HSF 0.10 patch notes: XeMFG, ReLimiter and REFramework support, MFG-Unlocker and no-depth warnings, and fixes"></a>
   <a href="docs/images/hsf-roadmap.png"><img src="docs/images/hsf-roadmap.png" width="32%" alt="HSF roadmap: what comes in the next update and after"></a>
 </p>
 <p align="center"><sub>Click a card to see it full size.</sub></p>
