@@ -922,6 +922,7 @@ bool DepthSent() {
 }
 
 bool Dx9DepthLine(char* text, size_t size, const char* sent);
+bool GenericDepthOffInIni();
 
 // What DLSS-G's depth input is now, for the log and the panel.
 void DepthLine(char* text, size_t size) {
@@ -932,7 +933,8 @@ void DepthLine(char* text, size_t size) {
     std::snprintf(text, size, "depth: %s; %s", sent, hsf::depth::Problem());
   else if (!s.source)
     std::snprintf(text, size, "depth: %s; ReShade has no depth buffer bound%s", sent,
-                  g_seen.api == device_api::vulkan ? " (the game binds none; path-traced games have none)"
+                  GenericDepthOffInIni()            ? " (ReShade's Generic Depth add-on is off in ReShade.ini)"
+                  : g_seen.api == device_api::vulkan ? " (the game binds none; path-traced games have none)"
                   : g_depth_variable.handle == 0   ? " (HSF.fx is not loaded)"
                                                    : "");
   else if (!s.measured)
@@ -5945,6 +5947,48 @@ const char* MfgUnlockerMissing() {
   return missing ? text : nullptr;
 }
 
+// Whether ReShade's own Generic Depth add-on is off ([ADDON] DisabledAddons in ReShade.ini). HSF gets the game's depth through it on every route but the
+// game's own Streamline. Read every 5 seconds, as the Add-ons tab can change it while the game runs.
+bool GenericDepthOffInIni() {
+  static bool off = false;
+  static ULONGLONG next = 0;
+  const ULONGLONG now = GetTickCount64();
+  if (now < next) return off;
+  next = now + 5000;
+  off = false;
+  char list[2048] = "";
+  size_t size = sizeof(list) - 1;
+  if (!reshade::get_config_value(nullptr, "ADDON", "DisabledAddons", list, &size)) return off;
+  size = (std::min)(size, sizeof(list) - 1);
+  list[size] = '\0';
+  // The names are split by commas in the file and by null characters in this call.
+  for (size_t i = 0; i < size;) {
+    size_t end = i;
+    while (end < size && list[end] != '\0' && list[end] != ',') ++end;
+    size_t a = i, b = end;
+    while (a < b && list[a] == ' ') ++a;
+    while (b > a && list[b - 1] == ' ') --b;
+    if (b - a == 13 && _strnicmp(list + a, "Generic Depth", 13) == 0) off = true;
+    i = end + 1;
+  }
+  return off;
+}
+
+// The red line when ReShade's Generic Depth add-on is off and so DLSS-G gets no depth; nullptr otherwise. Logged once per change.
+const char* GenericDepthMissing() {
+  static const char text[] = "ReShade's Generic Depth add-on is off, so DLSS-G gets no depth. Turn it on in ReShade's Add-ons tab, then restart the game.";
+  bool missing = g_depth_enabled && g_seen.have_api && !DepthSent() && GenericDepthOffInIni();
+#ifdef HSF_SL_GAME
+  if (g_sl_drive && D3d12Run()) missing = false;  // the game's own Streamline hands DLSS-G its depth
+#endif
+  static bool logged = false;
+  if (missing != logged) {
+    Log(missing ? "WARNING: ReShade's Generic Depth add-on is off in ReShade.ini, so DLSS-G gets no depth" : "ReShade's Generic Depth add-on is on now");
+    logged = missing;
+  }
+  return missing ? text : nullptr;
+}
+
 // PROTECT GAME HUD is a different setting on each route: the game's own Streamline hands DLSS-G the picture from before the HUD (DlssgHud), HSF's own
 // Streamline masks the HUD (FrameChecks), D3D11 keeps the HUD's draws out (GameHud). DX9, Vulkan and the D3D12 helper route have none: setting is nullptr.
 struct HudSetting {
@@ -6022,11 +6066,14 @@ MenuView ReadMenuViewOfRoute() {
   return v;
 }
 
-// The route's view, with MFG-Unlocker's absence first: on RTX 30 and 20 it is the cause of anything else that is wrong.
+// The route's view, with MFG-Unlocker's absence first: on RTX 30 and 20 it is the cause of anything else that is wrong. ReShade's Generic Depth add-on
+// being off shows even while generating, since the frames then come with no depth.
 MenuView ReadMenuView() {
   MenuView v = ReadMenuViewOfRoute();
   if (g_extra_enabled && !v.generating)
     if (const char* const missing = MfgUnlockerMissing()) v.problem = missing;
+  if (g_extra_enabled && v.problem == nullptr)
+    if (const char* const missing = GenericDepthMissing()) v.problem = missing;
   return v;
 }
 

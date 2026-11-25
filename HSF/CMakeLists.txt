@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.23)
-project(hsf VERSION 0.9.9 LANGUAGES C CXX)
+project(hsf VERSION 0.10 LANGUAGES C CXX)
 
 # HSF (Hunter's Sloppy Frames) by Capt-Hunter. DLSS Frame Generation for ReShade.
 # One ReShade add-on, built twice: a 32-bit configure makes hsf.addon32, a 64-bit one makes hsf.addon64. See ../docs/.
