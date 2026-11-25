@@ -44,6 +44,7 @@
 #include <d3d11.h>
 #include <dxgi1_5.h>
 #include <objbase.h>
+#include <psapi.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <wrl/client.h>
@@ -5844,6 +5845,106 @@ struct MenuView {
 
 const char* FinderReason();
 
+// ---- RTX 30 and 20 without MFG-Unlocker ----
+// DLSS-G runs on RTX 40 and newer only. RTX 30 and 20 need MFG-Unlocker (dashdogy, MIT; users install it, HSF never ships it). Without it every
+// check can still pass while DLSS-G shows 1 frame per real frame, so the menu, the overlay, the finder and HSF.log say why, and what to do.
+
+// RTX 30 (Ampere) or RTX 20 (Turing), from the card's name. The RTX 2000/3500 Ada cards are RTX 40 class.
+bool CardNeedsMfgUnlocker() {
+  const char* const gpu = GpuName();
+  if (std::strstr(gpu, "ADA") != nullptr) return false;
+  if (std::strstr(gpu, "TITAN RTX") != nullptr || std::strstr(gpu, "QUADRO RTX") != nullptr) return true;
+  const auto digit = [](char ch) { return ch >= '0' && ch <= '9'; };
+  for (const char* p = std::strstr(gpu, "RTX "); p != nullptr; p = std::strstr(p + 4, "RTX ")) {
+    const char* const n = p + 4;
+    if (n[0] == 'A' && digit(n[1])) return true;  // RTX A2000 to A6000 (Ampere)
+    if ((n[0] == '2' || n[0] == '3') && digit(n[1]) && digit(n[2]) && digit(n[3])) return true;
+  }
+  return false;
+}
+
+void StackString(HMODULE module, const wchar_t* key, wchar_t* out, size_t size);  // with the mod stack, below
+
+// MFG-Unlocker in this process: it is known by its status export, as it loads under any file name.
+bool MfgUnlockerInThisProcess() {
+  HMODULE modules[1024];
+  DWORD bytes = 0;
+  if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes)) return false;
+  for (DWORD i = 0; i < std::min<DWORD>(bytes / sizeof(HMODULE), 1024); ++i)
+    if (GetProcAddress(modules[i], "MfgUnlockSingleModuleQuery") != nullptr) return true;
+  return false;
+}
+
+// The first DLL in `folder` whose ProductName is MFG-Unlocker's, version.dll first; empty if none. Read as data, so nothing in it runs.
+std::wstring MfgUnlockerFileIn(const std::wstring& folder) {
+  std::wstring first;
+  WIN32_FIND_DATAW found{};
+  const HANDLE search = FindFirstFileW((folder + L"\\*.dll").c_str(), &found);
+  if (search == INVALID_HANDLE_VALUE) return first;
+  do {
+    if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    const HMODULE data = LoadLibraryExW((folder + L"\\" + found.cFileName).c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    if (data == nullptr) continue;
+    wchar_t product[64];
+    StackString(data, L"ProductName", product, std::size(product));
+    FreeLibrary(data);
+    if (_wcsicmp(product, L"MFG Unlocker") != 0) continue;
+    if (_wcsicmp(found.cFileName, L"version.dll") == 0) {
+      first = found.cFileName;
+      break;
+    }
+    if (first.empty()) first = found.cFileName;
+  } while (FindNextFileW(search, &found));
+  FindClose(search);
+  return first;
+}
+
+// The red line when this card needs MFG-Unlocker and it is not running; nullptr otherwise. Checked every 5 seconds, from 10 seconds after the
+// first frame (and on the helper routes once the helper runs), so a late load is not blamed. Logged once per change.
+const char* MfgUnlockerMissing() {
+  static char text[200] = "";
+  static bool missing = false;
+  static ULONGLONG next = 0, first_frame = 0;
+  const ULONGLONG now = GetTickCount64();
+  if (now < next) return missing ? text : nullptr;
+  next = now + 5000;
+  static const bool needs = CardNeedsMfgUnlocker();
+  const bool was = missing;
+  missing = false;
+  if (needs && g_seen.have_api && first_frame == 0) first_frame = now;
+  const bool d3d12 = g_seen.api == device_api::d3d12;
+  const bool helper = !d3d12 || !D3d12Run();
+  if (needs && first_frame != 0 && now - first_frame >= 10000 && (!helper || hsf::dlssg::Running()) && !MfgUnlockerInThisProcess() && !OlderCardModNow().live) {
+    wchar_t exe[MAX_PATH] = L"";
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring game = exe;
+    game.resize(game.find_last_of(L'\\'));
+    // dlssg_for_sm86 (RTX 30) is the other way to DLSS-G on these cards: its own folder next to the game.
+    if (GetFileAttributesW((game + L"\\dlssg_sm86\\backend\\sm86_backend.dll").c_str()) == INVALID_FILE_ATTRIBUTES) {
+      std::wstring file = MfgUnlockerFileIn(game);
+      if (file.empty()) file = MfgUnlockerFileIn(std::wstring(g_sl_folder) + L"\\mods");
+      missing = true;
+      if (file.empty())
+        std::snprintf(text, sizeof(text), "RTX 30 and 20 need MFG-Unlocker for DLSS-G, and it is not installed. Put it next to the game's exe%s, then restart the game.",
+                      d3d12 ? " as version.dll" : "");
+      else if (d3d12 && _wcsicmp(file.c_str(), L"version.dll") != 0)
+        std::snprintf(text, sizeof(text), "MFG-Unlocker is next to the game as %ls but did not load. In D3D12 games it loads only as version.dll: rename it to version.dll.", file.c_str());
+      else
+        std::snprintf(text, sizeof(text), "MFG-Unlocker (%ls) is installed but did not load. Use its 64-bit build, and tick Unblock in the file's Properties.", file.c_str());
+    }
+  }
+  if (missing != was || missing) {
+    static std::string logged;
+    const std::string line = missing ? std::string("WARNING: ") + text : std::string();
+    if (line != logged) {
+      if (missing) Log(line.c_str());
+      else if (!logged.empty()) Log("MFG-Unlocker is running now");
+      logged = line;
+    }
+  }
+  return missing ? text : nullptr;
+}
+
 // PROTECT GAME HUD is a different setting on each route: the game's own Streamline hands DLSS-G the picture from before the HUD (DlssgHud), HSF's own
 // Streamline masks the HUD (FrameChecks), D3D11 keeps the HUD's draws out (GameHud). DX9, Vulkan and the D3D12 helper route have none: setting is nullptr.
 struct HudSetting {
@@ -5851,7 +5952,7 @@ struct HudSetting {
   const char* note = "";  // what it does on this route, for the menu
 };
 
-MenuView ReadMenuView() {
+MenuView ReadMenuViewOfRoute() {
   MenuView v;
   v.base_fps = g_menu_fps;
   v.out_fps = g_menu_fps;
@@ -5918,6 +6019,14 @@ MenuView ReadMenuView() {
   // Vulkan: the finder's first open step, so WAITING always says which step stops frame generation.
   if (g_seen.api == device_api::vulkan && g_extra_enabled && !v.generating && v.problem == nullptr)
     if (const char* const reason = FinderReason()) v.waiting = reason;
+  return v;
+}
+
+// The route's view, with MFG-Unlocker's absence first: on RTX 30 and 20 it is the cause of anything else that is wrong.
+MenuView ReadMenuView() {
+  MenuView v = ReadMenuViewOfRoute();
+  if (g_extra_enabled && !v.generating)
+    if (const char* const missing = MfgUnlockerMissing()) v.problem = missing;
   return v;
 }
 
@@ -6152,6 +6261,7 @@ void ReadFinderD3d12(Finder& f) {
 
 Finder BuildFinder() {
   Finder f;
+  if (const char* const missing = MfgUnlockerMissing()) AddStep(f, "MFG-UNLOCKER", StepState::failed, "%s", missing);
 #ifdef HSF_SL_GAME
   if (D3d12Run()) {
     ReadFinderD3d12(f);
