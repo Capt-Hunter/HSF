@@ -193,6 +193,7 @@ The in-game hotkeys. Click a key, then press the new one: ESC keeps the old key,
 | FRAME GEN ON / OFF | Turns frame generation on and off (`FrameGenKey`). None by default. |
 | MULTIPLIER | Cycles the multiplier, 2x up to what this card can do (`MfgKey`, F7). With MFG-Unlocker on RTX 30 or 20, the unlocker sets the multiplier instead. |
 | OVERLAY ON / OFF | Turns the on-screen overlay off, and back to SIMPLE or ADVANCED, whichever it was (`OsdKey`). None by default. |
+| OVERLAY CORNER | Moves the overlay on screen to the next corner: top left, top right, bottom right, bottom left (`OsdCornerKey`). None by default. |
 | DEBUG VIEW | DirectX 9, 11 and Vulkan: cycles the debug view (`ViewKey`, F8). |
 
 A key set here shows beside its row at the top of the menu, as F7 does beside MULTIPLIER.
@@ -232,6 +233,7 @@ Frame generation, the multiplier, the overlay and the debug view are set in the 
 | none | turns frame generation on and off | `FrameGenKey=0` |
 | F7 | cycles the multiplier | `MfgKey=118` |
 | none | turns the on-screen overlay off and on | `OsdKey=0` |
+| none | moves the on-screen overlay to the next corner | `OsdCornerKey=0` |
 | F8 | cycles the debug view | `ViewKey=119` |
 | F9 | test: cycles DLSS-G's motion input through each source, then zero motion | `InputKey=120` |
 | F10 | test: real depth, or a constant | `DepthKey=121` |

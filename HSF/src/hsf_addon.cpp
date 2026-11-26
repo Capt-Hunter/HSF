@@ -171,6 +171,7 @@ uint32_t g_vk_dlss_depth_since = 0;     // the read-back count from which Curren
 uint32_t g_mfg_key = VK_F7;   // HSF.ini MfgKey: virtual-key code that cycles DlssgFrames in game (0 = none)
 uint32_t g_fg_key = 0;        // HSF.ini FrameGenKey: turns frame generation (Extra) on and off in game (0 = none)
 uint32_t g_osd_key = 0;       // HSF.ini OsdKey: turns the on-screen overlay off, and back to the look it had (0 = none)
+uint32_t g_osd_corner_key = 0;  // HSF.ini OsdCornerKey: moves the shown overlay to the next corner, clockwise (0 = none)
 int g_overlay_last = 1;       // the overlay's look (1 simple, 2 advanced) to come back to when OsdKey turns it on again
 uint32_t g_ui_panel_rgb = hsf::ui::DEFAULT_PANEL_RGB;    // HSF.ini UiPanel: the menu and overlay panel colour, RRGGBB in hex
 uint32_t g_ui_accent_rgb = hsf::ui::DEFAULT_ACCENT_RGB;  // HSF.ini UiAccent: the corner bracket's colour, RRGGBB in hex
@@ -376,7 +377,7 @@ uint32_t MainMonitorHz() {
 // ---- HSF.ini ----
 // [HSF] Extra=0|1 (frame generation on), Motion=auto|uv|-uv|mvpx|-mvpx|px|-px,
 // Source=auto|launchpad|lumenite (an old "uplift" reads as auto), Overlay=0|1, DlssgFrames=1-5, MfgKey=<virtual-key code> (cycles DlssgFrames,
-// 118 = F7, 0 = none), FrameGenKey=<code> (Extra on/off, 0 = none), OsdKey=<code> (overlay off/on, 0 = none), FpsCap=<fps on screen, 0 = none>, GpuReserve=0|1 (default 1), ReflexBoost=0|1, GameQueue1=0|1, ReflexSleep=0|1, Score=0|1, ViewKey=<code> (119 = F8),
+// 118 = F7, 0 = none), FrameGenKey=<code> (Extra on/off, 0 = none), OsdKey=<code> (overlay off/on, 0 = none), OsdCornerKey=<code> (overlay to the next corner, 0 = none), FpsCap=<fps on screen, 0 = none>, GpuReserve=0|1 (default 1), ReflexBoost=0|1, GameQueue1=0|1, ReflexSleep=0|1, Score=0|1, ViewKey=<code> (119 = F8),
 // InputKey=<code> (120 = F9), Depth=0|1, Compose=0|1, DepthInverted=-1|0|1, DepthUpsideDown=-1|0|1, DepthKey=<code> (121 = F10). Re-read whenever the file's time stamp changes;
 // the panel writes it. With InGameDlssg=1: DlssgRebuildCamera=0|1, DlssgCameraKey=<code> (122 = F11, 0 = none), DlssgDynamicRes=0|1, DlssgCutCheck=0|1, DlssgQuickOff=0|1, DlssgScoreGuard=0|1, DlssgChecks=0|1, DlssgHud=0|1, DlssgHudWatch=0|1.
 
@@ -534,6 +535,8 @@ void SaveIni() {
   WritePrivateProfileStringW(L"HSF", L"FrameGenKey", key, g_ini_path);
   swprintf(key, std::size(key), L"%u", g_osd_key);
   WritePrivateProfileStringW(L"HSF", L"OsdKey", key, g_ini_path);
+  swprintf(key, std::size(key), L"%u", g_osd_corner_key);
+  WritePrivateProfileStringW(L"HSF", L"OsdCornerKey", key, g_ini_path);
   wchar_t rgb[8];
   swprintf(rgb, std::size(rgb), L"%06X", g_ui_panel_rgb & 0xFFFFFF);
   WritePrivateProfileStringW(L"HSF", L"UiPanel", rgb, g_ini_path);
@@ -642,6 +645,7 @@ void PollIni() {
   g_mfg_key = std::min<UINT>(GetPrivateProfileIntW(L"HSF", L"MfgKey", VK_F7, g_ini_path), 255);
   g_fg_key = std::min<UINT>(GetPrivateProfileIntW(L"HSF", L"FrameGenKey", 0, g_ini_path), 255);
   g_osd_key = std::min<UINT>(GetPrivateProfileIntW(L"HSF", L"OsdKey", 0, g_ini_path), 255);
+  g_osd_corner_key = std::min<UINT>(GetPrivateProfileIntW(L"HSF", L"OsdCornerKey", 0, g_ini_path), 255);
   {
     // UiPanel and UiAccent: RRGGBB in hex; anything else is the default colour.
     const auto read_rgb = [](const wchar_t* name, uint32_t fallback) {
@@ -730,7 +734,7 @@ void Log(const char* text) {
   reshade::log_message(reshade::log_level::info, line);
 }
 
-// FrameGenKey and OsdKey, called next to MfgKey on every route. Saved to HSF.ini like a panel change. A route can reach this twice in one
+// FrameGenKey, OsdKey and OsdCornerKey, called next to MfgKey on every route. Saved to HSF.ini like a panel change. A route can reach this twice in one
 // frame (ReShade's present event and the route's own frame), and a pressed key reads as pressed in both, so a second press within 150 ms
 // is the same press.
 void HandleToggleKeys(effect_runtime* runtime) {
@@ -748,6 +752,14 @@ void HandleToggleKeys(effect_runtime* runtime) {
   if (g_osd_key != 0 && runtime->is_key_pressed(g_osd_key)) {
     last = now;
     g_overlay_mode = g_overlay_mode != 0 ? 0 : g_overlay_last;
+    SaveIni();
+  }
+  // The overlay on screen (simple or advanced, each with its own place) goes round the corners clockwise. Nothing to move while it is off.
+  if (g_osd_corner_key != 0 && g_overlay_mode != 0 && runtime->is_key_pressed(g_osd_corner_key)) {
+    last = now;
+    static constexpr int NEXT_CORNER[4] = {1, 3, 0, 2};  // top left > top right > bottom right > bottom left
+    int& corner = g_overlay_look[g_overlay_mode == 2 ? 1 : 0].corner;
+    corner = NEXT_CORNER[std::clamp(corner, 0, 3)];
     SaveIni();
   }
 }
@@ -7208,7 +7220,7 @@ bool KeyBind(effect_runtime* runtime, const char* id, uint32_t* key) {
     if (vk == VK_ESCAPE) return false;
     *key = vk == VK_BACK ? 0 : vk;
     if (*key != 0) {
-      uint32_t* const others[] = {&g_mfg_key, &g_fg_key, &g_osd_key, &g_view_key, &g_input_key, &g_depth_key, &g_record_key,
+      uint32_t* const others[] = {&g_mfg_key, &g_fg_key, &g_osd_key, &g_osd_corner_key, &g_view_key, &g_input_key, &g_depth_key, &g_record_key,
 #ifdef HSF_SL_GAME
                                   &g_sl_camera_key,
 #endif
@@ -8197,6 +8209,8 @@ void DrawPanel(effect_runtime* runtime) {
     if (mod_sets_multiplier) ui::RightNote("> SET BY MFG-UNLOCKER", c::FAINT);
     ui::SettingLabel("OVERLAY ON / OFF");
     if (KeyBind(runtime, "##OsdKey", &g_osd_key)) changed = true;
+    ui::SettingLabel("OVERLAY CORNER");
+    if (KeyBind(runtime, "##OsdCornerKey", &g_osd_corner_key)) changed = true;
     if (!now.d3d12) {
       ui::SettingLabel("DEBUG VIEW");
       if (KeyBind(runtime, "##ViewKey", &g_view_key)) changed = true;

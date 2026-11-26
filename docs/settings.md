@@ -24,6 +24,7 @@ Older files may still have `Presenter`, `Generated` and `Pacing`. They belonged 
 | `MfgKey` | `118` (F7) | key code, 0 = none | Live | All | Cycles `DlssgFrames` in game. Set in the menu's KEYBINDS section. |
 | `FrameGenKey` | `0` (none) | key code, 0 = none | Live | All | Turns frame generation (`Extra`) on and off in game. Set in KEYBINDS. |
 | `OsdKey` | `0` (none) | key code, 0 = none | Live | All | Turns the on-screen overlay off, and back to the look it had (`Overlay` 1 or 2). Set in KEYBINDS. |
+| `OsdCornerKey` | `0` (none) | key code, 0 = none | Live | All | Moves the overlay on screen to the next corner, clockwise. Simple and advanced each keep their own corner. Set in KEYBINDS. |
 | `Overlay` | `1` | 0 off, 1 simple, 2 advanced | Live | All | The on-screen overlay. |
 | `UiPanel` | `141C17` | RRGGBB in hex | Live | All | The menu's and overlay's panel colour; its border and lines follow it. Set in the menu's COLOURS section. |
 | `UiAccent` | `FF6E28` | RRGGBB in hex | Live | All | The corner mark's colour. Set in COLOURS. |
