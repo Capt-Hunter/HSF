@@ -81,6 +81,18 @@ A game that calls DLSS through NGX, without Streamline, hands the driver's `_nvn
 
 Depth in D24 or D16 cannot be copied into R32_FLOAT (it is not in the same copy family). A small shader reads it as UNORM and writes R32_FLOAT instead, so these games get their real depth and not flow. `ngx_call.h` holds the one reading of a DLSS call (the part in use, scale, jitter, flags, reset) that the D3D12, D3D11 and Vulkan hooks share.
 
+### 3.4 XeMFG, the second engine (`xmx.cpp`, `xmx_model.cpp`, `lzma_dec.cpp`)
+
+EXPERIMENTAL, picked with `FgEngine=xemfg` and read once at start. Intel's XeSS frame generation makes the generated frames inside DLSS-G's own evaluate call in `nvngx_dlssg.dll`, so DLSS-G still presents, paces and runs Reflex, and every route that feeds DLSS-G (in game, bring-in, and the helper for D3D11, DX9, 32-bit and Vulkan games) gets the engine through one hook. The hook goes in only after a preflight: `libxess_fg.dll` 1.3.1.78 and `libxell.dll` must be in `HSF_streamline` (or next to `HSF.ini`), of that exact build. Anything else means no hook and plain DLSS-G, with the reason in the menu and the log. Once hooked, a frame XeFG cannot make repeats the real one, so the picture never goes black.
+
+Intel's own model makes 2x. `xmx_model.cpp` sets up the multi-frame model (3x to 6x) inside `libxess_fg.dll` before XeFG's first context, at fixed addresses that are checked byte for byte first. Its 54 shader programs are derived from Intel's, so HSF never ships them: it reads them, without loading any code, from the player's own MFGAdaUnlock RenoDX add-on or MFG-Unlocker 1.7.1 or newer (which packs them with LZMA, hence `lzma_dec.cpp`), and matches each by SHA-256. A model another mod already set up is used as it is.
+
+Ported from MFGAdaUnlock-RenoDx by ImDreamt (MIT), whose model set-up came from dashdogy's MFG-Unlocker (MIT). HSF uses its own hook patcher (`hook_patch.cpp`) in place of Detours.
+
+### 3.5 Alongside ReLimiter
+
+ReLimiter hooks NVIDIA's NGX only as it starts, which on the bring-in route is before Streamline has loaded it, so HSF loads `_nvngx.dll` early when ReLimiter is next to the add-on (`SlPreloadNgx`). On the helper route DLSS-G runs in the helper, where ReLimiter cannot see the multiplier, so the game side states it each frame through NvAPI's `NvAPI_D3D_SetReflexSync` on the game's device (`dlssg_remote.cpp`): the driver refuses the call, and only ReLimiter's hook reads it. ReLimiter copies a swap chain's method table to control VSync; the FP16 path (`fp16_swap.cpp`) therefore hooks Streamline's class table too, and matches such copies to it by the class locator at index -1. On the bring-in route ReLimiter itself also needs two fixes (its proxy check and DLSS-G's worker Presents under Streamline); they are in its own code, not HSF's.
+
 ## 4. The D3D11 and DX9 routes
 
 ### 4.1 The helper (`dlssg_remote.cpp`, `dlssg_helper.cpp`, `dlssg_link.h`, `dlssg_core.*`)

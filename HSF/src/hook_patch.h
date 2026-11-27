@@ -36,8 +36,14 @@ uint8_t* NearSlot(const uint8_t* target);
 void WriteAbsoluteJump(uint8_t* at, const void* to);
 // Code still mapped at this address. A module that has been unloaded leaves free memory behind.
 bool CodeStillThere(const void* address);
-// The 8-byte address in a relay's absolute jump, written in one go.
+// The 8-byte address in a relay's absolute jump, written in one go. The page may be read-only (a module's own): it is made writable for the write.
 void PointRelay(uint8_t* relay, const void* to);
+// Free bytes in the module that holds `inside`: after the code of one of its executable sections, before that section's last page ends. The loader maps and zeroes them, and no
+// code uses them. Code put there belongs to that module, for tools that look up which module a function is in, and goes away with it. Only bytes still all 0 or int3, with 16
+// spare before them, are taken; the address leaves an absolute jump's 8-byte address (at +6) on an 8-byte boundary. Null when no section has room.
+uint8_t* ModuleCave(const void* inside, size_t bytes);
+// Writes bytes into code that may be read-only (a module's own pages), then flushes the instruction cache.
+bool WriteCode(uint8_t* at, const void* bytes, size_t size);
 
 // Hooks target with hook.hook; *hook.real gets what calls the original. Messages go to log (may be null). The caller keeps hook; the patcher's lock guards its patching.
 bool Install(Hook& hook, uint8_t* target, Log log);

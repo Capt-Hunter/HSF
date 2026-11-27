@@ -17,8 +17,10 @@ using LineFn = void (*)(const char* format, ...);
 bool Rewrite(DXGI_FORMAT& format);
 
 // After the swap chain is made. `game` is the one the game holds, `made` Streamline's (the same with no wrapper), `queue` the queue the game
-// passed and `real_queue` the same under any wrapper. The swap chains are not held.
-void Start(IUnknown* game, IUnknown* made, IUnknown* queue, IUnknown* real_queue, LineFn line);
+// passed and `real_queue` the same under any wrapper. The swap chains are not held. `made_class_table` is the method table Streamline's swap
+// chain had when it was made: another add-on (ReLimiter's VSync control) may since have put a copy of it on the object, and may put a new copy
+// on it at any resize; HSF hooks the class table too, so every copy made from it later carries HSF's methods.
+void Start(IUnknown* game, IUnknown* made, IUnknown* queue, IUnknown* real_queue, LineFn line, void* made_class_table = nullptr);
 
 // The game presents `game`: the FP16 frame goes into the real back buffer first.
 void BeforePresent(IUnknown* game);

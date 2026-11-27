@@ -12,6 +12,7 @@
 #include "dlssg_link.h"
 #include "hsf_log.h"
 #include "version.h"
+#include "xmx.h"
 
 #include <windows.h>
 
@@ -284,6 +285,16 @@ class HelperHost final : public core::Host {
   uint32_t Frames() override { return static_cast<uint32_t>(std::max<int32_t>(1, static_cast<int32_t>(g_b->frames))); }
   void AfterPresent(UINT64 id) override {
     g_presented = true;
+    // XeMFG's status for the add-on's menu, once a second (link version 15).
+    static ULONGLONG xmx_written = 0;
+    if (const ULONGLONG now = GetTickCount64(); now - xmx_written >= 1000) {
+      xmx_written = now;
+      const hsf::xmx::Status s = hsf::xmx::Snapshot();
+      memcpy(g_b->xmx_failure, s.failure, sizeof(g_b->xmx_failure));
+      memcpy(g_b->xmx_model, s.model, sizeof(g_b->xmx_model));
+      g_b->xmx_max_frames = static_cast<int32_t>(s.max_frames);
+      g_b->xmx_flags = (s.wanted ? 1 : 0) | (s.preflight ? 2 : 0) | (s.hooked > 0 ? 4 : 0) | (s.generating ? 8 : 0) | (s.published ? 16 : 0) | 32;
+    }
     NoteLatency(InterlockedExchange64(&g_b->slot_start[id % RING], 0));
   }
   void CountFrame(const sl::DLSSGState& state, bool motion, bool on) override {
@@ -367,6 +378,11 @@ int wmain(int argc, wchar_t** argv) {
   const wchar_t* const game_log = hsf::hsflog::PathFromEnvironment(false);
   core::OpenLog(game_log != nullptr ? game_log : (g_folder.substr(0, g_folder.find_last_of(L'\\')) + L"\\HSF.log").c_str());
   Log("HSF DLSS-G helper " HSF_VERSION " (64-bit), pid %lu", GetCurrentProcessId());
+  {
+    // FgEngine (EXPERIMENTAL XeMFG, xmx.h) from the game's HSF.ini, beside this exe's folder; the Intel files are looked for there too.
+    const std::wstring game_folder = g_folder.substr(0, g_folder.find_last_of(L'\\'));
+    hsf::xmx::Configure(hsf::xmx::WantedFromIni((game_folder + L"\\HSF.ini").c_str()), game_folder.c_str(), [](const char* text) { Log("%s", text); });
+  }
   const bool system_dxgi = LoadSystemGraphicsDlls();
   if (argc < 2) {
     Log("no shared block named on the command line");

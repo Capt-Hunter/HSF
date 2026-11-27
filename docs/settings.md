@@ -19,7 +19,8 @@ Older files may still have `Presenter`, `Generated` and `Pacing`. They belonged 
 | Key | Default | Values | When | Route | What it does |
 |---|---|---|---|---|---|
 | `Extra` | `1` | 0, 1 | Live | All | The menu's FRAME GEN. 0 shows real frames only. |
-| `DlssgFrames` | `1` | 1 to 5 | Live | All | Generated frames per real frame: 1 = 2x, up to 5 = 6x. The active provider reports its cap. Apex supports up to 3x. |
+| `FgEngine` | `dlssg` | `dlssg`, `xemfg` | Start | All | The menu's FG ENGINE. `dlssg` is NVIDIA's own frame generation. `xemfg` is EXPERIMENTAL: Intel's XeSS frame generation makes the frames inside DLSS-G, so DLSS-G still presents, paces and runs Reflex. It needs `libxess_fg.dll` 1.3.1.78 and `libxell.dll` in `HSF_streamline` (or next to `HSF.ini`). 3x to 6x also needs MFGAdaUnlock's RenoDX add-on or MFG-Unlocker 1.7.1 or newer: loaded in the game, next to its exe, or in `HSF_streamline\mods`. When a file is missing or of another build, HSF runs plain DLSS-G and the menu says why. |
+| `DlssgFrames` | `1` | 1 to 5 | Live | All | Generated frames per real frame: 1 = 2x, up to 5 = 6x. It is capped to what DLSS-G reports this GPU can do. |
 | `MfgKey` | `118` (F7) | key code, 0 = none | Live | All | Cycles `DlssgFrames` in game. Set in the menu's KEYBINDS section. |
 | `FrameGenKey` | `0` (none) | key code, 0 = none | Live | All | Turns frame generation (`Extra`) on and off in game. Set in KEYBINDS. |
 | `OsdKey` | `0` (none) | key code, 0 = none | Live | All | Turns the on-screen overlay off, and back to the look it had (`Overlay` 1 or 2). Set in KEYBINDS. |
@@ -64,19 +65,20 @@ Older files may still have `Presenter`, `Generated` and `Pacing`. They belonged 
 |---|---|---|---|---|---|
 | `InGameDlssg` | not set | 0, 1, 2 | Start; HSF writes 2 | D3D12-G | Runs DLSS-G inside a game that ships Streamline 2.x. Once D3D12 has shown more frames than D3D11 (at least 300), HSF writes 2 if the game's `sl.interposer.dll` is loaded. A run that is mostly D3D11 takes 1 or 2 out again. 0 by hand keeps it off for good. |
 | `SlBringIn` | not set | 0, 1, 2 | Start; HSF writes 2 | D3D12-B | Starts HSF's own Streamline 2.14 (from `HSF_streamline`) in a D3D12 game without one. 2 means HSF wrote it (once D3D12 has shown more frames than D3D11), and a later run that is mostly D3D11 takes it out again. 1 is set by hand and stays. 0 keeps it off for good. |
-| `FrameGenerationBackend` | `NVIDIA` | NVIDIA, Apex | Start | D3D12-B | The BACKEND menu selects a provider for the next launch. Apex requires HSF's bring-in route and native FP16 scRGB. |
-| `ApexAllowTearing` | `0` | 0, 1 | Start | D3D12-B | Allow Apex to pace VSync-off presents on a tearing-capable waitable swap chain with maximum frame latency 1 or 2. |
-| `ApexDebug` | `0` | 0, 1 | Start | D3D12-B | Sample Apex input, motion scale and evaluation diagnostics in `HSF.log`. |
-| `ApexRequestFlow` | `0` | 0, 1 | Start | D3D12-B | Let HSF request LaunchPad optical flow when the preset does not already supply it. |
-| `ApexAllowUnboundDepth` | `0` | 0, 1 | Start | D3D12-B | Compatibility option for HSF's depth copy without a bound game depth source. Use bound depth when available. |
+| `FrameGenerationBackend` | `NVIDIA` | NVIDIA, Apex | Start | D3D12-B | The BACKEND row selects the native FP16 Apex provider or HSF's DLSS-G / XeMFG route. |
+| `ApexAllowTearing` | `0` | 0, 1 | Start | D3D12-B (Apex) | Allow VSync-off pacing on a tearing-capable waitable swap chain with maximum frame latency 1 or 2. |
+| `ApexDebug` | `0` | 0, 1 | Start | D3D12-B (Apex) | Sample extra provider, motion and input diagnostics in HSF.log. |
+| `ApexRequestFlow` | `0` | 0, 1 | Start | D3D12-B (Apex) | Let HSF request LaunchPad flow if the preset does not already supply it. |
+| `ApexAllowUnboundDepth` | `0` | 0, 1 | Start | D3D12-B (Apex) | Compatibility opt-in for HSF's depth copy without a game depth binding. |
 | `SlUseOwn` | not set | 1 | Start; the menu writes it | D3D12-G | The menu's USE HSF'S STREAMLINE, for a game whose own Streamline never brings DLSS-G (some load it for Reflex only). On writes `SlBringIn=2` and `SlNgxPath` and removes `InGameDlssg`; off writes `InGameDlssg=2` and removes `SlBringIn`. HSF warns in the menu when the game's Streamline answers that DLSS-G is not loaded while this PC can run it, but never switches by itself. |
 | `StreamlineProbe` | `0` | 0, 1 | Start | D3D12-G | Hooks the game's Streamline and logs what it sends (`HSF.log`), changing nothing. |
-| `NgxInput` | `1` | 0, 1 | Start | D3D12-B | Takes the game's own DLSS data (motion, depth, jitter, reset) from its NGX calls, in games with DLSS but no Streamline. Defaults to 0 on the Apex route. |
+| `NgxInput` | `1` | 0, 1 | Start | D3D12-B | Takes the game's own DLSS data (motion, depth, jitter, reset) from its NGX calls, in games with DLSS but no Streamline. |
 | `SlLog` | `0` | 0, 1 | Start | D3D12-B | Streamline's own logging. It crashed Jusant, so it is off by default. |
 | `SlFactoryProxy` | `1` | 0, 1 | Start | D3D12-B | Makes the swap chain through Streamline's factory proxy. Needed with ShortFuse's NR mod. |
 | `SlManualHooking` | `0` | 0, 1 | Start | D3D12-B | Streamline's manual hooking mode, for games that crash while Streamline starts. |
 | `SlEarlyLoad` | `1` | 0, 1 | Start | D3D12-B | Loads `sl.interposer.dll` when HSF loads, before `slInit`, so add-ons that look for Streamline at start-up find it (RenoDX DLSS picks its Present hook then). |
 | `SlNgxPath` | empty | a folder | Start | D3D12-B | Folder of the game's own `nvngx_dlss.dll`, given to Streamline after `HSF_streamline`. Streamline starts NGX before the game does, with only its plugin folders to find DLSS in, so a game that runs DLSS through NGX (Unreal's DLSS plugin) otherwise finds no DLSS and hides it. HSF writes it when it picks this route in a game with DLSS loaded, or after its own search of the game folder (a copy the game has loaded comes first; with several copies the newest). `none:` plus a time means the search found none; it searches again when the game's exe changes. Empty = search at the next start. |
+| `SlPreloadNgx` | `1` | 0, 1 | Start | D3D12-B | When ReLimiter (`relimiter.addon64`) sits next to HSF, HSF loads the driver's `_nvngx.dll` as it loads, because ReLimiter hooks NGX only as it starts and would otherwise never see DLSS-G. Streamline loads the same file later, so nothing is loaded twice. 0 turns this off. |
 | `SlRouteDlssg` | `-1` | -1, 0, 1 | Start | D3D12-B | DLSS-G's own calls on ReShade's D3D12 device go to the game's native device. -1 = on only when a RenoDX HDR mod is loaded (the RenoDX DLSS NR mods, `renodx-dlss*`, do not count), 0 = never, 1 = always. |
 | `DlssgRebuildCamera` | `1` | 0, 1 | Live | D3D12-G | DLSS-G gets `clipToPrevClip` and `prevClipToClip` rebuilt by HSF from the camera, not the game's. |
 | `DlssgCameraKey` | `122` (F11) | key code, 0 = none | Live | D3D12-G | Flips `DlssgRebuildCamera` in game. |

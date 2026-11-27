@@ -11,13 +11,23 @@ A ReShade add-on. Up to 6x. DirectX 9, 11, 12 and Vulkan. 32-bit and 64-bit. SDR
 </p>
 
 <p align="center">
-  <a href="docs/images/hsf-main.png"><img src="docs/images/hsf-main.png" width="32%" alt="HSF 0.9.9 at a glance: hardware, features, install steps, known issues, bug report"></a>
-  <a href="docs/images/hsf-patch.png"><img src="docs/images/hsf-patch.png" width="32%" alt="HSF 0.9.9 patch notes: scRGB HDR, real depth, Vulkan motion, keybinds, colour themes and fixes"></a>
-  <a href="docs/images/hsf-roadmap.png"><img src="docs/images/hsf-roadmap.png" width="32%" alt="HSF roadmap: what comes in the next update and after"></a>
+  <a href="docs/images/hsf-main-0.10.png"><img src="docs/images/hsf-main-0.10.png" width="32%" alt="HSF 0.10 at a glance: hardware, features, FG engine, install steps, known issues, bug report"></a>
+  <a href="docs/images/hsf-patch-0.10.png"><img src="docs/images/hsf-patch-0.10.png" width="32%" alt="HSF 0.10 patch notes: XeMFG, ReLimiter and REFramework support, MFG-Unlocker and no-depth warnings, and fixes"></a>
+  <a href="docs/images/hsf-roadmap-0.10.png"><img src="docs/images/hsf-roadmap-0.10.png" width="32%" alt="HSF roadmap: what comes in the next update and after"></a>
 </p>
 <p align="center"><sub>Click a card to see it full size.</sub></p>
 
-> **Status:** preview (0.9.9). HSF runs in a wide range of games across DX9, DX11, DX12 and Vulkan, from old 32-bit titles to path-traced ones, and in PS3 and PS5 emulators. If a game misbehaves, send the log: see [troubleshooting](docs/troubleshooting.md).
+> **Status:** preview (0.10). HSF runs in a wide range of games across DX9, DX11, DX12 and Vulkan, from old 32-bit titles to path-traced ones, and in PS3 and PS5 emulators. If a game misbehaves, send the log: see [troubleshooting](docs/troubleshooting.md).
+
+## New in 0.10
+
+- **XeMFG, a second frame generation engine (EXPERIMENTAL).** Intel's XeSS frame generation makes the frames inside DLSS-G, and DLSS-G still presents, paces and runs Reflex. It works on every route, 2x to 6x. Pick it in the new FG ENGINE row and restart the game. Intel's files now ship in the zip, in `HSF_streamline`. 3x to 6x also need MFG-Unlocker or MFGAdaUnlock's RenoDX add-on.
+- **ReLimiter support.** HSF works with [ReLimiter](https://github.com/RankFTW/ReLimiter) on every route, the helper route included. ReLimiter sees the generated frames and paces them.
+- **REFramework support.** Games with REFramework no longer hang on a black screen at start. Use a current REFramework nightly.
+- **MFG-Unlocker warning on RTX 20 and 30.** When it is missing or not loaded, the menu, the overlay and the DLSS finder say so in red and tell you what to do.
+- **Follows MFG-Unlocker's multiplier.** HSF uses the multiplier MFG-Unlocker sets, with no extra toggle.
+- **No-depth warning.** When ReShade's Generic Depth add-on is switched off, the menu and the overlay say so in red and tell you how to turn it back on.
+- **Fixes.** Motion stays right when the game's DLSS drops its render size. FP16 HDR games with ReLimiter no longer go black. HDR colours no longer drift back to SDR. Games where HSF brings its own Streamline no longer crash on exit with MFG-Unlocker. The menu says so when a game's own Streamline has no DLSS-G.
 
 ## What you get
 
@@ -26,10 +36,11 @@ A ReShade add-on. Up to 6x. DirectX 9, 11, 12 and Vulkan. 32-bit and 64-bit. SDR
 - **HDR stays HDR.** HDR10 goes to DLSS-G as HDR10, and FP16 (scRGB) is turned into HDR10. No setting needed.
 - **The best motion it can find.** When a game runs DLSS, HSF uses the game's own motion vectors and depth. In DirectX 11 games that a [Luma](https://github.com/Filoppi/Luma-Framework) mod adds DLSS to, it reads what Luma hands to DLSS. Every other game gets optical flow from a ReShade effect, which HSF combines with the game's depth and cleans up.
 - **Its own menu.** A tab in ReShade for the multiplier, FPS cap, Reflex, motion source, HUD protection and two overlays.
+- **A second engine, EXPERIMENTAL.** XeMFG runs Intel's XeSS frame generation inside DLSS-G, on every route. Intel's files come with the zip; see the [user guide](docs/user-guide.md).
 
 ## What you need
 
-- An NVIDIA RTX GPU and a current driver. RTX 50 cards get up to 6x. On older RTX cards, MFG-Unlocker (installed separately; HSF never ships it) can add more.
+- An NVIDIA RTX GPU and a current driver. RTX 50 cards get up to 6x. On older RTX cards, MFG-Unlocker (installed separately; HSF never ships it) can add more. In DirectX 12 games it loads only when named `version.dll`.
 - ReShade 6.8 with **full add-on support** (DirectX 9 needs 6.5 or newer).
 - For games without DLSS: a flow source, iMMERSE LaunchPad or LumeniteFX Kernel (with its `include` folder). Download it yourself from its official page.
 - A single-player game. **Never use HSF in games with online anti-cheat.**
@@ -46,7 +57,7 @@ Download the latest `HSF-<version>.zip` from [Releases](https://github.com/Capt-
 
 1. Install ReShade with full add-on support into `<game>`.
 2. Copy `hsf.addon64` (64-bit game) or `hsf.addon32` (32-bit game) into `<game>`.
-3. Copy the `HSF_streamline` folder into `<game>`. 32-bit games need it too.
+3. Copy the `HSF_streamline` folder into `<game>`. 32-bit games need it too. It also holds Intel's files for XeMFG.
 4. Copy the `reshade-shaders` folder into `<game>`. It adds `HSF.fx`.
 5. Copy `HSF.ini` into `<game>`, replacing any old one.
 6. Start the game, open ReShade and go to the **HSF** tab. Turn FRAME GEN on.
@@ -132,6 +143,8 @@ Pull requests and bug reports are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md
 - kibblerz and [DLSS5 ReShade AIO](https://github.com/kibblerz/DLSS5-Reshade-AIO) (Apache-2.0): the NVIDIA Optical Flow motion source is ported from it.
 - BarbatosAWLS and [AeonSR](https://github.com/BarbatosAWLS/AeonSR) (MIT): the Vulkan route presents from a window of its own, as AeonSR does.
 - Pumbo (Filoppi) and [Luma](https://github.com/Filoppi/Luma-Framework): HSF reads the motion and depth Luma mods hand to DLSS. No Luma code is used.
+- ImDreamt and MFGAdaUnlock-RenoDx (MIT): XeMFG's hook, generator and 3x to 6x model set-up are ported from it.
+- dashdogy and MFG-Unlocker (MIT): the 3x to 6x model set-up XeMFG uses started there.
 - RankFTW and [RHI](https://github.com/RankFTW/RHI), for bringing HSF to RHI's players.
 - [ghostinthecamera](https://github.com/ghostinthecamera/GITC-Uplift), for all of the help along the way.
 - A special thanks to [RankFTW](https://github.com/RankFTW), who helped a great deal: testing, finding bugs, the bring-in route fixes, and bringing HSF to RHI. HSF is much better for it.

@@ -17,6 +17,10 @@ struct StartOptions {
   bool factory_proxy = true;   // SlFactoryProxy=0: Streamline changes the DXGI factory's method table instead of wrapping it. On by default: with RenoDX DLSS, a swap chain made the other way came back as plain DXGI and DLSS-G showed no frames (Jusant)
   bool manual_hooking = false; // SlManualHooking=1: Streamline hooks nothing itself, and HSF upgrades the factory, as OptiScaler does
   bool early_load = true;      // SlEarlyLoad=0: load sl.interposer.dll only with the first device, as before
+  // The add-on sets it when ReLimiter sits next to HSF (SlPreloadNgx=0 turns it off): the driver's _nvngx.dll is loaded as HSF loads, with sl.interposer.dll.
+  // ReLimiter hooks NGX only as it starts in its Streamline mode, and its later tries run only with its OSD on; without NGX it never sees DLSS-G made and
+  // never trusts that frame generation runs. Streamline loads the same file from the same folder a few seconds later, so nothing is loaded twice.
+  bool preload_ngx = false;
   // SlNgxPath=<folder>: where the game's own nvngx_dlss.dll lives. Streamline starts NGX with only its plugin folders to look in, and the game's own DLSS
   // (Unreal's plugin and others that call NGX directly) then finds no DLSS and hides it. Empty: HSF looks for the game's copy under the game folder.
   // "none:<exe write time>": an earlier search found none, so it is not searched again until the exe changes.
@@ -77,6 +81,8 @@ void Stop(bool process_exiting);
 // The process is exiting and its threads still run: called from the add-on's exit hook, before Windows unloads any DLL. If HSF started Streamline in this
 // process, it is shut down now; left up, DLSS-G ends the process with a fail fast (0xC0000409) while the DLLs unload. Afterwards nothing more goes to
 // Streamline and Present on the game's swap chain does nothing. Once only.
+// True while ShutdownForExit still has a Streamline to shut down.
+bool NeedsExitShutdown();
 void ShutdownForExit();
 
 struct Stats {

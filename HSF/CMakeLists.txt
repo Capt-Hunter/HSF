@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.23)
-project(hsf VERSION 0.9.9 LANGUAGES C CXX)
+project(hsf VERSION 0.10 LANGUAGES C CXX)
 
 # HSF (Hunter's Sloppy Frames) by Capt-Hunter. DLSS Frame Generation for ReShade.
 # One ReShade add-on, built twice: a 32-bit configure makes hsf.addon32, a 64-bit one makes hsf.addon64. See ../docs/.
@@ -43,18 +43,21 @@ else()
   # NVIDIA Optical Flow SDK 5.0 interface headers (NVIDIA's permissive licence, in each file). The engine itself is the driver's nvofapi64.dll.
   set(HSF_NGX_HEADERS "${HSF_STREAMLINE}/external/ngx-sdk/include")
   set(HSF_NVOF "${CMAKE_SOURCE_DIR}/third_party/nvof")
-  target_sources(hsf_addon PRIVATE src/compose.cpp src/frame_checks.cpp src/sl_game.cpp src/hook_patch.cpp src/sl_bring.cpp src/apex_fg.cpp src/fp16_swap.cpp src/hdr_out.cpp src/debug_view.cpp src/depth_fit.cpp src/ngx_input.cpp src/ngx_vk.cpp src/nvof_flow.cpp)
+  target_sources(hsf_addon PRIVATE src/compose.cpp src/frame_checks.cpp src/sl_game.cpp src/hook_patch.cpp src/sl_bring.cpp src/apex_fg.cpp src/fp16_swap.cpp src/hdr_out.cpp src/debug_view.cpp src/depth_fit.cpp src/ngx_input.cpp src/ngx_vk.cpp src/nvof_flow.cpp src/xmx.cpp src/xmx_model.cpp src/lzma_dec.cpp)
   target_compile_definitions(hsf_addon PRIVATE HSF_SL_GAME)
   target_include_directories(hsf_addon SYSTEM PRIVATE "${HSF_STREAMLINE}/include" "${HSF_NGX_HEADERS}" "${HSF_NVOF}")
   target_link_libraries(hsf_addon PRIVATE "${HSF_STREAMLINE}/lib/x64/sl.interposer.lib" delayimp version)
   target_link_options(hsf_addon PRIVATE "/DELAYLOAD:sl.interposer.dll")
   # DLSS-G for D3D11 and DX9 games: this 64-bit helper runs next to Streamline's DLLs in <game>\HSF_streamline; the add-on starts it
   # (dlssg_remote.cpp, dlssg_link.h). A Windows-subsystem exe, so no console window ever takes the foreground (DLSS-G stops without focus).
-  add_executable(hsf_dlssg_helper WIN32 src/dlssg_helper.cpp src/dlssg_core.cpp src/hsf_log.cpp src/hdr_out.cpp src/compose.cpp src/frame_checks.cpp src/nvof_flow.cpp)
+  add_executable(hsf_dlssg_helper WIN32 src/dlssg_helper.cpp src/dlssg_core.cpp src/hsf_log.cpp src/hdr_out.cpp src/compose.cpp src/frame_checks.cpp src/nvof_flow.cpp
+                 src/xmx.cpp src/xmx_model.cpp src/lzma_dec.cpp src/hook_patch.cpp src/safe_try.cpp)
   set_target_properties(hsf_dlssg_helper PROPERTIES OUTPUT_NAME "hsf-dlssg-helper64")
   target_include_directories(hsf_dlssg_helper SYSTEM PRIVATE "${HSF_STREAMLINE}/include" "${HSF_NVOF}")
-  target_link_libraries(hsf_dlssg_helper PRIVATE d3d12 dxgi d3dcompiler "${HSF_STREAMLINE}/lib/x64/sl.interposer.lib" delayimp version)
+  target_link_libraries(hsf_dlssg_helper PRIVATE d3d12 dxgi d3dcompiler "${HSF_STREAMLINE}/lib/x64/sl.interposer.lib" delayimp version hsf_minhook)
   target_link_options(hsf_dlssg_helper PRIVATE "/ENTRY:wmainCRTStartup" "/DELAYLOAD:sl.interposer.dll")
+  # Offline check that XeMFG finds its 54 programs in either mod's file (build\x64\xmx_programs_test.exe <file>...).
+  add_executable(xmx_programs_test tests/xmx_programs_test.cpp src/lzma_dec.cpp)
   # Offline test of the compose pass, no game needed (buildd\compose_test.exe).
   add_executable(compose_test tests/compose_test.cpp src/compose.cpp src/frame_checks.cpp)
   target_link_libraries(compose_test PRIVATE d3d12 dxgi d3dcompiler)
@@ -74,9 +77,9 @@ else()
   add_dependencies(sl_copies_test fake_interposer)
   # Offline test of the frame checks, no game needed.
   # A small program with no Streamline of its own: HSF must bring Streamline to it. Needs a folder with Streamline's DLLs and a GPU.
-  add_executable(sl_bring_test tests/sl_bring_test.cpp src/sl_bring.cpp src/apex_fg.cpp src/fp16_swap.cpp src/hdr_out.cpp src/hsf_log.cpp src/debug_view.cpp src/depth_fit.cpp src/compose.cpp src/frame_checks.cpp src/nvof_flow.cpp)
+  add_executable(sl_bring_test tests/sl_bring_test.cpp src/sl_bring.cpp src/apex_fg.cpp src/fp16_swap.cpp src/hdr_out.cpp src/hsf_log.cpp src/debug_view.cpp src/depth_fit.cpp src/compose.cpp src/frame_checks.cpp src/nvof_flow.cpp src/hook_patch.cpp src/safe_try.cpp)
   target_include_directories(sl_bring_test SYSTEM PRIVATE "${HSF_STREAMLINE}/include" "${HSF_NGX_HEADERS}" "${HSF_NVOF}")
-  target_link_libraries(sl_bring_test PRIVATE d3d12 dxgi d3dcompiler)
+  target_link_libraries(sl_bring_test PRIVATE d3d12 dxgi d3dcompiler hsf_minhook)
   target_link_options(sl_bring_test PRIVATE "/ENTRY:wmainCRTStartup")
 
   add_executable(apex_pixels_test tests/apex_pixels_test.cpp src/apex_fg.cpp src/hsf_log.cpp)
@@ -163,6 +166,7 @@ add_executable(gpu_reserve_test tests/gpu_reserve_test.cpp)
 # Offline test of the LaunchPad tune button's choices (build\<arch>\launchpad_tune_test.exe).
 add_executable(launchpad_tune_test tests/launchpad_tune_test.cpp)
 # Offline test of the safe-try marks (build\<arch>\safe_try_test.exe).
+add_executable(lzma_test tests/lzma_test.cpp src/lzma_dec.cpp)
 add_executable(safe_try_test tests/safe_try_test.cpp src/safe_try.cpp)
 # Offline test of HSF.log: fresh per game run, appends for reloads and the helper, whole lines from many threads (build\<arch>\hsf_log_test.exe).
 add_executable(hsf_log_test tests/hsf_log_test.cpp src/hsf_log.cpp)

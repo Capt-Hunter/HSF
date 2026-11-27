@@ -3,7 +3,7 @@
 ## 1. What you need to build
 
 - Windows 11, with Visual Studio 18 (C++ desktop workload). `build.cmd` uses its developer environment, CMake 3.23 or newer, and Ninja.
-- The Streamline SDK 2.14 in a `Streamline SDK` folder next to the `HSF` folder (CMake reads `../Streamline SDK`). It is not in the repo. Keep `include/`, `lib/x64/sl.interposer.lib` and `bin/x64/*.dll`. The Apex adapter also uses `external/ngx-sdk/include/` from Streamline 2.14.16.
+- The Streamline SDK 2.14 in a `Streamline SDK` folder next to the `HSF` folder (CMake reads `../Streamline SDK`). It is not in the repo. Only `include/`, `lib/x64/sl.interposer.lib` and `bin/x64/*.dll` are used.
 - Everything else is in the repo: the ReShade v6.0.0 add-on headers and the matching ImGui headers, under `HSF/third_party`.
 
 ## 2. Build

@@ -175,6 +175,7 @@ struct Presenter {
   uint32_t cuts_unlogged = 0;
   // The DLSS-G options last set.
   bool options_set = false, last_on = false;
+  ULONGLONG options_sent = 0;  // when the options last went to DLSS-G (GetTickCount64)
   uint32_t last_frames = 0;
   bool last_ui = false;
   // GPU guard: Streamline's GPU fence time-outs seen, how many in the current window, and whether DLSS-G is held off for them.

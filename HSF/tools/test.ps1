@@ -43,7 +43,7 @@ function RunTest($exe, $testArgs, $log) {
 foreach ($arch in $arches) {
   # Only the tests CMakeLists.txt still builds: an old exe left in the build folder is not run.
   $tests = @(Get-ChildItem "$root\build\$arch\*_test.exe" -ErrorAction SilentlyContinue |
-    Where-Object { $_.BaseName -in $built -and $_.Name -ne 'helper_exit_test.exe' } | Sort-Object Name)
+    Where-Object { $_.BaseName -in $built -and $_.Name -notin @('helper_exit_test.exe', 'xmx_programs_test.exe') } | Sort-Object Name)
   if ($tests.Count -eq 0) { Report "$arch (no tests)" $false "run tools\build.cmd $arch"; continue }
   foreach ($exe in $tests) {
     $name = "$arch\$($exe.BaseName)"

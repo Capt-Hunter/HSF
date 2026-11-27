@@ -29,6 +29,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include "apex_fg.h"
 #include "compose.h"
@@ -36,6 +37,7 @@
 #include "depth_fit.h"
 #include "fp16_swap.h"
 #include "frame_checks.h"
+#include "hook_patch.h"
 #include "nvof_flow.h"
 
 namespace hsf::slbring {
@@ -831,8 +833,26 @@ void BeginFrame(bool sleep) {
 
 // ---- DLSS-G's options ----
 
+// MFG-Unlocker (any file name: it is known by its status export) changes DLSS-G's frame count from its own menu by rewriting the next
+// slDLSSGSetOptions call. Looked for again every 5 s, since it can load after HSF.
+bool FrameCountModLoaded(ULONGLONG now) {
+  static ULONGLONG checked = 0;
+  static bool found = false;
+  if (checked != 0 && now - checked < 5000) return found;
+  checked = now;
+  HMODULE modules[1024];
+  DWORD bytes = 0;
+  bool any = false;
+  if (EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes))
+    for (DWORD i = 0; i < std::min<DWORD>(bytes / sizeof(HMODULE), 1024) && !any; ++i) any = GetProcAddress(modules[i], "MfgUnlockSingleModuleQuery") != nullptr;
+  if (any && !found) Line("MFG-Unlocker is loaded: DLSS-G's options go again twice a second so its menu can change the frame count");
+  found = any;
+  return found;
+}
+
 struct AppliedOptions {
   bool set = false, on = false;
+  ULONGLONG sent = 0;
   uint32_t frames = 0, width = 0, height = 0, input_width = 0, input_height = 0;
   DXGI_FORMAT colour = DXGI_FORMAT_UNKNOWN, motion = DXGI_FORMAT_UNKNOWN;
   bool dynamic = false;
@@ -843,10 +863,14 @@ void SetOptions(bool on, uint32_t frames, uint32_t width, uint32_t height, uint3
   const uint32_t most = std::max(g_max_frames.load(), 1u);
   frames = std::clamp(frames, 1u, most);
   AppliedOptions& a = g_options;
-  if (a.set && a.on == on && a.frames == frames && a.width == width && a.height == height && a.input_width == input_width && a.input_height == input_height && a.colour == colour && a.motion == motion && a.dynamic == dynamic) return;
+  const ULONGLONG now = GetTickCount64();
+  // While MFG-Unlocker is loaded the same options go again twice a second (quietly), so a frame count picked in its menu lands within
+  // half a second instead of waiting for HSF's own next change.
+  const bool same = a.set && a.on == on && a.frames == frames && a.width == width && a.height == height && a.input_width == input_width && a.input_height == input_height && a.colour == colour && a.motion == motion && a.dynamic == dynamic;
+  if (same && (now - a.sent < 500 || !FrameCountModLoaded(now))) return;
   // A new frame count while generating leaves DLSS-G on but generating nothing, as the helper found: off for one frame first, and the next frame's call turns it on again.
   if (a.set && a.on && on && a.frames != frames) on = false;
-  a = {true, on, frames, width, height, input_width, input_height, colour, motion, dynamic};
+  a = {true, on, now, frames, width, height, input_width, input_height, colour, motion, dynamic};
   sl::DLSSGOptions options{};
   options.mode = on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
   options.numFramesToGenerate = frames;
@@ -867,6 +891,7 @@ void SetOptions(bool on, uint32_t frames, uint32_t width, uint32_t height, uint3
   }
   const sl::Result result = g_sl_dlssg_options(VIEWPORT, options);
   g_generating = on;
+  if (same) return;
   Line("DLSS-G %s, %u generated per real frame, picture %ux%u format %u, inputs %ux%u: %d", on ? "ON" : "off", frames, width, height, static_cast<unsigned>(colour), input_width, input_height, static_cast<int>(result));
 }
 
@@ -1161,7 +1186,7 @@ void CatchPresent(IUnknown* swap_chain) {
   if (swap_chain == nullptr) return;
   void** const table = *reinterpret_cast<void***>(swap_chain);
   g_game_swap_chain = swap_chain;
-  if (!g_start_options.apex && g_made_queue != nullptr) hsf::fp16swap::Start(swap_chain, g_made_swap_chain, g_made_queue, RealQueue(g_made_queue), &Line);
+  if (!g_start_options.apex && g_made_queue != nullptr) hsf::fp16swap::Start(swap_chain, g_made_swap_chain, g_made_queue, RealQueue(g_made_queue), &Line, g_made_table);
   if (g_present_table == table) return;
   if (g_present_table != nullptr) {
     Line("a second kind of swap chain: its frames are not followed");
@@ -1204,6 +1229,153 @@ IUnknown* RealQueue(IUnknown* queue) {
   return queue;
 }
 
+// REFramework (RE engine games) hooks Streamline's linkSwapchainToCmdQueue in sl.dlss_g.dll as soon as that DLL loads, and its hook waits until REFramework has finished
+// starting. REFramework finishes starting only after the game's first frame, and the game's first swap chain goes through that function: with HSF bringing DLSS-G in, the
+// game waits there for ever on a black screen. When HSF first makes a swap chain through Streamline, Streamline's own bytes go back in place of REFramework's jump, and
+// they stay: DLSS-G calls the same function again from Present on its first frames, when REFramework has finished starting, and REFramework's hook then crashes inside
+// D3D12 (seen in a hang dump of RE Village). REFramework still finds the swap chain through its Present hook and its hook monitor. Only with REFramework loaded.
+struct ForeignJump {
+  uint8_t* at = nullptr;
+  size_t size = 0;
+  uint8_t original[16] = {};
+  uint8_t jump[16] = {};
+};
+ForeignJump g_refw_jump;
+bool g_refw_searched = false;
+
+// REFramework is the dinput8.dll that exports its own name for DirectInput8Create.
+bool IsReframework(HMODULE module) { return module != nullptr && GetProcAddress(module, "direct_input8_create") != nullptr; }
+
+bool Readable(const void* address, size_t bytes) {
+  MEMORY_BASIC_INFORMATION info{};
+  if (VirtualQuery(address, &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
+  return static_cast<const uint8_t*>(address) + bytes <= static_cast<const uint8_t*>(info.BaseAddress) + info.RegionSize;
+}
+
+// Where a jump at code leads: a rel32 jump, maybe on to an absolute one (a relay near the module), or an absolute jump in place. Null if code is not a jump.
+const uint8_t* JumpTarget(const uint8_t* code) {
+  const auto absolute = [](const uint8_t* at) -> const uint8_t* {
+    if (at[0] != 0xFF || at[1] != 0x25 || !Readable(at, 14)) return nullptr;
+    int32_t disp = 0;
+    std::memcpy(&disp, at + 2, 4);
+    if (disp != 0) return nullptr;
+    const uint8_t* to = nullptr;
+    std::memcpy(&to, at + 6, 8);
+    return to;
+  };
+  if (code[0] == 0xE9) {
+    int32_t rel = 0;
+    std::memcpy(&rel, code + 1, 4);
+    const uint8_t* const to = code + 5 + rel;
+    if (!Readable(to, 2)) return nullptr;
+    const uint8_t* const on = absolute(to);
+    return on != nullptr ? on : to;
+  }
+  return absolute(code);
+}
+
+bool JumpsIntoReframework(const uint8_t* code) {
+  const uint8_t* const to = JumpTarget(code);
+  HMODULE module = nullptr;
+  return to != nullptr && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(to), &module) &&
+         IsReframework(module);
+}
+
+// Whether the file's relocations touch [start, end) (RVAs): such bytes differ from the file because the loader changed them, and are not put back.
+bool RelocatedIn(const std::vector<uint8_t>& file, const IMAGE_NT_HEADERS64* nt, DWORD start, DWORD end) {
+  const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+  if (dir.VirtualAddress == 0 || dir.Size == 0) return false;
+  const IMAGE_SECTION_HEADER* const sections = IMAGE_FIRST_SECTION(nt);
+  size_t raw = 0;
+  for (WORD s = 0; s < nt->FileHeader.NumberOfSections; ++s) {
+    const IMAGE_SECTION_HEADER& sec = sections[s];
+    if (dir.VirtualAddress >= sec.VirtualAddress && dir.VirtualAddress < sec.VirtualAddress + sec.SizeOfRawData) raw = sec.PointerToRawData + (dir.VirtualAddress - sec.VirtualAddress);
+  }
+  if (raw == 0 || raw + dir.Size > file.size()) return true;  // unknown: treat as touched
+  for (size_t at = raw; at + sizeof(IMAGE_BASE_RELOCATION) <= raw + dir.Size;) {
+    IMAGE_BASE_RELOCATION block{};
+    std::memcpy(&block, file.data() + at, sizeof(block));
+    if (block.SizeOfBlock < sizeof(block) || at + block.SizeOfBlock > raw + dir.Size) break;
+    const size_t count = (block.SizeOfBlock - sizeof(block)) / sizeof(WORD);
+    for (size_t i = 0; i < count; ++i) {
+      WORD entry = 0;
+      std::memcpy(&entry, file.data() + at + sizeof(block) + i * sizeof(WORD), sizeof(WORD));
+      if ((entry >> 12) == IMAGE_REL_BASED_ABSOLUTE) continue;
+      const DWORD rva = block.VirtualAddress + (entry & 0xFFF);
+      if (rva < end && rva + 8 > start) return true;
+    }
+    at += block.SizeOfBlock;
+  }
+  return false;
+}
+
+// Compares sl.dlss_g.dll's code with its file and finds a jump into REFramework. Once per process, and only when REFramework is loaded.
+void FindReframeworkJump() {
+  if (g_refw_searched || !IsReframework(GetModuleHandleW(L"dinput8.dll"))) return;
+  const HMODULE dlssg = GetModuleHandleW(L"sl.dlss_g.dll");
+  if (dlssg == nullptr) return;
+  g_refw_searched = true;
+  wchar_t path[MAX_PATH];
+  if (GetModuleFileNameW(dlssg, path, MAX_PATH) == 0) return;
+  std::vector<uint8_t> file;
+  {
+    const HANDLE handle = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER size{};
+    DWORD got = 0;
+    if (GetFileSizeEx(handle, &size) && size.QuadPart > 0 && size.QuadPart < (256ll << 20)) {
+      file.resize(static_cast<size_t>(size.QuadPart));
+      if (!ReadFile(handle, file.data(), static_cast<DWORD>(file.size()), &got, nullptr) || got != file.size()) file.clear();
+    }
+    CloseHandle(handle);
+  }
+  if (file.size() < sizeof(IMAGE_DOS_HEADER)) return;
+  const auto* const dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(file.data());
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || static_cast<size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > file.size()) return;
+  const auto* const nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(file.data() + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
+  const IMAGE_SECTION_HEADER* const sections = IMAGE_FIRST_SECTION(nt);
+  if (reinterpret_cast<const uint8_t*>(sections + nt->FileHeader.NumberOfSections) > file.data() + file.size()) return;
+  uint8_t* const base = reinterpret_cast<uint8_t*>(dlssg);
+  for (WORD s = 0; s < nt->FileHeader.NumberOfSections; ++s) {
+    const IMAGE_SECTION_HEADER& sec = sections[s];
+    if ((sec.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+    const size_t size = (std::min)(static_cast<size_t>(sec.Misc.VirtualSize), static_cast<size_t>(sec.SizeOfRawData));
+    if (sec.PointerToRawData + size > file.size()) continue;
+    uint8_t* const mem = base + sec.VirtualAddress;
+    const uint8_t* const disk = file.data() + sec.PointerToRawData;
+    for (size_t i = 0; i + 14 <= size; ++i) {
+      if (mem[i] == disk[i] || !JumpsIntoReframework(mem + i)) continue;
+      size_t end = i + 5;
+      for (size_t k = i; k < i + sizeof(g_refw_jump.jump) && k < size; ++k)
+        if (mem[k] != disk[k]) end = k + 1;
+      if (RelocatedIn(file, nt, sec.VirtualAddress + static_cast<DWORD>(i), sec.VirtualAddress + static_cast<DWORD>(end))) {
+        Line("REFramework's jump in sl.dlss_g.dll at %p: relocated bytes next to it, left alone", static_cast<void*>(mem + i));
+        return;
+      }
+      g_refw_jump.at = mem + i;
+      g_refw_jump.size = end - i;
+      std::memcpy(g_refw_jump.original, disk + i, g_refw_jump.size);
+      std::memcpy(g_refw_jump.jump, mem + i, g_refw_jump.size);
+      Line("REFramework's hook in sl.dlss_g.dll at %p (+0x%X, %zu bytes): found", static_cast<void*>(mem + i),
+           static_cast<unsigned>(sec.VirtualAddress + i), g_refw_jump.size);
+      return;
+    }
+  }
+  Line("REFramework is loaded; no hook of its in sl.dlss_g.dll");
+}
+
+// Puts Streamline's bytes back in place of REFramework's jump, for good. Does nothing unless REFramework is loaded and its jump is still there.
+void LiftReframework() {
+  FindReframeworkJump();
+  ForeignJump& j = g_refw_jump;
+  if (j.at == nullptr || std::memcmp(j.at, j.jump, j.size) != 0) return;
+  if (hookpatch::WriteCode(j.at, j.original, j.size))
+    Line("REFramework's hook in sl.dlss_g.dll kept lifted: Streamline's own bytes stay in place (REFramework's hook crashes when DLSS-G calls it from Present)");
+  else
+    Line("REFramework's hook in sl.dlss_g.dll: could not put Streamline's bytes back");
+}
+
 // Makes the swap chain through Streamline's factory. `factory` is what reached this layer, which is what DXGI itself must get in the end.
 template <typename MakeThrough, typename MakeDirect>
 HRESULT ThroughStreamline(IUnknown* factory, IUnknown* queue, UINT game_flags, IUnknown** made, MakeThrough&& through, MakeDirect&& direct) {
@@ -1221,6 +1393,7 @@ HRESULT ThroughStreamline(IUnknown* factory, IUnknown* queue, UINT game_flags, I
     t_inside = true;
     t_native_factory = factory;
     g_made_queue = game_queue;
+    LiftReframework();
     hr = through(sl_factory, game_queue);
     t_inside = false;
     t_native_factory = nullptr;
@@ -1624,6 +1797,19 @@ void Start(const wchar_t* log_path, const wchar_t* folder, const StartOptions& o
     const HMODULE early = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     Line("sl.interposer.dll loaded early, as HSF loads: %s", early != nullptr ? "yes" : "no");
   }
+  if (options.preload_ngx && GetModuleHandleW(L"_nvngx.dll") == nullptr) {
+    // The driver's NGX folder, as NGX itself finds it.
+    wchar_t folder_ngx[MAX_PATH] = L"";
+    DWORD size = sizeof(folder_ngx);
+    const LSTATUS read = RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", L"FullPath", RRF_RT_REG_SZ, nullptr, folder_ngx, &size);
+    if (read != ERROR_SUCCESS || folder_ngx[0] == L'\0') {
+      Line("NVIDIA's NGX not loaded early for ReLimiter: the driver's NGX folder is not in the registry (%ld)", static_cast<long>(read));
+    } else {
+      const std::wstring dll = std::wstring(folder_ngx) + L"\\_nvngx.dll";
+      const HMODULE ngx = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+      Line("NVIDIA's NGX loaded early for ReLimiter, which hooks it only as it starts: %s (%ls)", ngx != nullptr ? "yes" : "no", dll.c_str());
+    }
+  }
 }
 
 void NoteDevice(void* device) {
@@ -2023,6 +2209,8 @@ void Stop(bool process_exiting) {
   g_sl_dlssg_state = nullptr;
   Line("=== stopped catching swap chains ===");
 }
+
+bool NeedsExitShutdown() { return g_sl_started.load() && g_sl_shutdown != nullptr && !g_shut.load(); }
 
 void ShutdownForExit() {
   if (g_start_options.apex) {

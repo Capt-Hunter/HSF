@@ -84,6 +84,7 @@ These were tested alongside HSF:
 - **RenoDX**: works, HDR10 included. RenoDX HDR mods in DirectX 12 games work with frame generation (tested in Scorn and BLACKTAIL).
 - **Luma**: works in DirectX 11, and HSF uses Luma's DLSS data (see MOTION).
 - **RTSS and ReShade overlays**: work. On DirectX 11, keep KEEP OVERLAYS OUT on, so the overlays are not generated.
+- **ReLimiter**: works with DLSS-G on the in-game route and on the helper route, where HSF tells ReLimiter the multiplier. On the bring-in route (DirectX 12 games without Streamline) ReLimiter needs a build with the fixes for Streamline under ReShade, which are with ReLimiter's authors; HSF loads NVIDIA's NGX early there when ReLimiter is next to it (`SlPreloadNgx`). In RE engine games, keep REFramework off: with HSF it gives a black screen.
 
 Heavily modded games (OptiScaler, REFramework and others) can clash. When a game crashes, move the other mods into a `_mods_off` folder and try HSF alone first.
 
@@ -117,6 +118,7 @@ Generation keeps running while ReShade's menu is open, and the big number is liv
 | Row | Choices | What it does |
 |---|---|---|
 | FRAME GEN | on / off | Turns generation on or off (`Extra`). On DirectX 9, 11 and Vulkan, OFF keeps the helper running so ON is instant, and a red **CLOSE HELPER** box appears beside it: press it to stop the helper, so the game shows its own frame rate. With FRAME GEN on but no motion (no flow effect, no NVOF), the helper does not start, and a running one stops after 3 s without motion. |
+| FG ENGINE | DLSS-G / XEMFG | Which engine makes the generated frames (`FgEngine`). DLSS-G is NVIDIA's own, the default. XEMFG is EXPERIMENTAL: Intel's XeSS frame generation, run inside DLSS-G, on every route. It needs Intel's `libxess_fg.dll` 1.3.1.78 and `libxell.dll` in `HSF_streamline`, which come with the release zip; 3X to 6X also need MFGAdaUnlock's RenoDX add-on (`renodx-mfgunlock.addon64`) or MFG-Unlocker 1.7.1 or newer, loaded in the game, next to its exe, or in `HSF_streamline\mods`. The pick applies when the game starts again (the note says RESTART THE GAME TO SWITCH). The note shows the engine in use, and an amber line says why when XeMFG could not start: HSF then runs DLSS-G. Hover over the row for XeMFG's full state. |
 | MULTIPLIER | 2X 3X 4X 5X 6X | Real frame plus 1 to 5 generated (`DlssgFrames`). Choices above what DLSS-G says this card can do are crossed out. F7 cycles it in game. On RTX 20, 30 and 40 with MFG-Unlocker, a line shows the card and how far it is unlocked. On RTX 20 and 30, MFG-Unlocker runs its own frame generation and sets the multiplier itself: the row shows its number and points to its menu. |
 | MOTION | DirectX 12: AUTO / DLSS / FLOW. DirectX 11 with Luma: AUTO / LUMA / FLOW. Vulkan: AUTO / DLSS / FLOW once a mod's DLSS data has come. Others: FLOW | AUTO uses the game's DLSS data (or Luma's) while it comes, else flow. DLSS is crossed out until the game has sent DLSS data in this run. The note on the right shows what is in use: GAME DATA, FLOW, or FLOW + DEPTH. With Luma, a line says when the game runs in DX12 (start it in DX11), when Luma sends no DLSS data yet (turn on DLSS in Luma's settings), and offers **SWITCH TO LUMA (DLSS)** while MOTION is on FLOW. |
 | FLOW PAUSE | ON / OFF | DirectX 11 with Luma. ON (default, `FlowPause`) turns the flow effect off while Luma's DLSS data comes, and back on when it stops (cuts, menus). Other effects that read the same flow stop moving while it is off. |
@@ -251,8 +253,8 @@ Frame generation and the overlay have no key until you set one, because the free
 
 Delete `hsf.addon64` or `hsf.addon32`, `HSF.ini`, `HSF_safe_try.ini`, `HSF.log`, `HSF.previous.log`, the `HSF_streamline` folder and `reshade-shaders\Shaders\HSF.fx`. HSF changes nothing else in the game folder. There is one exception: on DirectX 9 games that ran out of memory, the 4 GB flag may have been set by hand in the exe, and the original was kept next to it.
 
-## Experimental Apex ANR FG on D3D12
+## Experimental native FP16 Apex backend
 
-Apex is an optional backend for 64-bit D3D12 games with a native FP16 scRGB swap chain. Keep NVIDIA's `HSF_streamline` folder in place. Get the [Apex V.B20 add-on archive](https://github.com/apex-compute/ANR/releases/tag/FG-V.B20) and copy its `Apex Neural Rendering FG\dlssg` folder into `HSF_apex` beside `HSF.ini`. Keep the provider and its data together at `HSF_apex\dlssg\nvngx_dlssg.dll`.
+Apex ANR FG V.B20 uses HSF's x64 D3D12 bring-in route. The game needs a native FP16 scRGB swap chain, motion and depth. Keep the provider and its sidecar data under `HSF_apex\dlssg` beside the existing `HSF_streamline` folder. The BACKEND row switches at the next launch.
 
-With HSF's D3D12 bring-in route active, choose **APEX ANR FG** in **BACKEND** and restart the game. Apex needs motion and depth and supports 2x and 3x when the presentation path allows it. It retains the game's FP16 scRGB color output. See [the Apex settings](settings.md#4-d3d12-routes) for VSync-off pacing and diagnostics.
+Apex supports the manual 2x and 3x multipliers when allowed by the provider and presentation path. VSync interval 4 uses 2x.

@@ -113,7 +113,8 @@ inline DepthPart ReadDepthPart(const Parameter* parameters, const DlssCall& c, u
 }
 
 // A game can call DLSS for something small too, such as a mirror: a call is the main one when it is not less than half the largest of the last
-// 240 calls. `now` counts the calls (each hook its own).
+// 240 calls. `now` counts the calls (each hook its own), every one, taken or not: a clock of taken calls alone stops once DLSS goes from DLAA to
+// Quality or lower (less than half the area), and the smaller calls are then refused for good.
 struct MainCall {
   uint64_t largest_area = 0, largest_at = 0;
   bool Take(uint64_t area, uint64_t now) {
