@@ -31,6 +31,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "apex_fg.h"
 #include "compose.h"
 #include "debug_view.h"
 #include "depth_fit.h"
@@ -77,6 +78,31 @@ PFun_slPCLSetMarker* g_sl_marker = nullptr;
 PFun_slUpgradeInterface* g_sl_upgrade = nullptr;
 PFun_slShutdown* g_sl_shutdown = nullptr;
 StartOptions g_start_options;
+
+std::unique_ptr<apex::Provider> g_apex;
+std::atomic<ID3D12CommandQueue*> g_apex_queue{nullptr};
+std::atomic<bool> g_apex_enabled{true};
+std::atomic<bool> g_apex_history{false};
+std::atomic<bool> g_apex_failed{false};
+SRWLOCK g_apex_pending_lock = SRWLOCK_INIT;
+struct ApexPending {
+  FrameFeed feed;
+  ComPtr<ID3D12Resource> motion, depth;
+  DWORD thread = 0;
+};
+ApexPending g_apex_pending;
+std::atomic<uint64_t> g_apex_generated{0};
+uint32_t g_apex_present_samples = 0;
+apex::Session* g_apex_present = nullptr;
+unsigned g_apex_present_count = 0;
+bool FeedFrame(const FrameFeed& in);
+ApexPending TakeApexFrame() {
+  AcquireSRWLockExclusive(&g_apex_pending_lock);
+  ApexPending pending = std::move(g_apex_pending);
+  g_apex_pending = {};
+  ReleaseSRWLockExclusive(&g_apex_pending_lock);
+  return pending;
+}
 
 std::atomic<bool> g_tried{false};
 std::atomic<bool> g_up{false};
@@ -742,6 +768,7 @@ bool g_force_sync_logged = false;
 struct FrameTimes {
   double last = 0, average = 0, worst = 0;
   double present_sum = 0, present_worst = 0, sleep_sum = 0, sleep_worst = 0, feed_worst = 0;
+  double apex_wait_sum = 0;
   uint32_t frames = 0, spikes = 0;
 } g_times;
 
@@ -939,7 +966,189 @@ UINT SyncFor(UINT asked) {
   return 0;
 }
 
+bool StartApexProvider(ID3D12Device* device) {
+  if (g_apex) return true;
+  const bool other_runtime = GetModuleHandleW(L"sl.interposer.dll") || GetModuleHandleW(L"nvngx_dlssg.dll") ||
+                             GetModuleHandleW(L"OptiScaler.dll");
+  auto provider = std::make_unique<apex::Provider>();
+  if (other_runtime || !provider->Init(g_start_options.apex_dll.c_str(), device, g_start_options.apex_debug)) {
+    if (other_runtime) Line("Apex disabled: another frame-generation runtime is already loaded");
+    g_plugin_loaded = 0;
+    g_status = 1;
+    g_apex_failed = true;
+    return false;
+  }
+  g_max_frames = provider->MaxGenerated();
+  g_apex = std::move(provider);
+  g_plugin_loaded = 1;
+  return true;
+}
+
+template <typename Present>
+HRESULT PresentApex(IDXGISwapChain* chain, UINT sync, UINT flags, bool full_update, Present&& present) {
+  if ((flags & DXGI_PRESENT_TEST) != 0) return present(sync);
+  static ULONGLONG tearing_retry_after = 0;
+  const double before = NowMs();
+  ApexPending pending = TakeApexFrame();
+  FrameFeed& feed = pending.feed;
+  ComPtr<IDXGISwapChain3> swap;
+  ComPtr<ID3D12Resource> back;
+  HWND hwnd = nullptr;
+  BOOL exclusive = FALSE;
+  const bool have_input = pending.thread == GetCurrentThreadId() && feed.back_buffer && feed.depth && (feed.motion || feed.nvof);
+  // For even intervals, the two presents divide the game's original refresh budget equally.
+  // An interval of one already uses the shortest VSync present available for each frame.
+  const bool tearing = g_start_options.apex_allow_tearing && sync == 0 && flags == DXGI_PRESENT_ALLOW_TEARING;
+  const UINT pair_sync = tearing ? 0u : sync == 4 ? 2u : 1u;
+  const bool paced = full_update && (tearing || ((sync == 1 || sync == 2 || sync == 4) && flags == 0));
+  const bool enabled = g_apex_enabled.load();
+  bool ready = enabled && !g_shut.load() && !g_apex_failed.load() && have_input && feed.on && paced;
+  if (ready) {
+    ready = SUCCEEDED(chain->QueryInterface(IID_PPV_ARGS(&swap))) &&
+            SUCCEEDED(swap->GetHwnd(&hwnd)) && hwnd == GetForegroundWindow() &&
+            SUCCEEDED(swap->GetFullscreenState(&exclusive, nullptr)) && !exclusive &&
+            SUCCEEDED(swap->GetBuffer(swap->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&back))) &&
+            back.Get() == feed.back_buffer && back->GetDesc().Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    constexpr auto scrgb = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+    DXGI_COLOR_SPACE_TYPE native_space = DXGI_COLOR_SPACE_CUSTOM;
+    UINT bytes = sizeof(native_space);
+    if (ready && SUCCEEDED(swap->GetPrivateData(SKID_SWAP_CHAIN_COLOR_SPACE, &bytes, &native_space)) && bytes == sizeof(native_space))
+      feed.colour_space = static_cast<uint32_t>(native_space);
+    UINT supported = 0;
+    ready = ready && feed.colour_space == scrgb &&
+            SUCCEEDED(swap->CheckColorSpaceSupport(scrgb, &supported)) && (supported & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT);
+  }
+  if (ready && g_apex && (GetModuleHandleW(L"sl.interposer.dll") || GetModuleHandleW(L"OptiScaler.dll"))) {
+    static bool logged = false;
+    if (!logged) Line("Apex suspended because another frame-generation runtime was loaded");
+    logged = true;
+    ready = false;
+  }
+  std::unique_ptr<void, decltype(&CloseHandle)> latency_gate(nullptr, CloseHandle);
+  if (ready && tearing && GetTickCount64() < tearing_retry_after) ready = false;
+  if (ready && tearing) {
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    UINT latency = 0;
+    constexpr UINT required = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT | DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    if (SUCCEEDED(swap->GetDesc1(&desc)) && (desc.Flags & required) == required &&
+        SUCCEEDED(swap->GetMaximumFrameLatency(&latency)) && latency >= 1 && latency <= 2)
+      latency_gate.reset(swap->GetFrameLatencyWaitableObject());
+    ready = latency_gate != nullptr;
+    if (!ready) {
+      static bool logged = false;
+      if (!logged) Line("Apex VSync-off pacing needs a tearing-capable waitable swap chain with maximum frame latency 1 or 2 (reported %u)", latency);
+      logged = true;
+    }
+  }
+  if (enabled && have_input && !paced) {
+    static UINT last_sync = UINT_MAX, last_flags = UINT_MAX;
+    static bool last_full = true;
+    if (last_sync != sync || last_flags != flags || last_full != full_update) {
+      Line("Apex presents real frames only: sync %u, flags 0x%x, full update %d. Expected VSync interval 1, 2 or 4 with flags 0%s.",
+           sync, flags, full_update, g_start_options.apex_allow_tearing ? " or interval 0 with ALLOW_TEARING" : "");
+      last_sync = sync;
+      last_flags = flags;
+      last_full = full_update;
+    }
+  }
+  if (g_start_options.apex_debug && enabled && !ready) {
+    static ULONGLONG next = 0;
+    const auto now = GetTickCount64();
+    if (now >= next) {
+      next = now + 5000;
+      Line("Apex waiting: motion %d, depth %d, sync %u, flags 0x%x, space %u, active swap %d", feed.motion != nullptr,
+           feed.depth != nullptr, sync, flags, feed.colour_space, back && back.Get() == feed.back_buffer);
+    }
+  }
+  g_apex_present = nullptr;
+  g_apex_present_count = 0;
+  if (ready && StartApexProvider(feed.device)) {
+    // The four-refresh game mode is evenly divisible by two. Keep that cadence.
+    feed.frames = sync == 4 ? 1u : std::clamp(feed.frames, 1u, g_max_frames.load());
+    feed.back_buffer_state = D3D12_RESOURCE_STATE_PRESENT;
+    g_apex_history = FeedFrame(feed);
+  } else {
+    g_apex_history = false;
+  }
+  HRESULT generated = S_FALSE;
+  HRESULT result = S_OK;
+  unsigned generated_count = 0;
+  if (g_apex_enabled.load() && g_apex_present && g_apex_present->BeginPresent(back.Get())) {
+    const UINT index = swap->GetCurrentBackBufferIndex();
+    UINT next = index;
+    for (unsigned i = 0; i < g_apex_present_count; ++i) {
+      if (i != 0) {
+        generated = g_apex_present->CopySecondGenerated(swap.Get());
+        if (FAILED(generated)) break;
+      }
+      const UINT before_present = next;
+      generated = present(pair_sync);
+      next = swap->GetCurrentBackBufferIndex();
+      if (generated == S_OK && next == before_present) generated = DXGI_ERROR_INVALID_CALL;
+      if (generated != S_OK) break;
+      ++generated_count;
+      // The game's wait accounts for the first frame. Account for each extra Present before issuing another one.
+      if (latency_gate) {
+        const double wait_start = g_start_options.apex_debug ? NowMs() : 0;
+        const DWORD wait = WaitForSingleObject(latency_gate.get(), 50);
+        if (wait_start != 0) g_times.apex_wait_sum += NowMs() - wait_start;
+        if (wait != WAIT_OBJECT_0) {
+          static bool logged = false;
+          if (!logged) Line("Apex VSync-off presentation wait ended with 0x%lx; presenting the real frame", wait);
+          logged = true;
+          tearing_retry_after = GetTickCount64() + 2000;
+          generated = S_FALSE;
+          break;
+        }
+      }
+    }
+    const HRESULT restored = g_apex_present->RestoreReal(swap.Get());
+    g_apex_present->EndPresent();
+    if (generated != S_OK || FAILED(restored)) {
+      Line("Apex Present: generated 0x%08lx, restore 0x%08lx, indices %u/%u, device 0x%08lx", generated, restored,
+           index, next, feed.device->GetDeviceRemovedReason());
+      g_apex_history = false;
+      if (FAILED(generated) || FAILED(restored)) {
+        g_apex_failed = true;
+        g_status = 1;
+      }
+    }
+    result = FAILED(restored) ? restored : present(generated == S_OK ? pair_sync : sync);
+    if (generated_count != 0 && result == S_OK) {
+      static UINT last_input_interval = UINT_MAX;
+      static unsigned last_count = 0;
+      if (last_input_interval != sync || last_count != generated_count) {
+        if (tearing) Line("Apex pacing: VSync off, ALLOW_TEARING, frame-latency wait after each of %u generated presents", generated_count);
+        else if (generated_count == 2) Line("Apex pacing: game sync interval %u, two generated frames and one real frame at interval %u", sync, pair_sync);
+        else Line("Apex pacing: game sync interval %u, generated and real intervals %u + %u", sync, pair_sync, pair_sync);
+        last_input_interval = sync;
+        last_count = generated_count;
+      }
+      g_apex_generated.fetch_add(generated_count, std::memory_order_relaxed);
+    }
+  } else {
+    if (!g_apex_enabled.load()) g_apex_history = false;
+    result = present(sync);
+  }
+  if (FAILED(result) && feed.device && !g_apex_failed.exchange(true)) {
+    Line("Apex real Present failed 0x%08lx, device 0x%08lx", result, feed.device->GetDeviceRemovedReason());
+    g_status = 1;
+  }
+  g_generating = generated_count != 0 && result == S_OK;
+  g_shown_per_real = result == S_OK ? generated_count + 1 : 0;
+  if (result == S_OK) g_presented_total.fetch_add(1, std::memory_order_relaxed);
+  else g_apex_history = false;
+  const double elapsed = NowMs() - before;
+  ++g_apex_present_samples;
+  g_times.present_sum += elapsed;
+  g_times.present_worst = std::max(g_times.present_worst, elapsed);
+  CountFrameTime();
+  return result;
+}
+
 HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swap_chain, UINT sync, UINT flags) {
+  if (g_start_options.apex && swap_chain == g_game_swap_chain.load())
+    return PresentApex(swap_chain, sync, flags, true, [&](UINT interval) { return g_real_present(swap_chain, interval, flags); });
   if (g_shut.load(std::memory_order_acquire) && swap_chain == g_game_swap_chain.load()) return S_OK;  // Streamline is shut down for the exit
   if (swap_chain != g_game_swap_chain.load() || (flags & DXGI_PRESENT_TEST) != 0) return g_real_present(swap_chain, sync, flags);
   hsf::fp16swap::BeforePresent(swap_chain);
@@ -955,6 +1164,10 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swap_chain, UINT sync, UIN
 }
 
 HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* swap_chain, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters) {
+  if (g_start_options.apex && swap_chain == g_game_swap_chain.load()) {
+    const bool full = parameters == nullptr || (parameters->DirtyRectsCount == 0 && !parameters->pScrollRect && !parameters->pScrollOffset);
+    return PresentApex(swap_chain, sync, flags, full, [&](UINT interval) { return g_real_present1(swap_chain, interval, flags, parameters); });
+  }
   if (g_shut.load(std::memory_order_acquire) && swap_chain == g_game_swap_chain.load()) return S_OK;
   if (swap_chain != g_game_swap_chain.load() || (flags & DXGI_PRESENT_TEST) != 0) return g_real_present1(swap_chain, sync, flags, parameters);
   hsf::fp16swap::BeforePresent(swap_chain);
@@ -976,7 +1189,7 @@ void CatchPresent(IUnknown* swap_chain) {
   if (swap_chain == nullptr) return;
   void** const table = *reinterpret_cast<void***>(swap_chain);
   g_game_swap_chain = swap_chain;
-  if (g_made_queue != nullptr) hsf::fp16swap::Start(swap_chain, g_made_swap_chain, g_made_queue, RealQueue(g_made_queue), &Line, g_made_table);
+  if (!g_start_options.apex && g_made_queue != nullptr) hsf::fp16swap::Start(swap_chain, g_made_swap_chain, g_made_queue, RealQueue(g_made_queue), &Line, g_made_table);
   if (g_present_table == table) return;
   if (g_present_table != nullptr) {
     Line("a second kind of swap chain: its frames are not followed");
@@ -984,7 +1197,9 @@ void CatchPresent(IUnknown* swap_chain) {
   }
   g_real_present = reinterpret_cast<PresentFn>(table[SLOT_PRESENT]);
   g_real_present1 = reinterpret_cast<Present1Fn>(table[SLOT_PRESENT1]);
-  const bool written = WriteSlot(table, SLOT_PRESENT, reinterpret_cast<void*>(&HookPresent)) && WriteSlot(table, SLOT_PRESENT1, reinterpret_cast<void*>(&HookPresent1));
+  const bool first = WriteSlot(table, SLOT_PRESENT, reinterpret_cast<void*>(&HookPresent));
+  const bool written = first && WriteSlot(table, SLOT_PRESENT1, reinterpret_cast<void*>(&HookPresent1));
+  if (first && !written) WriteSlot(table, SLOT_PRESENT, reinterpret_cast<void*>(g_real_present));
   Line("following Present on the table %p: %d", table, written ? 1 : 0);
   if (written) g_present_table = table;
 }
@@ -1205,7 +1420,47 @@ DXGI_SWAP_CHAIN_DESC* ForDlssg(DXGI_SWAP_CHAIN_DESC* desc, DXGI_SWAP_CHAIN_DESC&
   return hsf::fp16swap::Rewrite(copy.BufferDesc.Format) ? &copy : desc;
 }
 
+bool IsSystemDxgi(const void* address);
+
+void CatchApex(IUnknown* chain, IUnknown* queue, DXGI_FORMAT format, UINT flags) {
+  if (!chain || !queue) return;
+  void** const table = *reinterpret_cast<void***>(chain);
+  ComPtr<ID3D12CommandQueue> native;
+  ComPtr<ID3D12Device> device;
+  if (!IsSystemDxgi(table) || FAILED(RealQueue(queue)->QueryInterface(IID_PPV_ARGS(&native))) ||
+      FAILED(native->GetDevice(IID_PPV_ARGS(&device))) || device.Get() != g_device.load()) return;
+  if (format != DXGI_FORMAT_R16G16B16A16_FLOAT || (g_present_table && g_present_table != table)) {
+    Line("Apex skipped swap chain format %u, flags 0x%x; requires a native FP16 swap chain with a supported DXGI method table",
+         static_cast<unsigned>(format), flags);
+    return;
+  }
+  if (!g_present_table && (!IsSystemDxgi(table[SLOT_PRESENT]) || !IsSystemDxgi(table[SLOT_PRESENT1]))) {
+    Line("Apex skipped a swap chain with an existing Present hook");
+    return;
+  }
+  ID3D12CommandQueue* const previous_queue = g_apex_queue.load();
+  if (previous_queue && previous_queue != native.Get()) {
+    Line("Apex skipped a swap chain on another command queue");
+    return;
+  }
+  g_apex_queue = native.Get();
+  g_apex_history = false;
+  CatchPresent(chain);
+  if (g_present_table == table) {
+    g_swap_chains.fetch_add(1);
+    // The game continues to use its own waitable object. Both presents go through DXGI's existing queue,
+    // HSF neither consumes the signal nor changes the maximum frame latency.
+    Line("Apex attached to native FP16 swap chain, HDR conversion off, flags 0x%x, frame latency waitable %s",
+         flags, (flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0 ? "yes" : "no");
+  }
+}
+
 HRESULT NativeForHwnd(IDXGIFactory2* factory, IUnknown* queue, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen, IDXGIOutput* output, IDXGISwapChain1** swap_chain, CreateForHwndFn real) {
+  if (g_start_options.apex) {
+    const HRESULT hr = real(factory, queue, hwnd, desc, fullscreen, output, swap_chain);
+    if (SUCCEEDED(hr) && desc && swap_chain) CatchApex(*swap_chain, queue, desc->Format, desc->Flags);
+    return hr;
+  }
   return ThroughStreamline(factory, queue, desc->Flags, reinterpret_cast<IUnknown**>(swap_chain),
                            [&](IDXGIFactory2* sl_factory, IUnknown* game_queue) {
                              // The game's own flags. Adding the frame latency waitable for a game that never waits on it turns off the queue limit that holds it back (Red Dead Redemption 2).
@@ -1216,6 +1471,11 @@ HRESULT NativeForHwnd(IDXGIFactory2* factory, IUnknown* queue, HWND hwnd, const 
 }
 
 HRESULT NativeCreate(IDXGIFactory* factory, IUnknown* queue, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** swap_chain, CreateSwapChainFn real) {
+  if (g_start_options.apex) {
+    const HRESULT hr = real(factory, queue, desc, swap_chain);
+    if (SUCCEEDED(hr) && desc && swap_chain) CatchApex(*swap_chain, queue, desc->BufferDesc.Format, desc->Flags);
+    return hr;
+  }
   return ThroughStreamline(factory, queue, desc->Flags, reinterpret_cast<IUnknown**>(swap_chain),
                            [&](IDXGIFactory2* sl_factory, IUnknown* game_queue) {
                              DXGI_SWAP_CHAIN_DESC copy{};
@@ -1260,7 +1520,7 @@ HRESULT STDMETHODCALLTYPE HookCreateForHwnd(IDXGIFactory2* factory, IUnknown* qu
   } else {
     hr = NativeForHwnd(factory, queue, hwnd, desc, fullscreen, output, swap_chain, g_real_for_hwnd);
   }
-  if (SUCCEEDED(hr) && swap_chain != nullptr) CatchPresent(*swap_chain);
+  if (!g_start_options.apex && SUCCEEDED(hr) && swap_chain != nullptr) CatchPresent(*swap_chain);
   return hr;
 }
 
@@ -1277,7 +1537,7 @@ HRESULT STDMETHODCALLTYPE HookCreateSwapChain(IDXGIFactory* factory, IUnknown* q
   } else {
     hr = NativeCreate(factory, queue, desc, swap_chain, g_real_create);
   }
-  if (SUCCEEDED(hr) && swap_chain != nullptr) CatchPresent(*swap_chain);
+  if (!g_start_options.apex && SUCCEEDED(hr) && swap_chain != nullptr) CatchPresent(*swap_chain);
   return hr;
 }
 
@@ -1321,7 +1581,9 @@ bool CatchSwapChains() {
   void** const table = *reinterpret_cast<void***>(factory);
   g_real_create = reinterpret_cast<CreateSwapChainFn>(table[SLOT_CREATE_SWAP_CHAIN]);
   g_real_for_hwnd = reinterpret_cast<CreateForHwndFn>(table[SLOT_CREATE_FOR_HWND]);
-  const bool written = WriteSlot(table, SLOT_CREATE_SWAP_CHAIN, reinterpret_cast<void*>(&HookCreateSwapChain)) && WriteSlot(table, SLOT_CREATE_FOR_HWND, reinterpret_cast<void*>(&HookCreateForHwnd));
+  const bool first = WriteSlot(table, SLOT_CREATE_SWAP_CHAIN, reinterpret_cast<void*>(&HookCreateSwapChain));
+  const bool written = first && WriteSlot(table, SLOT_CREATE_FOR_HWND, reinterpret_cast<void*>(&HookCreateForHwnd));
+  if (first && !written) WriteSlot(table, SLOT_CREATE_SWAP_CHAIN, reinterpret_cast<void*>(g_real_create));
   HMODULE owner = nullptr;
   wchar_t owner_path[MAX_PATH] = L"?";
   if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(table), &owner)) GetModuleFileNameW(owner, owner_path, MAX_PATH);
@@ -1334,7 +1596,9 @@ bool CatchSwapChains() {
   if (native != nullptr) {
     g_native_create = reinterpret_cast<CreateSwapChainFn>(native[SLOT_CREATE_SWAP_CHAIN]);
     g_native_for_hwnd = reinterpret_cast<CreateForHwndFn>(native[SLOT_CREATE_FOR_HWND]);
-    const bool under = WriteSlot(native, SLOT_CREATE_SWAP_CHAIN, reinterpret_cast<void*>(&HookNativeCreate)) && WriteSlot(native, SLOT_CREATE_FOR_HWND, reinterpret_cast<void*>(&HookNativeForHwnd));
+    const bool first_native = WriteSlot(native, SLOT_CREATE_SWAP_CHAIN, reinterpret_cast<void*>(&HookNativeCreate));
+    const bool under = first_native && WriteSlot(native, SLOT_CREATE_FOR_HWND, reinterpret_cast<void*>(&HookNativeForHwnd));
+    if (first_native && !under) WriteSlot(native, SLOT_CREATE_SWAP_CHAIN, reinterpret_cast<void*>(g_native_create));
     Line("under the wrapper, on DXGI's table %p: %d", native, under ? 1 : 0);
     if (under) {
       g_native_table = native;
@@ -1342,6 +1606,8 @@ bool CatchSwapChains() {
       g_native_create = nullptr;
       g_native_for_hwnd = nullptr;
     }
+  } else if (wrapped && g_start_options.apex) {
+    Line("Apex could not locate native DXGI under this wrapper");
   } else if (wrapped) {
     Line("this wrapper's own factory was not found: Streamline goes on top of it, so effect textures would come a frame late");
   }
@@ -1392,6 +1658,9 @@ struct Feeder {
   depthfit::Pass depth_fit;
   bool depth_fit_tried = false, depth_fit_ready = false;
   nvof::Flow nvof;
+  std::unique_ptr<apex::Session> apex;
+  bool apex_tried = false;
+  ComPtr<ID3D12Resource> apex_inputs[compose::FRAMES][2];
   ComPtr<ID3D12Resource> mvec, composed, colour;
   // Zero motion in the motion format, for a frame NVIDIA Optical Flow has nothing for while no effect gives a flow (its first, or after a failure).
   // Committed resources start as zeros and nothing writes it; it stays in NON_PIXEL_SHADER_RESOURCE, as NVOF's own result does.
@@ -1521,7 +1790,9 @@ void Start(const wchar_t* log_path, const wchar_t* folder, const StartOptions& o
   hsflog::Open(log_path);  // the add-on has HSF.log open already; a test opens its own
   g_folder = folder;
   g_start_options = options;
-  Line("HSF %s", HSF_VERSION);
+  g_apex_enabled = true;
+  Line("HSF %s, frame generation backend %s", HSF_VERSION, options.apex ? "Apex ANR FG" : "NVIDIA DLSS-G");
+  if (options.apex) return;
   // RenoDX DLSS decides when it starts whether to hook Streamline's Present or ReShade's, and ReShade starts it right after HSF. With ReShade's, DLSS-G showed no frames
   // in Jusant. Loading the DLL does not start Streamline: slInit still waits for the first device. HSF's reference is kept for the life of the process.
   if (options.early_load && GetModuleHandleW(L"sl.interposer.dll") == nullptr) {
@@ -1545,9 +1816,16 @@ void Start(const wchar_t* log_path, const wchar_t* folder, const StartOptions& o
 }
 
 void NoteDevice(void* device) {
+  if (g_start_options.apex && g_tried.load()) return;
   g_device = static_cast<ID3D12Device*>(device);
   Line("D3D12 device %p", device);
   if (g_tried.exchange(true)) return;
+  if (g_start_options.apex) {
+    g_up = CatchSwapChains();
+    g_max_frames = 1;
+    if (!g_up) Line("Apex disabled: could not attach to native DXGI");
+    return;
+  }
   Line("=== HSF bringing Streamline in, from %ls ===", g_folder.c_str());
   if (!StartStreamline()) return;
   if (!CatchSwapChains()) return;
@@ -1555,6 +1833,24 @@ void NoteDevice(void* device) {
 }
 
 void Poll() {
+  if (g_start_options.apex) {
+    if (!g_up || g_shut) return;
+    const uint64_t now = GetTickCount64();
+    if (now < g_next_report) return;
+    g_next_report = now + 5000;
+    Line("Apex status %d, real %llu, submitted %llu, generated %llu, real-frame time %.2f ms (worst %.2f), Present average %.2f ms",
+         g_status.load(), g_presented_total.load(), g_fed_total.load(), g_apex_generated.load(),
+         g_times.average, g_times.worst, g_times.present_sum / std::max(1u, g_apex_present_samples));
+    if (g_start_options.apex_debug && g_apex_present_samples != 0)
+      Line("Apex DXGI frame-latency wait: %.2f ms per real Present over %u Presents",
+           g_times.apex_wait_sum / g_apex_present_samples, g_apex_present_samples);
+    g_apex_present_samples = 0;
+    const double last = g_times.last, average = g_times.average;
+    g_times = {};
+    g_times.last = last;
+    g_times.average = average;
+    return;
+  }
   if (g_sl_dlssg_state == nullptr || g_shut.load(std::memory_order_acquire)) return;
   const uint64_t now = GetTickCount64();
   if (now < g_next_report) return;
@@ -1585,12 +1881,26 @@ void SetReflex(uint32_t fps_cap, bool boost, bool sleep) {
   g_sleep_on = sleep;
 }
 
-namespace {
-bool FeedFrame(const FrameFeed& in);
+void SetApexEnabled(bool enabled) {
+  if (g_apex_enabled.exchange(enabled) == enabled) return;
+  if (!enabled) {
+    TakeApexFrame();
+    g_apex_history = false;
+  }
+  Line("Apex frame generation %s, cumulative generated frames %llu", enabled ? "enabled" : "off (real presents only)", g_apex_generated.load());
 }
 
 bool Frame(const FrameFeed& in) {
   if (g_shut.load(std::memory_order_acquire)) return false;
+  if (g_start_options.apex && !in.tag) {
+    if (!g_apex_enabled.load() || !g_up || g_apex_failed || in.queue != g_apex_queue.load() || !in.back_buffer || !in.depth || (!in.motion && !in.nvof)) return false;
+    ApexPending pending{in, in.motion, in.depth, GetCurrentThreadId()};
+    AcquireSRWLockExclusive(&g_apex_pending_lock);
+    const bool queued = g_apex_enabled.load();
+    if (queued) g_apex_pending = std::move(pending);
+    ReleaseSRWLockExclusive(&g_apex_pending_lock);
+    return queued;
+  }
   const double before = NowMs();
   const bool fed = FeedFrame(in);
   g_times.feed_worst = std::max(g_times.feed_worst, NowMs() - before);
@@ -1602,14 +1912,15 @@ bool FeedFrame(const FrameFeed& in) {
   // No flow effect is fine with NVIDIA Optical Flow on: it makes the flow alone, at the depth's size in a format of HSF's choosing.
   const bool nvof_alone = in.motion == nullptr && in.nvof;
   if ((in.motion == nullptr && !nvof_alone) || in.depth == nullptr || in.back_buffer == nullptr) return false;
-  if (in.tag == nullptr && (g_sl_tag == nullptr || g_sl_constants == nullptr || g_sl_dlssg_options == nullptr || g_token == nullptr)) return false;
+  const bool apex_mode = g_start_options.apex && !in.tag;
+  if (!apex_mode && in.tag == nullptr && (g_sl_tag == nullptr || g_sl_constants == nullptr || g_sl_dlssg_options == nullptr || g_token == nullptr)) return false;
   const D3D12_RESOURCE_DESC back = in.back_buffer->GetDesc();
   if (in.colour_space != UINT32_MAX) g_game_space = in.colour_space;
   // DLSS-G takes SDR or HDR10 frames, not FP16 (NVIDIA's DLSS-G guide, section 11.0): it accepts the options and shows only the real frames. The helper converts
   // FP16 to HDR10 for its own swap chain, but here DLSS-G presents on the game's, so the game (or RenoDX's swap chain setting) has to output HDR10.
   // When HSF converts the game's FP16 frames itself (fp16_swap.h), DLSS-G sees R10G10B10A2 and this is no problem.
   const bool fp16 = (back.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || back.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS) && !hsf::fp16swap::Active();
-  if (fp16 && !g_fp16.exchange(true)) Line("the swap chain is FP16 (scRGB): DLSS-G generates nothing from it; set the game or RenoDX to HDR10");
+  if (!apex_mode && fp16 && !g_fp16.exchange(true)) Line("the swap chain is FP16 (scRGB): DLSS-G generates nothing from it; set the game or RenoDX to HDR10");
   if (!fp16) g_fp16 = false;
   D3D12_RESOURCE_DESC depth_desc = in.depth->GetDesc();
   D3D12_RESOURCE_DESC motion_desc = depth_desc;
@@ -1696,10 +2007,15 @@ bool FeedFrame(const FrameFeed& in) {
     Line("the GPU is over 200 ms behind: a frame without inputs");
     return false;
   }
-  const bool reset = in.reset || (in.tag == nullptr && (!g_options.set || !g_options.on));
+  const bool reset = in.reset || (apex_mode ? !g_apex_history : in.tag == nullptr && (!g_options.set || !g_options.on));
   ID3D12GraphicsCommandList* const list = f->list.Get();
-  f->alloc[frame]->Reset();
-  list->Reset(f->alloc[frame].Get(), nullptr);
+  HRESULT reset_hr = f->alloc[frame]->Reset();
+  if (SUCCEEDED(reset_hr) || !apex_mode) reset_hr = list->Reset(f->alloc[frame].Get(), nullptr);
+  if (apex_mode && FAILED(reset_hr)) {
+    Line("Apex input command list reset failed 0x%08lx", reset_hr);
+    g_status = 1;
+    return false;
+  }
   // The depth everything below reads and DLSS-G gets.
   ID3D12Resource* depth = in.depth;
   if (fit_depth) {
@@ -1770,7 +2086,36 @@ bool FeedFrame(const FrameFeed& in) {
   const sl::Extent extent{partial ? in.y : 0, partial ? in.x : 0, partial ? in.width : f->input_width, partial ? in.height : f->input_height};
   ID3D12Resource* const tag_motion = own_motion ? f->mvec.Get() : flow;
   const uint32_t motion_state = static_cast<uint32_t>(own_motion || flow_made ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : READ_ANY);
-  if (in.tag != nullptr) {
+  apex::FrameResult apex_result = apex::FrameResult::failed;
+  if (apex_mode) {
+    if (!f->apex_tried) {
+      f->apex_tried = true;
+      auto session = std::make_unique<apex::Session>();
+      if (session->Init(*g_apex, in, f->input_width, f->input_height)) f->apex = std::move(session);
+    }
+    const auto fits = [&](ID3D12Resource* resource) {
+      const auto d = resource->GetDesc();
+      return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count == 1 &&
+             static_cast<uint64_t>(extent.left) + extent.width <= d.Width &&
+             static_cast<uint64_t>(extent.top) + extent.height <= d.Height &&
+             (d.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0;
+    };
+    const DXGI_FORMAT mvec_format = tag_motion ? tag_motion->GetDesc().Format : DXGI_FORMAT_UNKNOWN;
+    const DXGI_FORMAT depth_format = depth->GetDesc().Format;
+    const bool compatible = tag_motion && fits(tag_motion) && fits(depth) &&
+                            (mvec_format == DXGI_FORMAT_R16G16_FLOAT || mvec_format == DXGI_FORMAT_R32G32_FLOAT) &&
+                            depth_format == DXGI_FORMAT_R32_FLOAT;
+    if (!compatible) {
+      static bool logged = false;
+      if (!logged) Line("Apex skipped incompatible motion/depth resources (formats %u/%u, region %u,%u %ux%u)",
+                       static_cast<unsigned>(mvec_format), static_cast<unsigned>(depth_format), extent.left, extent.top, extent.width, extent.height);
+      logged = true;
+    } else if (f->apex) {
+      f->apex_inputs[frame][0] = tag_motion;
+      f->apex_inputs[frame][1] = depth;
+      apex_result = f->apex->Record(list, in, tag_motion, static_cast<D3D12_RESOURCE_STATES>(motion_state), depth, composing || in.dilated, reset, in.frames);
+    }
+  } else if (in.tag != nullptr) {
     const uint32_t ext[4] = {extent.left, extent.top, extent.width, extent.height};
     in.tag(list, depth, static_cast<uint32_t>(READ_ANY), tag_motion, motion_state, ext, in.scale, composing || in.dilated, in.depth_inverted);
   } else {
@@ -1796,15 +2141,37 @@ bool FeedFrame(const FrameFeed& in) {
       f->view.Record(list, frame, static_cast<debugview::Kind>(in.view), tag_motion, depth, partial ? in.x : 0, partial ? in.y : 0, partial ? in.width : 0, partial ? in.height : 0,
                      in.depth_inverted, in.scale, in.back_buffer, static_cast<D3D12_RESOURCE_STATES>(in.back_buffer_state));
   }
-  list->Close();
+  const HRESULT closed = list->Close();
+  if (apex_mode && FAILED(closed)) {
+    Line("Apex input command list close failed 0x%08lx", closed);
+    return false;
+  }
   ID3D12CommandList* const lists[] = {list};
   in.queue->ExecuteCommandLists(1, lists);
-  in.queue->Signal(f->fence.Get(), ++f->value);
+  const HRESULT signaled = in.queue->Signal(f->fence.Get(), ++f->value);
+  if (apex_mode && FAILED(signaled)) {
+    Line("Apex input fence signal failed 0x%08lx, device 0x%08lx", signaled, in.device->GetDeviceRemovedReason());
+    g_status = 1;
+    return false;
+  }
   f->alloc_value[frame] = f->value;
   ++f->count;
   double ms = 0;
   if (composing && f->compose.TakeAverageMs(600, ms)) Line("compose pass: %.2f ms on the GPU", ms);
   if (masking && f->mask.TakeAverageMs(600, ms)) Line("HUD mask: %.2f ms on the GPU", ms);
+  if (apex_mode) {
+    if (apex_result == apex::FrameResult::failed) {
+      g_status = 1;
+      return false;
+    }
+    g_status = 0;
+    g_fed_total.fetch_add(1, std::memory_order_relaxed);
+    if (apex_result == apex::FrameResult::generated) {
+      g_apex_present = f->apex.get();
+      g_apex_present_count = in.frames;
+    }
+    return true;
+  }
   // Someone else's Streamline: its owner sends the constants, options and markers.
   if (in.tag != nullptr) return true;
 
@@ -1823,6 +2190,7 @@ bool FeedFrame(const FrameFeed& in) {
 }  // namespace
 
 void Stop(bool process_exiting) {
+  if (g_start_options.apex) TakeApexFrame();
   if (!process_exiting && g_table != nullptr) {
     WriteSlot(g_table, SLOT_CREATE_SWAP_CHAIN, reinterpret_cast<void*>(g_real_create));
     WriteSlot(g_table, SLOT_CREATE_FOR_HWND, reinterpret_cast<void*>(g_real_for_hwnd));
@@ -1838,7 +2206,9 @@ void Stop(bool process_exiting) {
       g_present_table = nullptr;
     }
     g_feeder.reset();
+    if (g_start_options.apex) g_apex.reset();
   } else {
+    if (g_start_options.apex) (void)g_apex.release();
     // The game's queue may be gone already, and the feeder's parts would wait on it.
     (void)g_feeder.release();
   }
@@ -1849,6 +2219,13 @@ void Stop(bool process_exiting) {
 bool NeedsExitShutdown() { return g_sl_started.load() && g_sl_shutdown != nullptr && !g_shut.load(); }
 
 void ShutdownForExit() {
+  if (g_start_options.apex) {
+    if (g_shut.exchange(true)) return;
+    TakeApexFrame();
+    g_feeder.reset();
+    g_apex.reset();
+    return;
+  }
   if (!g_sl_started.load() || g_sl_shutdown == nullptr || g_shut.exchange(true)) return;
   Line("the game is exiting: shutting HSF's Streamline down while its threads still run");
   const sl::Result result = g_sl_shutdown();
@@ -1859,6 +2236,7 @@ void ShutdownForExit() {
 
 Stats GetStats() {
   Stats s{};
+  s.apex = g_start_options.apex;
   s.streamline_up = g_up.load();
   s.swap_chains = g_swap_chains.load();
   s.failed = g_failed.load();

@@ -27,6 +27,11 @@ struct StartOptions {
   std::wstring ngx_path;
   std::wstring ini_path;       // HSF.ini, where the search's answer is saved as SlNgxPath; empty saves nothing
 
+  bool apex = false;          // Run Apex directly on the native D3D12 swap chain.
+  bool apex_debug = false;
+  bool apex_allow_tearing = false;  // Pace VSync-off presents on a waitable swap chain with latency one or two.
+  std::wstring apex_dll;      // Absolute path to the provider, with its package files alongside it.
+
   int route_dlssg = -1;        // SlRouteDlssg: DLSS-G's own calls on ReShade's device go to the native one. -1 when RenoDX is loaded, 0 never, 1 always
 };
 // folder holds sl.interposer.dll and its plugins. Only loads sl.interposer.dll (no slInit) when early_load is set, so other add-ons that look for Streamline
@@ -66,6 +71,8 @@ struct FrameFeed {
 };
 // After the frame is finished and before Streamline gets its Present, on the thread that presents, with anything recorded for the same queue already submitted. False: this frame has no inputs.
 bool Frame(const FrameFeed& feed);
+// Applies the Apex toggle at native Present, including a frame already queued by ReShade.
+void SetApexEnabled(bool enabled);
 void SetReflex(uint32_t fps_cap, bool boost, bool sleep);
 // A line in this file's log, for ngx_input.cpp.
 void LogLine(const char* text);
@@ -79,6 +86,7 @@ bool NeedsExitShutdown();
 void ShutdownForExit();
 
 struct Stats {
+  bool apex;                 // the direct Apex backend was selected
   bool streamline_up;        // slInit worked
   uint32_t swap_chains;      // made through Streamline
   uint32_t failed;           // Streamline could not make, so the game got a plain one

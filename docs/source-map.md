@@ -66,6 +66,7 @@ D3D11 and DX9 games, 32-bit and 64-bit, run DLSS-G in the helper. Streamline 2.1
 | `sl_game.h`, `sl_game.cpp` | The in-game route: HSF's hooks on the game's `sl.interposer.dll` (plugin hook, load watch, two copies), logging, drive, motion order, camera rebuild, cut check, focus hold, frame tokens. |
 | `hook_patch.h`, `hook_patch.cpp` | HSF's own hook patcher: 5-byte jump, relay page near the module, trampoline, the full length decoder, chaining behind another tool's jump. Its own leaf lock. |
 | `sl_bring.h`, `sl_bring.cpp` | The bring-in route: loads Streamline 2.14, catches swap-chain creation on the DXGI factory, sends Reflex, tokens, tags and frames, and shuts Streamline down before the game exits. |
+| `apex_fg.h`, `apex_fg.cpp` | Direct Apex ANR FG provider, FP16 resources, motion conversion and presentation copies. |
 | `fp16_swap.h`, `fp16_swap.cpp` | Bring-in route, FP16 (scRGB) games: the swap chain is made as R10G10B10A2, the game draws into FP16 textures of HSF's own, and each frame is converted to HDR10 or sRGB before Streamline takes it. |
 | `depth_fit.h`, `depth_fit.cpp` | Compute pass that brings the game's render-size depth up to the size of its full-size DLSS vectors, since DLSS-G takes one size for both. |
 | `dxgi_guard.h`, `dxgi_guard.cpp` | Keeps ReShade's DXGI factory from wrapping adapter interfaces it does not know (d3d11.dll asks for one when RTSS makes its device), which crashed the game. |

@@ -252,3 +252,9 @@ Frame generation and the overlay have no key until you set one, because the free
 ## 9. Uninstall
 
 Delete `hsf.addon64` or `hsf.addon32`, `HSF.ini`, `HSF_safe_try.ini`, `HSF.log`, `HSF.previous.log`, the `HSF_streamline` folder and `reshade-shaders\Shaders\HSF.fx`. HSF changes nothing else in the game folder. There is one exception: on DirectX 9 games that ran out of memory, the 4 GB flag may have been set by hand in the exe, and the original was kept next to it.
+
+## Experimental native FP16 Apex backend
+
+Apex ANR FG V.B20 uses HSF's x64 D3D12 bring-in route. The game needs a native FP16 scRGB swap chain, motion and depth. Keep the provider and its sidecar data under `HSF_apex\dlssg` beside the existing `HSF_streamline` folder. The BACKEND row switches at the next launch.
+
+Apex supports the manual 2x and 3x multipliers when allowed by the provider and presentation path. VSync interval 4 uses 2x.

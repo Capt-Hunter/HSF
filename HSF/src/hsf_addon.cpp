@@ -388,6 +388,10 @@ bool D3d12Run() { return g_d3d12_frames.load(std::memory_order_relaxed) > g_d3d1
 
 #ifdef HSF_SL_GAME
 bool g_sl_bring = false;  // SlBringIn=1: a D3D12 game with no Streamline gets it from HSF
+bool g_apex_route = false;  // Direct D3D12 Apex uses only the rendering callbacks it needs.
+bool g_apex_next_launch = false;
+bool g_apex_request_flow = false;  // Opt in to requesting LaunchPad flow when no other effect does.
+bool g_apex_allow_unbound_depth = false;  // Stock HSF accepted the depth copy even without a bound source.
 // The bring route's Streamline must be shut down before Windows unloads the DLLs at exit (slbring::ShutdownForExit). ExitProcess ends in ntdll's RtlExitUserProcess,
 // which still runs with every thread alive and no loader lock held, so the hook goes there.
 using ExitUserProcessFn = void(NTAPI*)(LONG);
@@ -585,6 +589,13 @@ void SaveIni() {
   if (GetFileAttributesExW(g_ini_path, GetFileExInfoStandard, &data)) g_ini_time = data.ftLastWriteTime;
 }
 
+void SetFrameGenerationEnabled(bool enabled) {
+  g_extra_enabled = enabled;
+#ifdef HSF_SL_GAME
+  if (g_apex_route) hsf::slbring::SetApexEnabled(enabled);
+#endif
+}
+
 void PollIni() {
   static ULONGLONG next_check = 0;
   const ULONGLONG now = GetTickCount64();
@@ -608,7 +619,7 @@ void PollIni() {
       if (_wcsicmp(mode, LaunchPadModeName(i)) == 0) g_launchpad_mode = i;
   }
   g_game_fg_ok = GetPrivateProfileIntW(L"HSF", L"GameFgWarningOk", 0, g_ini_path) != 0;
-  g_extra_enabled = GetPrivateProfileIntW(L"HSF", L"Extra", 1, g_ini_path) != 0;
+  SetFrameGenerationEnabled(GetPrivateProfileIntW(L"HSF", L"Extra", 1, g_ini_path) != 0);
   wchar_t motion[16];
   GetPrivateProfileStringW(L"HSF", L"Motion", L"auto", motion, static_cast<DWORD>(std::size(motion)), g_ini_path);
   g_motion_convention = 0;
@@ -741,7 +752,7 @@ void HandleToggleKeys(effect_runtime* runtime) {
   if (now - last < 150) return;
   if (g_fg_key != 0 && runtime->is_key_pressed(g_fg_key)) {
     last = now;
-    g_extra_enabled = !g_extra_enabled;
+    SetFrameGenerationEnabled(!g_extra_enabled);
     Log(g_extra_enabled ? "FrameGenKey: frame generation on" : "FrameGenKey: frame generation off");
     SaveIni();
   }
@@ -1103,7 +1114,10 @@ void Inspect(effect_runtime* runtime, device* dev, const resource_desc& back) {
   g_motion9 = nullptr;
   g_motion_vk = {0};
   if (g_seen.source >= 0) {
-    EnableRequest(runtime);
+#ifdef HSF_SL_GAME
+    if (!g_apex_route || g_apex_request_flow)
+#endif
+      EnableRequest(runtime);
     resource_view srv{}, srv_srgb{};
     runtime->get_texture_binding(g_source_variables[g_seen.source], &srv, &srv_srgb);
     if (srv.handle != 0) {
@@ -2838,9 +2852,11 @@ bool FindFlowAndDepth(effect_runtime* runtime, device* dev, ID3D12Resource** mot
       }
     };
     switch_on("HSF.fx", "HSF_DepthCopy");
-    switch_on("HSF.fx", "HSF_Depth");
-    switch_on("MartysMods_LAUNCHPAD.fx", "MartysMods_Launchpad");
-    switch_on("lumenite_Kernel.fx", "Lumenite_Kernel");  // the other flow HSF reads (FF7R had it and no LaunchPad)
+    if (!g_apex_route) {
+      switch_on("HSF.fx", "HSF_Depth");
+      switch_on("MartysMods_LAUNCHPAD.fx", "MartysMods_Launchpad");
+      switch_on("lumenite_Kernel.fx", "Lumenite_Kernel");  // the other flow HSF reads (FF7R had it and no LaunchPad)
+    }
   }
   ID3D12Resource* motion = nullptr;
   if (g_seen.have_motion && g_seen.source >= 0) {
@@ -2853,6 +2869,16 @@ bool FindFlowAndDepth(effect_runtime* runtime, device* dev, ID3D12Resource** mot
     resource_view srv{}, srv_srgb{};
     runtime->get_texture_binding(depth_variable, &srv, &srv_srgb);
     if (srv.handle != 0) depth = reinterpret_cast<ID3D12Resource*>(dev->get_resource_from_view(srv).handle);
+  }
+  if (g_apex_route && depth) {
+    uint32_t width = 0, height = 0;
+    if (!BoundDepthSize(runtime, width, height)) {
+      static bool logged = false;
+      if (!logged) Log(g_apex_allow_unbound_depth ? "Apex compatibility test: using the depth copy without a game depth binding" :
+                                                  "Apex is waiting for a real depth binding for HSF.fx");
+      logged = true;
+      if (!g_apex_allow_unbound_depth) depth = nullptr;
+    }
   }
   static bool logged_ready = false, logged_missing = false;
   // With NVOF on and no flow effect, NVOF makes the flow alone: depth is enough, and the effect's sign convention does not apply (motion stays nullptr).
@@ -4914,9 +4940,48 @@ void OnDestroyDevice(device* dev) {
   Log(line);
 }
 
+#ifdef HSF_SL_GAME
+// Pause HSF's full-resolution depth pass while Apex is off. The original technique state is restored on resume.
+bool SyncApexDepthCopy(effect_runtime* runtime, bool enabled) {
+  static effect_runtime* owner = nullptr;
+  static uint32_t reload = 0;
+  static bool last_enabled = true, paused = false;
+  if (owner != runtime || reload != g_effect_reloads) {
+    owner = runtime;
+    reload = g_effect_reloads;
+    last_enabled = true;
+    paused = false;
+  }
+  if (enabled == last_enabled) return true;
+  last_enabled = enabled;
+  const effect_technique copy = runtime->find_technique("HSF.fx", "HSF_DepthCopy");
+  if (!enabled) {
+    paused = copy.handle && runtime->get_technique_state(copy);
+    if (paused) {
+      runtime->set_technique_state(copy, false);
+      Log("Apex paused HSF's depth copy");
+    }
+  } else if (paused && copy.handle) {
+    paused = false;
+    runtime->set_technique_state(copy, true);
+    Log("Apex resumed HSF's depth copy");
+    return false;  // The effects have already run. Wait for the next frame's depth copy.
+  }
+  return true;
+}
+#endif
+
 void OnFinishEffects(effect_runtime* runtime, command_list*, resource_view rtv, resource_view) {
   device* const dev = runtime->get_device();
   PollIni();
+#ifdef HSF_SL_GAME
+  if (g_apex_route && dev->get_api() == device_api::d3d12 &&
+      (!SyncApexDepthCopy(runtime, g_extra_enabled) || !g_extra_enabled)) {
+    g_d3d12_frames.fetch_add(1, std::memory_order_relaxed);
+    HandleToggleKeys(runtime);
+    return;
+  }
+#endif
   UpdateStats();
   if (rtv.handle == 0) return;
   const resource target = dev->get_resource_from_view(rtv);
@@ -5062,6 +5127,12 @@ void OnSlBringPresent(effect_runtime*) { hsf::slbring::Poll(); }
 bool g_in_helper = false;  // True inside HSF's own DLSS-G helper process.
 
 void OnInitDevice([[maybe_unused]] device* dev) {
+#ifdef HSF_SL_GAME
+  if (g_apex_route) {
+    if (dev->get_api() == device_api::d3d12) hsf::slbring::NoteDevice(reinterpret_cast<void*>(dev->get_native()));
+    return;
+  }
+#endif
   // Vulkan probe: the planned bridge hands the game's frames to the helper through images and a fence shared with NT handles, made through
   // ReShade on the game's device. ReShade's layer can do that only when it turned on the external memory and semaphore extensions.
   if (dev->get_api() == device_api::vulkan) {
@@ -5628,8 +5699,8 @@ void DrawDetails(effect_runtime* runtime) {
 #ifdef HSF_SL_GAME
   if (g_sl_bring && D3d12Run()) {
     const hsf::slbring::Stats stats = hsf::slbring::GetStats();
-    ImGui::Text("Streamline brought in by HSF: %s", stats.swap_chains != 0 ? "running" : "no swap chain yet");
-    ImGui::Text("DLSS-G %s, asked for %ux, really showing %ux. Status 0x%x, up to %ux", stats.generating ? "generating" : "not generating", g_dlssg_frames + 1, stats.shown_per_real, stats.status, stats.max_frames + 1);
+    ImGui::Text("%s: %s", stats.apex ? "Apex ANR FG" : "Streamline brought in by HSF", stats.swap_chains != 0 ? "running" : "no swap chain yet");
+    ImGui::Text("%s %s, asked for %ux, really showing %ux. Status 0x%x, up to %ux", stats.apex ? "Apex" : "DLSS-G", stats.generating ? "generating" : "not generating", g_dlssg_frames + 1, stats.shown_per_real, stats.status, stats.max_frames + 1);
     DrawD3d12Controls(stats.max_frames, g_bring_using_game ? "the game's own DLSS vectors and depth" : MotionFrom() != 1 ? "optical (this game sends no DLSS data now)" : "optical", true);
     DrawLaunchPadTune(runtime);
     DrawOlderCardMod();
@@ -5659,7 +5730,9 @@ void DrawDetails(effect_runtime* runtime) {
     ImGui::TextUnformatted("Waiting for the first frame.");
     return;
   }
-  bool changed = ImGui::Checkbox("Frame generation", &g_extra_enabled);
+  bool enabled = g_extra_enabled;
+  bool changed = ImGui::Checkbox("Frame generation", &enabled);
+  if (changed) SetFrameGenerationEnabled(enabled);
   {
     const char* const MODES[] = {"2x", "3x", "4x", "5x", "6x"};
     // Only the modes DLSS-G says this machine can do (known once it has started).
@@ -6006,11 +6079,18 @@ MenuView ReadMenuViewOfRoute() {
   if (g_sl_bring && d3d12_run) {
     const hsf::slbring::Stats s = hsf::slbring::GetStats();
     v.api = "D3D12";
-    v.route = "IN GAME // HSF STREAMLINE";
+    v.route = s.apex ? "IN GAME // APEX ANR FG" : "IN GAME // HSF STREAMLINE";
     v.d3d12 = v.bring = true;
     v.max_frames = s.max_frames;
-    v.generating = s.generating && s.shown_per_real > 1;
+    v.generating = (!s.apex || g_extra_enabled) && s.generating && s.shown_per_real > 1;
     if (v.generating) v.out_fps = v.base_fps * static_cast<float>(s.shown_per_real);
+    if (s.apex) {
+      if (s.plugin_loaded == 0) v.problem = "Apex initialization failed (see HSF.log).";
+      else if (s.status > 0) v.problem = "Apex frame submission failed (see HSF.log).";
+      else if (s.swap_chains == 0) v.waiting = "Apex is waiting for a compatible native FP16 swap chain.";
+      else if (!v.generating) v.waiting = "Apex needs a focused scRGB window, compatible presentation and motion/depth inputs.";
+      return v;
+    }
     if (!s.streamline_up) v.waiting = "Streamline has not started yet.";
     else if (s.swap_chains == 0) v.waiting = "No swap chain through Streamline yet.";
     else if (s.plugin_loaded == 0) v.problem = "DLSS-G's plugin did not load (see HSF.log).";
@@ -6215,6 +6295,15 @@ void ReadFinderD3d12(Finder& f) {
   if (g_sl_bring) {
     const hsf::slbring::Stats s = hsf::slbring::GetStats();
     f.route = FinderRoute::hsf_streamline;
+    if (s.apex) {
+      AddStep(f, "APEX ANR FG", s.plugin_loaded == 1 ? StepState::ok : s.plugin_loaded == 0 ? StepState::failed : StepState::waiting,
+              "%s", s.plugin_loaded == 1 ? "provider initialized" : "check HSF.log for the provider status");
+      AddStep(f, "NATIVE FP16", s.swap_chains ? StepState::ok : StepState::waiting, "%s",
+              s.swap_chains ? "FP16 swap chain attached, HDR conversion off" : "waiting for a compatible swap chain");
+      AddStep(f, "FRAMES", s.generating ? StepState::ok : s.status > 0 ? StepState::failed : StepState::waiting,
+              "%s", s.generating ? "presenting generated frames" : "check presentation, window focus and motion/depth in HSF.log");
+      return;
+    }
     if (s.streamline_up) AddStep(f, "STREAMLINE", StepState::ok, "HSF's own, started");
     else AddStep(f, "STREAMLINE", StepState::failed, "HSF's Streamline did not start (HSF.log says why). Restart the game once");
     if (s.swap_chains > 0) AddStep(f, "SWAP CHAIN", StepState::ok, "%u made through Streamline", s.swap_chains);
@@ -7227,7 +7316,7 @@ bool KeyBind(effect_runtime* runtime, const char* id, uint32_t* key) {
 
 // Every setting the menu shows, back to HSF's defaults. Route switches (InGameDlssg, SlBringIn and the like) and hotkeys stay as they are.
 void ResetMenuSettings() {
-  g_extra_enabled = true;
+  SetFrameGenerationEnabled(true);
   g_dlssg_frames = 1;
   g_reflex_sleep = true;
   g_reflex_boost = false;
@@ -7569,7 +7658,12 @@ std::string MenuShort(const char* text, size_t limit, bool file_name = false) {
 bool XmxFellBack(const FgEngineState& engine, const hsf::xmx::Status& xmx) { return engine.running && xmx.failure[0] != '\0' && xmx.hooked == 0; }
 
 // Who makes the generated frames this run, for the overlay: XeMFG once its hook is in, else DLSS-G.
-const char* FgEngineName(const FgEngineState& engine, const hsf::xmx::Status& xmx) { return engine.running && xmx.hooked > 0 ? "XEMFG" : "DLSS-G"; }
+const char* FgEngineName(const FgEngineState& engine, const hsf::xmx::Status& xmx) {
+#ifdef HSF_SL_GAME
+  if (g_apex_route) return "APEX";
+#endif
+  return engine.running && xmx.hooked > 0 ? "XEMFG" : "DLSS-G";
+}
 
 // FG ENGINE's hover text: XeMFG's whole state, in sentences.
 std::string FgEngineReport(const FgEngineState& engine, const hsf::xmx::Status& xmx) {
@@ -7656,7 +7750,11 @@ void DrawPanel(effect_runtime* runtime) {
 
   // ---- Frame generation on or off.
   ui::RowLabel("FRAME GEN", c::GREEN);
-  if (ui::Toggle("##fg", &g_extra_enabled)) changed = true;
+  bool enabled = g_extra_enabled;
+  if (ui::Toggle("##fg", &enabled)) {
+    SetFrameGenerationEnabled(enabled);
+    changed = true;
+  }
   if (g_fg_key != 0) {
     char key[32];
     KeyName(g_fg_key, key, sizeof(key));
@@ -7678,42 +7776,69 @@ void DrawPanel(effect_runtime* runtime) {
   // state (FgEngineReport), and one amber line shows under it only when something is wrong (FgEngineProblem).
   FgEngineState& engine = FgEngine();
   const hsf::xmx::Status xmx = XmxNow();
-  ui::RowLabel("FG ENGINE", c::GREEN);
-  if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", FgEngineReport(engine, xmx).c_str());
+#ifdef HSF_SL_GAME
+  if (!g_apex_route && !g_apex_next_launch)
+#endif
   {
-    static const char* const ENGINES[] = {"DLSS-G", "XEMFG"};
-    static const char* const TIPS[] = {"NVIDIA's own frame generation. The default.",
-                                       "EXPERIMENTAL. Intel's XeSS frame generation, run inside DLSS-G.\n"
-                                       "Needs libxess_fg.dll 1.3.1.78 and libxell.dll in HSF_streamline.\n"
-                                       "3x to 6x also needs MFG-Unlocker or the RenoDX MFG unlock add-on.\n"
-                                       "Applies when the game starts again."};
-    int pick = engine.pick;
-    if (ui::Choice("##fgengine", ENGINES, 2, &pick, 0, TIPS) && pick != engine.pick) {
-      engine.pick = pick;
-      WritePrivateProfileStringW(L"HSF", L"FgEngine", pick == 1 ? L"xemfg" : L"dlssg", g_ini_path);
-      Log(pick == 1 ? "menu: FG ENGINE set to XEMFG (FgEngine=xemfg), from the next launch" : "menu: FG ENGINE set to DLSS-G (FgEngine=dlssg), from the next launch");
-    }
-    char note[64];
-    ImU32 note_colour = c::DIM;
-    if (engine.pick != (engine.running ? 1 : 0)) {
-      std::snprintf(note, sizeof(note), "> RESTART THE GAME TO SWITCH");
-      note_colour = c::AMBER;
-    } else if (!engine.running) {
-      std::snprintf(note, sizeof(note), "> NVIDIA");
-    } else if (XmxFellBack(engine, xmx)) {
-      std::snprintf(note, sizeof(note), "> DLSS-G (XEMFG FAILED)");
-      note_colour = c::AMBER;
-    } else {
-      std::snprintf(note, sizeof(note), "> XEMFG // EXPERIMENTAL // %uX", xmx.published ? xmx.max_frames + 1 : 2u);
-      note_colour = xmx.generating ? c::GREEN : c::DIM;
-    }
-    ui::RightNote(note, note_colour);
-  }
-  if (const std::string problem = FgEngineProblem(engine, xmx); !problem.empty()) {
-    ImGui::SetCursorScreenPos(ImVec2(ui::ControlX(), ImGui::GetCursorScreenPos().y));
-    ui::Caps(problem.c_str(), c::AMBER, 0.75f);
+    ui::RowLabel("FG ENGINE", c::GREEN);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", FgEngineReport(engine, xmx).c_str());
+    {
+      static const char* const ENGINES[] = {"DLSS-G", "XEMFG"};
+      static const char* const TIPS[] = {"NVIDIA's own frame generation. The default.",
+                                         "EXPERIMENTAL. Intel's XeSS frame generation, run inside DLSS-G.\n"
+                                         "Needs libxess_fg.dll 1.3.1.78 and libxell.dll in HSF_streamline.\n"
+                                         "3x to 6x also needs MFG-Unlocker or the RenoDX MFG unlock add-on.\n"
+                                         "Applies when the game starts again."};
+      int pick = engine.pick;
+      if (ui::Choice("##fgengine", ENGINES, 2, &pick, 0, TIPS) && pick != engine.pick) {
+        engine.pick = pick;
+        WritePrivateProfileStringW(L"HSF", L"FgEngine", pick == 1 ? L"xemfg" : L"dlssg", g_ini_path);
+        Log(pick == 1 ? "menu: FG ENGINE set to XEMFG (FgEngine=xemfg), from the next launch" : "menu: FG ENGINE set to DLSS-G (FgEngine=dlssg), from the next launch");
+      }
+      char note[64];
+      ImU32 note_colour = c::DIM;
+      if (engine.pick != (engine.running ? 1 : 0)) {
+        std::snprintf(note, sizeof(note), "> RESTART THE GAME TO SWITCH");
+        note_colour = c::AMBER;
+      } else if (!engine.running) {
+        std::snprintf(note, sizeof(note), "> NVIDIA");
+      } else if (XmxFellBack(engine, xmx)) {
+        std::snprintf(note, sizeof(note), "> DLSS-G (XEMFG FAILED)");
+        note_colour = c::AMBER;
+      } else {
+        std::snprintf(note, sizeof(note), "> XEMFG // EXPERIMENTAL // %uX", xmx.published ? xmx.max_frames + 1 : 2u);
+        note_colour = xmx.generating ? c::GREEN : c::DIM;
+      }
+      ui::RightNote(note, note_colour);
+    }
+    if (const std::string problem = FgEngineProblem(engine, xmx); !problem.empty()) {
+      ImGui::SetCursorScreenPos(ImVec2(ui::ControlX(), ImGui::GetCursorScreenPos().y));
+      ui::Caps(problem.c_str(), c::AMBER, 0.75f);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", FgEngineReport(engine, xmx).c_str());
+    }
   }
+
+#ifdef HSF_SL_GAME
+  if (now.d3d12 || g_apex_route) {
+    static bool save_failed = false;
+    static const char* const backends[] = {"DLSS-G / XEMFG", "APEX ANR FG"};
+    const bool apex_available = now.d3d12 && g_sl_bring && !g_sl_drive;
+    int next_backend = g_apex_next_launch ? 1 : 0;
+    ui::RowLabel("BACKEND", c::GREEN);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("%s", apex_available ? "The selection takes effect after you restart the game." :
+                         "Apex needs Direct3D 12 and HSF's bring-in route, with the game-owned frame generation route off.");
+    if (ui::Choice("##fg_backend", backends, 2, &next_backend, apex_available ? 0u : 2u)) {
+      save_failed = !WritePrivateProfileStringW(L"HSF", L"FrameGenerationBackend", next_backend ? L"Apex" : L"NVIDIA", g_ini_path);
+      if (!save_failed) {
+        g_apex_next_launch = next_backend != 0;
+        Log(g_apex_next_launch ? "backend saved for next launch: Apex ANR FG" : "backend saved for next launch: DLSS-G / XeMFG");
+      }
+    }
+    if (save_failed) ui::SmallWrapped("Could not save HSF.ini.", c::RED);
+    else if (g_apex_next_launch != g_apex_route && apex_available) ui::SmallWrapped("Restart the game to switch backends.", c::AMBER);
+  }
+#endif
 
   // ---- Multiplier: only what DLSS-G says this machine can do, once it has said.
   ui::RowLabel("MULTIPLIER", c::RED);
@@ -8909,12 +9034,12 @@ void DrawOsd(effect_runtime*) {
 // True when this add-on was loaded into HSF's own DLSS-G helper, not a game. A child process of a packaged game (Game Pass) searches the
 // game's package folder for DLLs first, so a ReShade dxgi.dll there can load into the helper. The helper then does its own guard (system
 // DLLs first, dlssg_helper.cpp); this is the second line, for a ReShade that still gets in.
-bool InHelperProcess() {
+bool CurrentExecutableIs(const wchar_t* expected) {
   wchar_t exe[MAX_PATH];
   const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
   if (n == 0 || n >= MAX_PATH) return false;
   const wchar_t* const slash = wcsrchr(exe, L'\\');
-  return _wcsicmp(slash != nullptr ? slash + 1 : exe, hsf::dlssg_link::HELPER_EXE) == 0;
+  return _wcsicmp(slash != nullptr ? slash + 1 : exe, expected) == 0;
 }
 
 // Inside the helper: ReShade's effects stay off, so the frames DLSS-G shows are not processed a second time.
@@ -8943,6 +9068,19 @@ void RegisterEvents() {
     return;
   }
 #ifdef HSF_SL_GAME
+  if (g_apex_route) {
+    reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
+    reshade::register_event<reshade::addon_event::present>(OnPresentColorSpace);
+    reshade::register_event<reshade::addon_event::reshade_finish_effects>(OnFinishEffects);
+    reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloaded);
+    reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnMenuToggled);
+    reshade::register_event<reshade::addon_event::reshade_present>(OnSlBringPresent);
+    reshade::register_event<reshade::addon_event::reshade_present>(OnSummaryFrame);
+    reshade::register_event<reshade::addon_event::reshade_present>(OnMenuFrame);
+    reshade::register_overlay("HSF", DrawPanel);
+    reshade::register_overlay("OSD", DrawOsd);
+    return;
+  }
   if (g_sl_bring) reshade::register_event<reshade::addon_event::reshade_present>(OnSlBringPresent);
   reshade::register_event<reshade::addon_event::execute_command_list>(OnVkSubmit);
   if (g_sl_game) {
@@ -9019,9 +9157,15 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
   return true;
 }
 
+extern "C" __declspec(dllexport) void AddonUninit(HMODULE, HMODULE) {
+#ifdef HSF_SL_GAME
+  if (g_sl_bring && hsf::slbring::GetStats().apex) hsf::slbring::ShutdownForExit();
+#endif
+}
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
   switch (reason) {
-    case DLL_PROCESS_ATTACH:
+    case DLL_PROCESS_ATTACH: {
       if (!reshade::register_addon(module)) return FALSE;
       reshade::log_message(reshade::log_level::info, "HSF " HSF_VERSION
 #ifdef _WIN64
@@ -9031,7 +9175,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
 #endif
       // In HSF's own helper the add-on does nothing else: no route pick, no HSF.ini writes, no menu or overlay.
       g_fresh_attach = true;
-      g_in_helper = InHelperProcess();
+      g_in_helper = CurrentExecutableIs(hsf::dlssg_link::HELPER_EXE);
       if (g_in_helper) {
         RegisterEvents();
         reshade::log_message(reshade::log_level::warning,
@@ -9045,14 +9189,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         log_path.resize(log_path.find_last_of(L'\\') + 1);
         hsf::hsflog::Open((log_path + L"HSF.log").c_str());
       }
-#ifdef HSF_SL_GAME
-      // FgEngine (EXPERIMENTAL XeMFG, xmx.h): read once, a change needs a restart. The Intel files are looked for in HSF_streamline, then next to HSF.ini.
-      if (g_ini_path[0] != L'\0') {
-        std::wstring folder = g_ini_path;
-        folder.resize(folder.find_last_of(L'\\'));
-        hsf::xmx::Configure(hsf::xmx::WantedFromIni(g_ini_path), folder.c_str(), &Log);
-      }
-#endif
       {
         // New ways of hooking are tried with the old kept as the backup (safe_try.h); HSF keeps its marks in HSF_safe_try.ini next to HSF.ini.
         std::wstring safe_try = g_ini_path;
@@ -9063,24 +9199,64 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         hsf::safetry::SetEnabled(GetPrivateProfileIntW(L"HSF", L"SafeTry", 1, g_ini_path) != 0);
         if (!hsf::safetry::Enabled()) Log("safe try is OFF (SafeTry=0): new ways are used even after a crash, and nothing is turned off");
       }
-      // Vulkan games: same-frame hand-off needs shared semaphores on the game's device, added at its vkCreateDevice (vk_hook.h).
-      if (GetPrivateProfileIntW(L"HSF", L"VkDeviceHook", 1, g_ini_path) != 0)
-        if (const char* const hooked = hsf::vk::HookCreateDevice()) Log(hooked);
 #ifdef HSF_SL_GAME
       // A native D3D12 game with its own Streamline. StreamlineProbe=1 logs what it sends and changes nothing; InGameDlssg=1 also runs DLSS-G inside the game.
       g_sl_drive = RouteOn(ReadRoute(L"InGameDlssg"));
       g_sl_game = g_sl_drive || GetPrivateProfileIntW(L"HSF", L"StreamlineProbe", 0, g_ini_path) != 0;
       // A native D3D12 game with no Streamline. On its own this only starts Streamline in the game: nothing is generated yet, as nothing feeds DLSS-G.
-      g_sl_bring = RouteOn(ReadRoute(L"SlBringIn"));
+      const Route bring_route = ReadRoute(L"SlBringIn");
+      g_sl_bring = RouteOn(bring_route);
+      const bool fc27 = CurrentExecutableIs(L"FC27.exe");
+      const std::wstring ini = g_ini_path;
+      const size_t separator = ini.rfind(L'\\');
+      const std::wstring folder = separator == std::wstring::npos ? std::wstring() : ini.substr(0, separator);
+      const std::wstring apex_dll = folder + L"\\HSF_apex\\dlssg\\nvngx_dlssg.dll";
+      const DWORD provider_attributes = folder.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(apex_dll.c_str());
+      const bool have_apex = provider_attributes != INVALID_FILE_ATTRIBUTES && !(provider_attributes & FILE_ATTRIBUTE_DIRECTORY);
+      wchar_t fg_backend[32]{};
+      GetPrivateProfileStringW(L"HSF", L"FrameGenerationBackend", fc27 ? L"Auto" : L"NVIDIA", fg_backend,
+                               static_cast<DWORD>(std::size(fg_backend)), g_ini_path);
+      // Auto only arms the native route. The factory waits for a D3D12 FP16 swap chain, and Present checks scRGB before loading the provider.
+      const bool auto_apex = _wcsicmp(fg_backend, L"Auto") == 0 && have_apex && !g_sl_game && bring_route != Route::off &&
+                             (g_sl_bring || fc27);
+      g_apex_next_launch = _wcsicmp(fg_backend, L"Apex") == 0 || auto_apex;
+      const bool apex_requested = g_apex_next_launch;
+      if (auto_apex || (apex_requested && fc27 && have_apex && !g_sl_game && bring_route == Route::unset)) g_sl_bring = true;
+      if (apex_requested && (!g_sl_bring || g_sl_drive)) {
+        Log("Apex requires SlBringIn=1 and HSF's InGameDlssg route off; select one frame-generation route");
+        if (g_sl_drive) g_sl_bring = false;
+      }
+      g_apex_route = apex_requested && g_sl_bring;
+      // FgEngine (EXPERIMENTAL XeMFG, xmx.h): read once, a change needs a restart. The Intel files are looked for in HSF_streamline, then next to HSF.ini.
+      if (!g_apex_route && !folder.empty()) {
+        hsf::xmx::Configure(hsf::xmx::WantedFromIni(g_ini_path), folder.c_str(), &Log);
+      }
+      g_apex_request_flow = g_apex_route && GetPrivateProfileIntW(L"HSF", L"ApexRequestFlow", 0, g_ini_path) != 0;
+      const int apex_compatibility_default = g_apex_route && fc27 ? 1 : 0;
+      g_apex_allow_unbound_depth =
+          g_apex_route && GetPrivateProfileIntW(L"HSF", L"ApexAllowUnboundDepth", apex_compatibility_default, g_ini_path) != 0;
+      if (g_apex_route) {
+        g_sl_game = false;
+        if (auto_apex) Log("Apex auto: waiting for a compatible native FP16 scRGB swap chain");
+        Log("Apex uses the existing ReShade preset and its own depth copy; automatic shader tuning and the DXGI adapter guard are off");
+      }
       if (g_sl_bring) {
-        wchar_t folder[MAX_PATH];
-        wcscpy_s(folder, g_ini_path);
-        if (wchar_t* const slash = wcsrchr(folder, L'\\')) *slash = L'\0';
-        const std::wstring bring_log = std::wstring(folder) + L"\\HSF.log";  // open already: the bring-in lines join HSF's
+        const std::wstring bring_log = folder + L"\\HSF.log";  // open already: the bring-in lines join HSF's
         // HSF's own Streamline if it is there, so that a game with an old copy, or none, gets the version HSF was tested with.
-        const std::wstring own = std::wstring(folder) + L"\\HSF_streamline";
+        const std::wstring own = folder + L"\\HSF_streamline";
         const bool have_own = GetFileAttributesW((own + L"\\sl.interposer.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
         hsf::slbring::StartOptions sl_options;
+        sl_options.apex = apex_requested;
+        sl_options.apex_debug = GetPrivateProfileIntW(L"HSF", L"ApexDebug", 0, g_ini_path) != 0;
+        sl_options.apex_allow_tearing =
+            apex_requested && GetPrivateProfileIntW(L"HSF", L"ApexAllowTearing", apex_compatibility_default, g_ini_path) != 0;
+        sl_options.apex_dll = apex_dll;
+        if (g_apex_route && fc27) {
+          char settings[160];
+          std::snprintf(settings, sizeof(settings), "Apex FC 27 profile: VSync-off pacing %s, HSF depth copy without Generic Depth %s",
+                        sl_options.apex_allow_tearing ? "on" : "off", g_apex_allow_unbound_depth ? "on" : "off");
+          Log(settings);
+        }
         sl_options.log = GetPrivateProfileIntW(L"HSF", L"SlLog", 0, g_ini_path) != 0;
         sl_options.factory_proxy = GetPrivateProfileIntW(L"HSF", L"SlFactoryProxy", 1, g_ini_path) != 0;
         sl_options.manual_hooking = GetPrivateProfileIntW(L"HSF", L"SlManualHooking", 0, g_ini_path) != 0;
@@ -9100,13 +9276,14 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         sl_options.ngx_path = ngx_path;
         sl_options.ini_path = g_ini_path;
         sl_options.route_dlssg = static_cast<int>(GetPrivateProfileIntW(L"HSF", L"SlRouteDlssg", -1, g_ini_path));
-        hsf::slbring::Start(bring_log.c_str(), have_own ? own.c_str() : folder, sl_options);
+        hsf::slbring::Start(bring_log.c_str(), have_own ? own.c_str() : folder.c_str(), sl_options);
         if (void* const exit_user_process = reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlExitUserProcess")))
           Log(g_exit_hook.Add("RtlExitUserProcess", exit_user_process, reinterpret_cast<void*>(&OnExitUserProcess), reinterpret_cast<void**>(&g_real_exit_user_process), &Log)
-                  ? "exit hook in: HSF's Streamline is shut down before the DLLs unload"
-                  : "exit hook not in: the game may crash at quit (DLSS-G's fail fast)");
-        g_ngx_input = GetPrivateProfileIntW(L"HSF", L"NgxInput", 1, g_ini_path) != 0;
+                  ? "exit hook in: HSF frame generation shuts down before the DLLs unload"
+                  : "exit hook not in: frame generation shutdown could not be registered");
+        g_ngx_input = GetPrivateProfileIntW(L"HSF", L"NgxInput", g_apex_route ? 0 : 1, g_ini_path) != 0;
         if (g_ngx_input) hsf::ngx::Start(&hsf::slbring::LogLine);
+        else if (g_apex_route) Log("Apex driver NGX capture is off; using ReShade motion and depth");
       }
       if (g_sl_game) {
         wchar_t log_path[MAX_PATH];
@@ -9122,10 +9299,17 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
           if (g_sl_ngx) hsf::ngx::Start(&Log);
         }
       }
+      if (!g_apex_route)
 #endif
-      g_fault9_handler = AddVectoredExceptionHandler(0, OnFault9);
+      {
+        // Vulkan games add shared semaphores for the same-frame device hand-off.
+        if (GetPrivateProfileIntW(L"HSF", L"VkDeviceHook", 1, g_ini_path) != 0)
+          if (const char* const hooked = hsf::vk::HookCreateDevice()) Log(hooked);
+        g_fault9_handler = AddVectoredExceptionHandler(0, OnFault9);
+      }
       RegisterEvents();
       break;
+    }
     case DLL_PROCESS_DETACH:
       if (g_in_helper) {
         reshade::unregister_addon(module);
