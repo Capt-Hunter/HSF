@@ -768,6 +768,7 @@ bool g_force_sync_logged = false;
 struct FrameTimes {
   double last = 0, average = 0, worst = 0;
   double present_sum = 0, present_worst = 0, sleep_sum = 0, sleep_worst = 0, feed_worst = 0;
+  double apex_wait_sum = 0;
   uint32_t frames = 0, spikes = 0;
 } g_times;
 
@@ -1088,7 +1089,9 @@ HRESULT PresentApex(IDXGISwapChain* chain, UINT sync, UINT flags, bool full_upda
       ++generated_count;
       // The game's wait accounts for the first frame. Account for each extra Present before issuing another one.
       if (latency_gate) {
+        const double wait_start = g_start_options.apex_debug ? NowMs() : 0;
         const DWORD wait = WaitForSingleObject(latency_gate.get(), 50);
+        if (wait_start != 0) g_times.apex_wait_sum += NowMs() - wait_start;
         if (wait != WAIT_OBJECT_0) {
           static bool logged = false;
           if (!logged) Line("Apex VSync-off presentation wait ended with 0x%lx; presenting the real frame", wait);
@@ -1838,6 +1841,9 @@ void Poll() {
     Line("Apex status %d, real %llu, submitted %llu, generated %llu, real-frame time %.2f ms (worst %.2f), Present average %.2f ms",
          g_status.load(), g_presented_total.load(), g_fed_total.load(), g_apex_generated.load(),
          g_times.average, g_times.worst, g_times.present_sum / std::max(1u, g_apex_present_samples));
+    if (g_start_options.apex_debug && g_apex_present_samples != 0)
+      Line("Apex DXGI frame-latency wait: %.2f ms per real Present over %u Presents",
+           g_times.apex_wait_sum / g_apex_present_samples, g_apex_present_samples);
     g_apex_present_samples = 0;
     const double last = g_times.last, average = g_times.average;
     g_times = {};

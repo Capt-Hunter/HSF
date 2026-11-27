@@ -65,11 +65,11 @@ Older files may still have `Presenter`, `Generated` and `Pacing`. They belonged 
 |---|---|---|---|---|---|
 | `InGameDlssg` | not set | 0, 1, 2 | Start; HSF writes 2 | D3D12-G | Runs DLSS-G inside a game that ships Streamline 2.x. Once D3D12 has shown more frames than D3D11 (at least 300), HSF writes 2 if the game's `sl.interposer.dll` is loaded. A run that is mostly D3D11 takes 1 or 2 out again. 0 by hand keeps it off for good. |
 | `SlBringIn` | not set | 0, 1, 2 | Start; HSF writes 2 | D3D12-B | Starts HSF's own Streamline 2.14 (from `HSF_streamline`) in a D3D12 game without one. 2 means HSF wrote it (once D3D12 has shown more frames than D3D11), and a later run that is mostly D3D11 takes it out again. 1 is set by hand and stays. 0 keeps it off for good. |
-| `FrameGenerationBackend` | `NVIDIA` | NVIDIA, Apex | Start | D3D12-B | The BACKEND row selects the native FP16 Apex provider or HSF's DLSS-G / XeMFG route. |
-| `ApexAllowTearing` | `0` | 0, 1 | Start | D3D12-B (Apex) | Allow VSync-off pacing on a tearing-capable waitable swap chain with maximum frame latency 1 or 2. |
-| `ApexDebug` | `0` | 0, 1 | Start | D3D12-B (Apex) | Sample extra provider, motion and input diagnostics in HSF.log. |
+| `FrameGenerationBackend` | `Auto` in FC 27, `NVIDIA` elsewhere | NVIDIA, Apex, Auto | Start | D3D12-B | Auto arms Apex when the bundled provider is present and HSF can use the bring-in route. Apex starts only on native D3D12 FP16 scRGB. An explicit backend choice overrides Auto. |
+| `ApexAllowTearing` | `1` in FC 27 Apex mode, `0` elsewhere | 0, 1 | Start | D3D12-B (Apex) | Allow VSync-off pacing on a tearing-capable waitable swap chain with maximum frame latency 1 or 2. |
+| `ApexDebug` | `0` | 0, 1 | Start | D3D12-B (Apex) | Sample provider, motion, inputs and DXGI frame-latency wait time in HSF.log. |
 | `ApexRequestFlow` | `0` | 0, 1 | Start | D3D12-B (Apex) | Let HSF request LaunchPad flow if the preset does not already supply it. |
-| `ApexAllowUnboundDepth` | `0` | 0, 1 | Start | D3D12-B (Apex) | Compatibility opt-in for HSF's depth copy without a game depth binding. |
+| `ApexAllowUnboundDepth` | `1` in FC 27 Apex mode, `0` elsewhere | 0, 1 | Start | D3D12-B (Apex) | Allow HSF's depth copy without a game depth binding. A usable depth copy is still required. |
 | `SlUseOwn` | not set | 1 | Start; the menu writes it | D3D12-G | The menu's USE HSF'S STREAMLINE, for a game whose own Streamline never brings DLSS-G (some load it for Reflex only). On writes `SlBringIn=2` and `SlNgxPath` and removes `InGameDlssg`; off writes `InGameDlssg=2` and removes `SlBringIn`. HSF warns in the menu when the game's Streamline answers that DLSS-G is not loaded while this PC can run it, but never switches by itself. |
 | `StreamlineProbe` | `0` | 0, 1 | Start | D3D12-G | Hooks the game's Streamline and logs what it sends (`HSF.log`), changing nothing. |
 | `NgxInput` | `1` | 0, 1 | Start | D3D12-B | Takes the game's own DLSS data (motion, depth, jitter, reset) from its NGX calls, in games with DLSS but no Streamline. |

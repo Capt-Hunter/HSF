@@ -9034,12 +9034,12 @@ void DrawOsd(effect_runtime*) {
 // True when this add-on was loaded into HSF's own DLSS-G helper, not a game. A child process of a packaged game (Game Pass) searches the
 // game's package folder for DLLs first, so a ReShade dxgi.dll there can load into the helper. The helper then does its own guard (system
 // DLLs first, dlssg_helper.cpp); this is the second line, for a ReShade that still gets in.
-bool InHelperProcess() {
+bool CurrentExecutableIs(const wchar_t* expected) {
   wchar_t exe[MAX_PATH];
   const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
   if (n == 0 || n >= MAX_PATH) return false;
   const wchar_t* const slash = wcsrchr(exe, L'\\');
-  return _wcsicmp(slash != nullptr ? slash + 1 : exe, hsf::dlssg_link::HELPER_EXE) == 0;
+  return _wcsicmp(slash != nullptr ? slash + 1 : exe, expected) == 0;
 }
 
 // Inside the helper: ReShade's effects stay off, so the frames DLSS-G shows are not processed a second time.
@@ -9175,7 +9175,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
 #endif
       // In HSF's own helper the add-on does nothing else: no route pick, no HSF.ini writes, no menu or overlay.
       g_fresh_attach = true;
-      g_in_helper = InHelperProcess();
+      g_in_helper = CurrentExecutableIs(hsf::dlssg_link::HELPER_EXE);
       if (g_in_helper) {
         RegisterEvents();
         reshade::log_message(reshade::log_level::warning,
@@ -9204,41 +9204,59 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
       g_sl_drive = RouteOn(ReadRoute(L"InGameDlssg"));
       g_sl_game = g_sl_drive || GetPrivateProfileIntW(L"HSF", L"StreamlineProbe", 0, g_ini_path) != 0;
       // A native D3D12 game with no Streamline. On its own this only starts Streamline in the game: nothing is generated yet, as nothing feeds DLSS-G.
-      g_sl_bring = RouteOn(ReadRoute(L"SlBringIn"));
+      const Route bring_route = ReadRoute(L"SlBringIn");
+      g_sl_bring = RouteOn(bring_route);
+      const bool fc27 = CurrentExecutableIs(L"FC27.exe");
+      const std::wstring ini = g_ini_path;
+      const size_t separator = ini.rfind(L'\\');
+      const std::wstring folder = separator == std::wstring::npos ? std::wstring() : ini.substr(0, separator);
+      const std::wstring apex_dll = folder + L"\\HSF_apex\\dlssg\\nvngx_dlssg.dll";
+      const DWORD provider_attributes = folder.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(apex_dll.c_str());
+      const bool have_apex = provider_attributes != INVALID_FILE_ATTRIBUTES && !(provider_attributes & FILE_ATTRIBUTE_DIRECTORY);
       wchar_t fg_backend[32]{};
-      GetPrivateProfileStringW(L"HSF", L"FrameGenerationBackend", L"NVIDIA", fg_backend, static_cast<DWORD>(std::size(fg_backend)), g_ini_path);
-      g_apex_next_launch = _wcsicmp(fg_backend, L"Apex") == 0;
+      GetPrivateProfileStringW(L"HSF", L"FrameGenerationBackend", fc27 ? L"Auto" : L"NVIDIA", fg_backend,
+                               static_cast<DWORD>(std::size(fg_backend)), g_ini_path);
+      // Auto only arms the native route. The factory waits for a D3D12 FP16 swap chain, and Present checks scRGB before loading the provider.
+      const bool auto_apex = _wcsicmp(fg_backend, L"Auto") == 0 && have_apex && !g_sl_game && bring_route != Route::off &&
+                             (g_sl_bring || fc27);
+      g_apex_next_launch = _wcsicmp(fg_backend, L"Apex") == 0 || auto_apex;
       const bool apex_requested = g_apex_next_launch;
+      if (auto_apex || (apex_requested && fc27 && have_apex && !g_sl_game && bring_route == Route::unset)) g_sl_bring = true;
       if (apex_requested && (!g_sl_bring || g_sl_drive)) {
         Log("Apex requires SlBringIn=1 and HSF's InGameDlssg route off; select one frame-generation route");
         if (g_sl_drive) g_sl_bring = false;
       }
       g_apex_route = apex_requested && g_sl_bring;
       // FgEngine (EXPERIMENTAL XeMFG, xmx.h): read once, a change needs a restart. The Intel files are looked for in HSF_streamline, then next to HSF.ini.
-      if (!g_apex_route && g_ini_path[0] != L'\0') {
-        std::wstring folder = g_ini_path;
-        folder.resize(folder.find_last_of(L'\\'));
+      if (!g_apex_route && !folder.empty()) {
         hsf::xmx::Configure(hsf::xmx::WantedFromIni(g_ini_path), folder.c_str(), &Log);
       }
       g_apex_request_flow = g_apex_route && GetPrivateProfileIntW(L"HSF", L"ApexRequestFlow", 0, g_ini_path) != 0;
-      g_apex_allow_unbound_depth = g_apex_route && GetPrivateProfileIntW(L"HSF", L"ApexAllowUnboundDepth", 0, g_ini_path) != 0;
+      const int apex_compatibility_default = g_apex_route && fc27 ? 1 : 0;
+      g_apex_allow_unbound_depth =
+          g_apex_route && GetPrivateProfileIntW(L"HSF", L"ApexAllowUnboundDepth", apex_compatibility_default, g_ini_path) != 0;
       if (g_apex_route) {
         g_sl_game = false;
+        if (auto_apex) Log("Apex auto: waiting for a compatible native FP16 scRGB swap chain");
         Log("Apex uses the existing ReShade preset and its own depth copy; automatic shader tuning and the DXGI adapter guard are off");
       }
       if (g_sl_bring) {
-        wchar_t folder[MAX_PATH];
-        wcscpy_s(folder, g_ini_path);
-        if (wchar_t* const slash = wcsrchr(folder, L'\\')) *slash = L'\0';
-        const std::wstring bring_log = std::wstring(folder) + L"\\HSF.log";  // open already: the bring-in lines join HSF's
+        const std::wstring bring_log = folder + L"\\HSF.log";  // open already: the bring-in lines join HSF's
         // HSF's own Streamline if it is there, so that a game with an old copy, or none, gets the version HSF was tested with.
-        const std::wstring own = std::wstring(folder) + L"\\HSF_streamline";
+        const std::wstring own = folder + L"\\HSF_streamline";
         const bool have_own = GetFileAttributesW((own + L"\\sl.interposer.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
         hsf::slbring::StartOptions sl_options;
         sl_options.apex = apex_requested;
         sl_options.apex_debug = GetPrivateProfileIntW(L"HSF", L"ApexDebug", 0, g_ini_path) != 0;
-        sl_options.apex_allow_tearing = apex_requested && GetPrivateProfileIntW(L"HSF", L"ApexAllowTearing", 0, g_ini_path) != 0;
-        sl_options.apex_dll = std::wstring(folder) + L"\\HSF_apex\\dlssg\\nvngx_dlssg.dll";
+        sl_options.apex_allow_tearing =
+            apex_requested && GetPrivateProfileIntW(L"HSF", L"ApexAllowTearing", apex_compatibility_default, g_ini_path) != 0;
+        sl_options.apex_dll = apex_dll;
+        if (g_apex_route && fc27) {
+          char settings[160];
+          std::snprintf(settings, sizeof(settings), "Apex FC 27 profile: VSync-off pacing %s, HSF depth copy without Generic Depth %s",
+                        sl_options.apex_allow_tearing ? "on" : "off", g_apex_allow_unbound_depth ? "on" : "off");
+          Log(settings);
+        }
         sl_options.log = GetPrivateProfileIntW(L"HSF", L"SlLog", 0, g_ini_path) != 0;
         sl_options.factory_proxy = GetPrivateProfileIntW(L"HSF", L"SlFactoryProxy", 1, g_ini_path) != 0;
         sl_options.manual_hooking = GetPrivateProfileIntW(L"HSF", L"SlManualHooking", 0, g_ini_path) != 0;
@@ -9258,7 +9276,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         sl_options.ngx_path = ngx_path;
         sl_options.ini_path = g_ini_path;
         sl_options.route_dlssg = static_cast<int>(GetPrivateProfileIntW(L"HSF", L"SlRouteDlssg", -1, g_ini_path));
-        hsf::slbring::Start(bring_log.c_str(), have_own ? own.c_str() : folder, sl_options);
+        hsf::slbring::Start(bring_log.c_str(), have_own ? own.c_str() : folder.c_str(), sl_options);
         if (void* const exit_user_process = reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlExitUserProcess")))
           Log(g_exit_hook.Add("RtlExitUserProcess", exit_user_process, reinterpret_cast<void*>(&OnExitUserProcess), reinterpret_cast<void**>(&g_real_exit_user_process), &Log)
                   ? "exit hook in: HSF frame generation shuts down before the DLLs unload"
